@@ -785,6 +785,7 @@ class ChatGPTProvider:
                                             {
                                                 "request_id": request_id,
                                                 "block_index": idx,
+                                                "block_type": "text",
                                                 "sequence": seq.get(idx, 0),
                                                 "text": delta_text,
                                             },
@@ -800,10 +801,11 @@ class ChatGPTProvider:
                                     if delta_text:
                                         idx = event.get("output_index", 0)
                                         await self._coordinator.hooks.emit(
-                                            "llm:stream_thinking_delta",
+                                            "llm:stream_block_delta",
                                             {
                                                 "request_id": request_id,
                                                 "block_index": idx,
+                                                "block_type": "thinking",
                                                 "sequence": seq.get(idx, 0),
                                                 "text": delta_text,
                                             },

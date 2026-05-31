@@ -395,6 +395,10 @@ class TestStreamingContractConformance:
         assert len(deltas) == 3, f"Expected 3 deltas, got {len(deltas)}"
         seqs = [p["sequence"] for _, p in deltas]
         assert seqs == [0, 1, 2], f"Expected sequences [0,1,2], got {seqs}"
+        block_types = [p["block_type"] for _, p in deltas]
+        assert block_types == ["text", "text", "text"], (
+            f"Expected all deltas block_type='text', got {block_types}"
+        )
 
     # ------------------------------------------------------------------
     # 3. Reasoning block → thinking_delta
@@ -402,7 +406,7 @@ class TestStreamingContractConformance:
 
     @pytest.mark.asyncio
     async def test_stream_thinking_delta_from_reasoning_summary(self) -> None:
-        """reasoning_summary_text.delta → llm:stream_thinking_delta (not block_delta)."""
+        """reasoning_summary_text.delta → llm:stream_block_delta with block_type='thinking'."""
         from amplifier_core.message_models import ChatRequest, Message
 
         provider = _make_provider()
@@ -419,18 +423,22 @@ class TestStreamingContractConformance:
             await provider.complete(request)
 
         events = _stream_events(provider)
-        thinking = [(n, p) for n, p in events if n == "llm:stream_thinking_delta"]
-        assert len(thinking) == 1, (
-            f"Expected 1 llm:stream_thinking_delta, got {len(thinking)}"
+        # Must NOT emit the old separate thinking_delta event
+        assert not any(n == "llm:stream_thinking_delta" for n, _ in events), (
+            "llm:stream_thinking_delta must not be emitted (collapsed into block_delta)"
         )
-        _, payload = thinking[0]
+        # Must emit llm:stream_block_delta with block_type='thinking'
+        thinking_deltas = [
+            (n, p) for n, p in events
+            if n == "llm:stream_block_delta" and p.get("block_type") == "thinking"
+        ]
+        assert len(thinking_deltas) == 1, (
+            f"Expected 1 llm:stream_block_delta(block_type='thinking'), got {len(thinking_deltas)}"
+        )
+        _, payload = thinking_deltas[0]
         assert payload["text"] == "Thinking through this..."
         assert payload["block_index"] == 0
         assert payload["sequence"] == 0
-
-        # Must NOT emit block_delta for reasoning
-        deltas = [n for n, _ in events if n == "llm:stream_block_delta"]
-        assert deltas == [], "reasoning delta must not emit llm:stream_block_delta"
 
     @pytest.mark.asyncio
     async def test_stream_thinking_block_start_is_thinking_type(self) -> None:
@@ -705,6 +713,9 @@ class TestStreamingContractConformance:
             f"Expected 1 delta (empty skipped), got {len(deltas)}: {deltas}"
         )
         assert deltas[0][1]["text"] == "real text"
+        assert deltas[0][1]["block_type"] == "text", (
+            "text delta must carry block_type='text'"
+        )
 
     # ------------------------------------------------------------------
     # 9. Uses self._coordinator (underscore), not self.coordinator
@@ -747,7 +758,7 @@ class TestStreamingContractConformance:
 
     @pytest.mark.asyncio
     async def test_stream_reasoning_text_delta_maps_to_thinking(self) -> None:
-        """response.reasoning_text.delta also emits llm:stream_thinking_delta."""
+        """response.reasoning_text.delta emits llm:stream_block_delta with block_type='thinking'."""
         from amplifier_core.message_models import ChatRequest, Message
 
         provider = _make_provider()
@@ -764,10 +775,18 @@ class TestStreamingContractConformance:
             await provider.complete(request)
 
         events = _stream_events(provider)
-        thinking = [n for n, _ in events if n == "llm:stream_thinking_delta"]
-        assert len(thinking) == 1, (
-            f"Expected llm:stream_thinking_delta for reasoning_text.delta, "
-            f"got {thinking}"
+        # Must NOT emit the old separate thinking_delta event
+        assert not any(n == "llm:stream_thinking_delta" for n, _ in events), (
+            "llm:stream_thinking_delta must not be emitted (collapsed into block_delta)"
+        )
+        # Must emit llm:stream_block_delta with block_type='thinking'
+        thinking_deltas = [
+            (n, p) for n, p in events
+            if n == "llm:stream_block_delta" and p.get("block_type") == "thinking"
+        ]
+        assert len(thinking_deltas) == 1, (
+            f"Expected llm:stream_block_delta(block_type='thinking') for reasoning_text.delta, "
+            f"got {thinking_deltas}"
         )
 
     # ------------------------------------------------------------------
