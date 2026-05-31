@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from typing import Any
 
 import httpx
@@ -662,6 +663,24 @@ class ChatGPTProvider:
 
         start_time = time.monotonic()
 
+        # Per-request streaming override (does NOT mutate config-level setting).
+        # Callers pass metadata={"stream": False} to suppress llm:stream_* events.
+        _use_streaming: bool = bool(self._config.get("use_streaming", True))
+        _meta = getattr(request, "metadata", None)
+        if isinstance(_meta, dict) and _meta.get("stream") is False:
+            _use_streaming = False
+
+        # Emit stream events only when coordinator is present AND streaming is on.
+        emit_stream_events: bool = bool(_has_hooks and _use_streaming)
+
+        # Streaming state — stable across the 401-retry loop.
+        # request_id is generated once; seq/block_types reset per attempt (fresh stream).
+        request_id: str = str(uuid.uuid4())
+        seq: dict[int, int] = {}
+        block_types: dict[int, str] = {}
+        any_emitted: bool = False          # True once any delta/thinking event is emitted
+        stream_aborted_emitted: bool = False
+
         # Local guard variable — concurrency-safe (no instance-level mutation).
         retry_attempted = False
 
@@ -670,6 +689,9 @@ class ChatGPTProvider:
             lines: list[str] = []
             for _attempt in range(2):
                 lines = []
+                # Reset per-attempt stream state (fresh SSE stream from server).
+                seq = {}
+                block_types = {}
                 try:
                     async with httpx.AsyncClient(timeout=self.timeout) as client:
                         async with client.stream(
@@ -707,8 +729,123 @@ class ChatGPTProvider:
                                         status, resp.headers, error_body, self.name
                                     )
 
+                            # Dual-pass SSE loop: emit contract events inline (pass 1)
+                            # and collect all lines for parse_sse_events below (pass 2).
+                            # Each data: line is JSON-parsed twice — acceptable overhead.
                             async for line in resp.aiter_lines():
                                 lines.append(line)
+
+                                if not emit_stream_events:
+                                    continue
+
+                                if not line.startswith("data: "):
+                                    continue
+
+                                data_str = line[6:]
+                                if data_str == "[DONE]":
+                                    break
+
+                                try:
+                                    event = json.loads(data_str)
+                                except json.JSONDecodeError:
+                                    continue
+
+                                et = event.get("type", "")
+
+                                if et == "response.output_item.added":
+                                    idx: int = event.get("output_index", 0)
+                                    item = event.get("item", {})
+                                    item_type = item.get("type", "")
+                                    block_type = {
+                                        "message": "text",
+                                        "reasoning": "thinking",
+                                        "function_call": "tool_use",
+                                    }.get(item_type, "text")
+                                    block_types[idx] = block_type
+                                    seq[idx] = 0
+                                    bs_payload: dict[str, Any] = {
+                                        "request_id": request_id,
+                                        "block_index": idx,
+                                        "block_type": block_type,
+                                    }
+                                    if block_type == "tool_use":
+                                        tc_name = item.get("name")
+                                        if tc_name:
+                                            bs_payload["name"] = tc_name
+                                    await self._coordinator.hooks.emit(
+                                        "llm:stream_block_start", bs_payload
+                                    )
+
+                                elif et == "response.output_text.delta":
+                                    delta_text = event.get("delta", "")
+                                    if delta_text:
+                                        idx = event.get("output_index", 0)
+                                        await self._coordinator.hooks.emit(
+                                            "llm:stream_block_delta",
+                                            {
+                                                "request_id": request_id,
+                                                "block_index": idx,
+                                                "sequence": seq.get(idx, 0),
+                                                "text": delta_text,
+                                            },
+                                        )
+                                        seq[idx] = seq.get(idx, 0) + 1
+                                        any_emitted = True
+
+                                elif et in (
+                                    "response.reasoning_summary_text.delta",
+                                    "response.reasoning_text.delta",
+                                ):
+                                    delta_text = event.get("delta", "")
+                                    if delta_text:
+                                        idx = event.get("output_index", 0)
+                                        await self._coordinator.hooks.emit(
+                                            "llm:stream_thinking_delta",
+                                            {
+                                                "request_id": request_id,
+                                                "block_index": idx,
+                                                "sequence": seq.get(idx, 0),
+                                                "text": delta_text,
+                                            },
+                                        )
+                                        seq[idx] = seq.get(idx, 0) + 1
+                                        any_emitted = True
+
+                                elif et == "response.output_item.done":
+                                    idx = event.get("output_index", 0)
+                                    if idx in block_types:
+                                        await self._coordinator.hooks.emit(
+                                            "llm:stream_block_end",
+                                            {
+                                                "request_id": request_id,
+                                                "block_index": idx,
+                                                "block_type": block_types[idx],
+                                            },
+                                        )
+
+                                elif et == "error":
+                                    # Emit stream_aborted now if we already sent deltas.
+                                    # parse_sse_events will raise SSEError after the loop.
+                                    if any_emitted and not stream_aborted_emitted:
+                                        error_obj = event.get("error", {})
+                                        err_msg = (
+                                            error_obj.get("message", str(event))
+                                            if isinstance(error_obj, dict)
+                                            else str(error_obj)
+                                        )
+                                        await self._coordinator.hooks.emit(
+                                            "llm:stream_aborted",
+                                            {
+                                                "request_id": request_id,
+                                                "error": {
+                                                    "type": "error",
+                                                    "msg": err_msg,
+                                                },
+                                            },
+                                        )
+                                        stream_aborted_emitted = True
+
+                                # response.function_call_arguments.delta: silently consumed
 
                     break  # request succeeded — exit the retry loop
 
@@ -762,6 +899,18 @@ class ChatGPTProvider:
 
         except SSEError as exc:
             # Map SSE-layer errors to kernel types before escaping complete().
+            # If a partial stream was emitted before the SSE error, signal abort.
+            if any_emitted and _has_hooks and not stream_aborted_emitted:
+                await self._coordinator.hooks.emit(
+                    "llm:stream_aborted",
+                    {
+                        "request_id": request_id,
+                        "error": {
+                            "type": type(exc).__name__,
+                            "msg": str(exc),
+                        },
+                    },
+                )
             duration_ms = (time.monotonic() - start_time) * 1000
             code = exc.code or ""
             msg = str(exc).lower()
@@ -798,6 +947,18 @@ class ChatGPTProvider:
 
         except httpx.TimeoutException as exc:
             # Timeout → LLMTimeoutError (retryable).
+            # If a partial stream was emitted before the timeout, signal abort.
+            if any_emitted and _has_hooks and not stream_aborted_emitted:
+                await self._coordinator.hooks.emit(
+                    "llm:stream_aborted",
+                    {
+                        "request_id": request_id,
+                        "error": {
+                            "type": type(exc).__name__,
+                            "msg": str(exc),
+                        },
+                    },
+                )
             duration_ms = (time.monotonic() - start_time) * 1000
             mapped_timeout = kernel_errors.LLMTimeoutError(
                 f"ChatGPT API request timed out: {exc}",
@@ -821,6 +982,18 @@ class ChatGPTProvider:
             # Transport / connection errors → ProviderUnavailableError (retryable).
             # Covers ConnectError, RemoteProtocolError, and other transport
             # failures. Note: TimeoutException is a separate hierarchy caught above.
+            # If a partial stream was emitted before the transport error, signal abort.
+            if any_emitted and _has_hooks and not stream_aborted_emitted:
+                await self._coordinator.hooks.emit(
+                    "llm:stream_aborted",
+                    {
+                        "request_id": request_id,
+                        "error": {
+                            "type": type(exc).__name__,
+                            "msg": str(exc),
+                        },
+                    },
+                )
             duration_ms = (time.monotonic() - start_time) * 1000
             mapped_unavail = kernel_errors.ProviderUnavailableError(
                 f"ChatGPT API connection error: {exc}",
@@ -842,6 +1015,18 @@ class ChatGPTProvider:
 
         except Exception as exc:
             # Catch-all: wrap in LLMError so callers always receive a typed error.
+            # If a partial stream was emitted, signal abort before translating error.
+            if any_emitted and _has_hooks and not stream_aborted_emitted:
+                await self._coordinator.hooks.emit(
+                    "llm:stream_aborted",
+                    {
+                        "request_id": request_id,
+                        "error": {
+                            "type": type(exc).__name__,
+                            "msg": str(exc),
+                        },
+                    },
+                )
             duration_ms = (time.monotonic() - start_time) * 1000
             if _has_hooks:
                 await self._coordinator.hooks.emit(
