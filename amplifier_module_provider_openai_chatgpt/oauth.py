@@ -538,9 +538,10 @@ async def start_device_code_flow() -> dict:
             if error_code in (
                 "deviceauth_authorization_unknown",
                 "authorization_pending",
+                "deviceauth_authorization_pending",
             ):
                 continue  # User hasn't authorized yet; sleep then retry.
-            elif error_code == "slow_down":
+            elif error_code in ("slow_down", "deviceauth_slow_down"):
                 interval += 5
                 continue
             elif error_code in ("expired_token", "deviceauth_expired"):
