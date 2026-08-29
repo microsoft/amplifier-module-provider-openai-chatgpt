@@ -29,6 +29,10 @@ default_model = "gpt-5.5"
 
 ### All Config Options
 
+This provider has no interactive setup wizard (no `ConfigField` prompts) --
+it authenticates via OAuth device-code login on mount instead. Every key
+below is a fully supported config key -- set it directly in `settings.yaml`.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `default_model` | str | `"gpt-5.5"` | Model to use for inference |
@@ -37,6 +41,15 @@ default_model = "gpt-5.5"
 | `token_file_path` | str | `~/.amplifier/openai-chatgpt-oauth.json` | Path to the OAuth token JSON file |
 | `timeout` | float | `300.0` | HTTP timeout in seconds for streaming requests |
 | `models_cache_ttl` | float | `3600` | How long (seconds) to cache the live model catalog before re-fetching |
+| `models_client_version` | str | `"99.99.99"` | Settings-only override for the model-catalog version-gating constant (see `models.py`'s `MODELS_CLIENT_VERSION` -- FRAGILE, relies on the ChatGPT backend treating any unknown high version as "give me everything") |
+| `use_streaming` | bool | `true` | Set `false` to force non-streaming completions |
+| `priority` | int | `100` | Read by the orchestrator's provider-selection logic |
+| `extra_request_params` | dict | `{}` | Merged last into the Responses-API payload -- an escape hatch for any field not listed above. **Warning:** this backend enforces a strict payload schema and is known to reject unrecognized top-level fields (e.g. Chat-Completions-style params like `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `logprobs` are NOT accepted here) -- verify any new key against the live backend first. |
+
+Boolean and numeric keys accept native types or the string forms a config
+wizard writes (`"true"`/`"false"`); invalid numeric strings warn and fall
+back to the default rather than crashing at mount. Unrecognized config
+keys produce a mount-time warning (with a did-you-mean suggestion).
 
 ### Authentication
 
@@ -98,7 +111,10 @@ amplifier module add provider-openai-chatgpt \
 # 2. Install the provider
 amplifier provider install openai-chatgpt --force
 
-# 3. Add and configure via the interactive wizard
+# 3. Add the provider (no interactive config wizard -- this provider has no
+#    ConfigField prompts; it authenticates via OAuth device-code login on
+#    mount instead. Set any config keys directly in settings.yaml -- see
+#    "All config keys" below)
 amplifier provider add openai-chatgpt
 
 # 4. Or use the management dashboard

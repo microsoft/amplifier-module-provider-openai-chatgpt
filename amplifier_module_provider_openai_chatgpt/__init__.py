@@ -38,7 +38,7 @@ async def mount(
             - login_on_mount: If True (default), trigger login when tokens
               are absent or invalid.
             - raw: Pass raw payloads/events through provider hooks.
-            - default_model: Default model name (default: 'gpt-4o').
+            - default_model: Default model name (default: 'gpt-5.5').
             - timeout: HTTP timeout in seconds (default: 300.0).
 
     Returns:
@@ -47,8 +47,13 @@ async def mount(
     if config is None:
         config = {}
 
+    from .provider import _coerce_bool, _warn_unknown_config_keys
+
+    _warn_unknown_config_keys(config)
     token_file_path: str | None = config.get("token_file_path")
-    login_on_mount: bool = config.get("login_on_mount", True)
+    login_on_mount: bool = _coerce_bool(
+        config.get("login_on_mount"), key="login_on_mount", default=True
+    )
 
     # Load tokens from disk.
     tokens = load_tokens(token_file_path)
