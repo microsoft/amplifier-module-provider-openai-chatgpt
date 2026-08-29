@@ -7,6 +7,7 @@ against the ChatGPT backend API with OAuth authentication.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import logging
 import time
@@ -33,6 +34,7 @@ from ._sse import ParsedResponse, SSEError, parse_sse_events
 from .models import (
     DEFAULT_CACHE_TTL_SECONDS,
     FALLBACK_MODELS,
+    MODELS_CLIENT_VERSION,
     fetch_models,
     to_model_infos,
 )
@@ -44,6 +46,106 @@ from .oauth import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Config keys this provider actively reads. `priority` IS live here (read by
+# the orchestrator's provider-selection logic via the attribute-then-config
+# branch) -- never remove it from the allowlist. `extra_request_params` is
+# app-cli-reserved and must stay allow-listed too.
+_KNOWN_CONFIG_KEYS = frozenset(
+    {
+        "token_file_path",
+        "login_on_mount",
+        "raw",
+        "default_model",
+        "timeout",
+        "priority",
+        "models_cache_ttl",
+        "models_client_version",
+        "use_streaming",
+        "instance_id",
+        "extra_request_params",
+    }
+)
+
+
+def _warn_unknown_config_keys(config: dict[str, Any]) -> None:
+    """Warn (never fail) about config keys this provider doesn't recognize,
+    with a difflib did-you-mean suggestion for likely typos."""
+    for key in config:
+        if key in _KNOWN_CONFIG_KEYS:
+            continue
+        suggestions = difflib.get_close_matches(key, _KNOWN_CONFIG_KEYS, n=1)
+        hint = f" Did you mean '{suggestions[0]}'?" if suggestions else ""
+        logger.warning("[PROVIDER] Unknown config key '%s' is ignored.%s", key, hint)
+
+
+def _coerce_bool(value: Any, *, key: str, default: bool) -> bool:
+    """Coerce a config value to bool, tolerating string forms from wizards.
+
+    Config wizards commonly persist booleans as the strings "true"/"false".
+    ``bool("false")`` evaluates to ``True`` in Python -- this parses the
+    string content instead of relying on Python truthiness.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes"):
+            return True
+        if normalized in ("false", "0", "no"):
+            return False
+        logger.warning(
+            "[PROVIDER] Config key '%s' has unrecognized boolean value %r; "
+            "defaulting to %s.",
+            key,
+            value,
+            default,
+        )
+        return default
+    logger.warning(
+        "[PROVIDER] Config key '%s' has unexpected type %s for a boolean "
+        "value (%r); coercing with bool().",
+        key,
+        type(value).__name__,
+        value,
+    )
+    return bool(value)
+
+
+def _coerce_float(value: Any, *, key: str, default: float) -> float:
+    """Coerce a config value to float, warning and defaulting on failure."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[PROVIDER] Config key '%s' has invalid float value %r; "
+            "defaulting to %s.",
+            key,
+            value,
+            default,
+        )
+        return default
+
+
+def _coerce_int(value: Any, *, key: str, default: int) -> int:
+    """Coerce a config value to int, warning and defaulting on failure."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[PROVIDER] Config key '%s' has invalid integer value %r; "
+            "defaulting to %s.",
+            key,
+            value,
+            default,
+        )
+        return default
 
 # Full endpoint for the ChatGPT Responses API
 CHATGPT_CODEX_ENDPOINT = CHATGPT_CODEX_BASE_URL + "/responses"
@@ -95,16 +197,54 @@ class ChatGPTProvider:
         self._config = config or {}
         self._coordinator = coordinator
         self._tokens = tokens
+        _warn_unknown_config_keys(self._config)
 
-        self.priority: int = int(self._config.get("priority", 100))
-        self.raw: bool = bool(self._config.get("raw", False))
+        self.priority: int = _coerce_int(
+            self._config.get("priority"), key="priority", default=100
+        )
+        self.raw: bool = _coerce_bool(self._config.get("raw"), key="raw", default=False)
         self.default_model: str = self._config.get("default_model", "gpt-5.5")
-        self.timeout: float = float(self._config.get("timeout", 300.0))
+        self.timeout: float = _coerce_float(
+            self._config.get("timeout"), key="timeout", default=300.0
+        )
         self._token_file_path: str | None = self._config.get("token_file_path")
 
+        # Streaming flag: emit token-level streaming events when True
+        self.use_streaming: bool = _coerce_bool(
+            self._config.get("use_streaming"), key="use_streaming", default=True
+        )
+
+        # Settings-only override for the FRAGILE version-gating constant in
+        # models.py (MODELS_CLIENT_VERSION). See models.py for why this is
+        # fragile -- exposing it as config lets an operator work around a
+        # backend version-gating change without waiting on a code release.
+        self.models_client_version: str = self._config.get(
+            "models_client_version", MODELS_CLIENT_VERSION
+        )
+
+        # Arbitrary Responses-API payload fields merged in last (after every
+        # other field is computed). WARNING: this ChatGPT backend enforces a
+        # strict payload schema and is known to reject unrecognized
+        # top-level fields -- common Chat-Completions-style params such as
+        # `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`,
+        # and `logprobs` are NOT accepted by this Responses-API-style
+        # endpoint. Verify any new key against the live backend before
+        # relying on it.
+        _extra_raw = self._config.get("extra_request_params")
+        if _extra_raw is not None and not isinstance(_extra_raw, dict):
+            logger.warning(
+                "[PROVIDER] Config key 'extra_request_params' must be a "
+                "dict; got %s. Ignoring.",
+                type(_extra_raw).__name__,
+            )
+            _extra_raw = None
+        self.extra_request_params: dict[str, Any] = _extra_raw or {}
+
         # Model catalog cache: (monotonic_timestamp, models) or None when empty.
-        self._models_cache_ttl: float = float(
-            self._config.get("models_cache_ttl", DEFAULT_CACHE_TTL_SECONDS)
+        self._models_cache_ttl: float = _coerce_float(
+            self._config.get("models_cache_ttl"),
+            key="models_cache_ttl",
+            default=DEFAULT_CACHE_TTL_SECONDS,
         )
         self._models_cache: tuple[float, list[ModelInfo]] | None = None
         self._models_lock = asyncio.Lock()
@@ -375,6 +515,14 @@ class ChatGPTProvider:
                 "effort": request.reasoning_effort,
                 "summary": "detailed",
             }
+
+        # Arbitrary payload fields merged in LAST -- an escape hatch for any
+        # Responses-API field this provider doesn't expose a dedicated
+        # field for. See __init__'s extra_request_params docstring for the
+        # known-rejected-params warning: this backend enforces a strict
+        # payload schema.
+        if self.extra_request_params:
+            payload.update(self.extra_request_params)
 
         return payload
 
@@ -665,7 +813,7 @@ class ChatGPTProvider:
 
         # Per-request streaming override (does NOT mutate config-level setting).
         # Callers pass metadata={"stream": False} to suppress llm:stream_* events.
-        _use_streaming: bool = bool(self._config.get("use_streaming", True))
+        _use_streaming: bool = self.use_streaming
         _meta = getattr(request, "metadata", None)
         if isinstance(_meta, dict) and _meta.get("stream") is False:
             _use_streaming = False
