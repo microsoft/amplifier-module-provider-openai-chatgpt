@@ -604,7 +604,9 @@ class TestDeviceCodeFlow:
             result = asyncio.run(start_device_code_flow())
 
         assert result["authorization_code"] == "auth_code_xyz"
-        assert mock_sleep.call_count == 2
+        # Poll-immediately-then-interval: no sleep before poll 1, one sleep
+        # before poll 2 (after the pending response).
+        assert mock_sleep.call_count == 1
 
     def test_expired_device_code_raises(self):
         from amplifier_module_provider_openai_chatgpt.oauth import (

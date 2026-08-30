@@ -12,7 +12,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -44,6 +44,7 @@ from .oauth import (
     load_tokens,
     refresh_tokens,
 )
+from .oauth import login as oauth_login
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +324,67 @@ class ChatGPTProvider:
                 )
                 # Do not cache the fallback — next call should retry.
                 return to_model_infos(FALLBACK_MODELS)
+
+    # ------------------------------------------------------------------
+    # Auth surface (capability marker: "auth:oauth-device-code")
+    # ------------------------------------------------------------------
+    #
+    # These two members are the onboarding contract app-cli's wizard/login
+    # step duck-types onto: auth_status() to know whether login is needed,
+    # login() to actually run it. mount() (the only entrypoint before this
+    # change) remains the runtime safety net for `login_on_mount`.
+
+    def auth_status(self) -> str:
+        """Return this provider's current OAuth authentication state.
+
+        Checks in-memory tokens first (fast path), then re-reads tokens from
+        disk (another process -- e.g. `amplifier provider login` -- may have
+        completed a login since this instance was constructed).
+
+        Returns:
+            ``"authenticated"``: a valid, unexpired token is available.
+            ``"expired"``: tokens exist (in memory or on disk) but do not
+                pass :func:`~.oauth.is_token_valid` (missing/expired).
+            ``"unauthenticated"``: no tokens were found anywhere.
+        """
+        if is_token_valid(self._tokens):
+            return "authenticated"
+
+        disk_tokens = load_tokens(path=self._token_file_path)
+        if is_token_valid(disk_tokens):
+            return "authenticated"
+
+        if self._tokens or disk_tokens:
+            return "expired"
+
+        return "unauthenticated"
+
+    async def login(self, print_fn: Callable[[str], None] | None = None) -> bool:
+        """Run the OAuth device-code login flow and adopt the resulting tokens.
+
+        Thin instance wrapper over :func:`~.oauth.login`. This is the
+        out-of-band entrypoint app-cli's `amplifier provider login` command
+        (and its onboarding wizard) call directly -- unlike `mount()`, this
+        can run at any time, not just at session start.
+
+        Args:
+            print_fn: Optional callable to receive the device-code
+                verification URL and user code, instead of stderr (e.g. an
+                app-cli output channel). Defaults to None, which prints to
+                stderr -- the same behavior `mount()` has always used.
+
+        Returns:
+            True on success.
+
+        Raises:
+            RuntimeError: If the device-code flow fails (see
+                :func:`~.oauth.login`).
+        """
+        tokens = await oauth_login(
+            token_file_path=self._token_file_path, print_fn=print_fn
+        )
+        self._tokens = tokens
+        return True
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         """Parse tool calls from a ChatResponse.

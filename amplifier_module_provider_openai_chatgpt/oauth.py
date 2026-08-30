@@ -11,7 +11,9 @@ import json
 import logging
 import os
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 from urllib.parse import urlencode
 
 import httpx
@@ -46,6 +48,7 @@ DEVICE_CODE_USERCODE_URL = f"{OAUTH_ISSUER}/api/accounts/deviceauth/usercode"
 DEVICE_CODE_TOKEN_URL = f"{OAUTH_ISSUER}/api/accounts/deviceauth/token"
 DEVICE_CODE_VERIFICATION_URL = f"{OAUTH_ISSUER}/codex/device"
 DEVICE_CODE_POLL_INTERVAL = 5  # seconds between polling attempts
+DEVICE_CODE_POLL_TIMEOUT_S = 900  # overall wall-clock bound on the poll loop (15 min)
 
 # ---------------------------------------------------------------------------
 # ChatGPT Codex API
@@ -81,7 +84,7 @@ def save_tokens(tokens: dict, path: str | None = None) -> None:
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(tokens, f)
 
     os.chmod(path, 0o600)
@@ -104,7 +107,7 @@ def load_tokens(path: str | None = None) -> dict | None:
         path = os.path.expanduser(TOKEN_FILE_PATH)
 
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             content = f.read()
         if not content.strip():
             return None
@@ -193,8 +196,17 @@ async def refresh_tokens(refresh_token: str, path: str | None = None) -> dict | 
             resp = await client.post(OAUTH_TOKEN_URL, content=data, headers=headers)
             resp.raise_for_status()
             token_data = resp.json()
+    except httpx.HTTPStatusError as exc:
+        # Server responded with an error status -- carry the status/body so
+        # callers can distinguish "refresh token revoked" (e.g. 400
+        # invalid_grant) from "network down" (no response at all).
+        body = exc.response.text[:500]
+        logger.warning(
+            "Failed to refresh tokens (HTTP %s): %s", exc.response.status_code, body
+        )
+        return None
     except Exception as exc:
-        logger.warning("Failed to refresh tokens: %s", exc)
+        logger.warning("Failed to refresh tokens (network error): %s", exc)
         return None
 
     # Compute expires_at from the expires_in field in the response.
@@ -418,7 +430,11 @@ def generate_pkce_pair() -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
-async def start_device_code_flow() -> dict:
+async def start_device_code_flow(
+    *,
+    print_fn: Callable[[str], None] | None = None,
+    overall_timeout_s: float = DEVICE_CODE_POLL_TIMEOUT_S,
+) -> dict:
     """Perform device code authorization flow and return authorization credentials.
 
     Step 1: POSTs to DEVICE_CODE_USERCODE_URL with client_id and scope to
@@ -477,15 +493,19 @@ async def start_device_code_flow() -> dict:
     interval: int = int(device_data.get("interval", DEVICE_CODE_POLL_INTERVAL))
 
     # Step 2: Prompt the user to authorize via their browser.
-    # Use stderr so the message is visible even when the CLI UI has captured stdout.
+    # Route through print_fn when given (e.g. ChatGPTProvider.login() wires this
+    # to the app-cli's own output channel); otherwise print to stderr so the
+    # message is visible even when the CLI UI has captured stdout (mount path).
     import sys
 
-    print(
-        f"\n\nOpen this URL on any device: {DEVICE_CODE_VERIFICATION_URL}",
-        file=sys.stderr,
-        flush=True,
-    )
-    print(f"Enter code: {user_code}\n", file=sys.stderr, flush=True)
+    def _emit(line: str) -> None:
+        if print_fn is not None:
+            print_fn(line)
+        else:
+            print(line, file=sys.stderr, flush=True)
+
+    _emit(f"\n\nOpen this URL on any device: {DEVICE_CODE_VERIFICATION_URL}")
+    _emit(f"Enter code: {user_code}\n")
     logger.warning(
         "OpenAI OAuth: visit %s and enter code: %s",
         DEVICE_CODE_VERIFICATION_URL,
@@ -500,8 +520,18 @@ async def start_device_code_flow() -> dict:
         "Content-Type": "application/json",
     }
 
+    deadline = time.monotonic() + overall_timeout_s
+    first_poll = True
     while True:
-        await asyncio.sleep(interval)
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Device code flow timed out after {overall_timeout_s:.0f} seconds "
+                "waiting for authorization. Please try again."
+            )
+
+        if not first_poll:
+            await asyncio.sleep(interval)
+        first_poll = False
 
         poll_data = json.dumps(
             {
@@ -555,7 +585,11 @@ async def start_device_code_flow() -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def login(*, token_file_path: str | None = None) -> dict:
+async def login(
+    *,
+    token_file_path: str | None = None,
+    print_fn: Callable[[str], None] | None = None,
+) -> dict:
     """Authenticate using device code flow.
 
     Uses device code flow only — appropriate for all environments including SSH.
@@ -563,6 +597,9 @@ async def login(*, token_file_path: str | None = None) -> dict:
     Args:
         token_file_path: Destination file path for token storage.
             Defaults to TOKEN_FILE_PATH.
+        print_fn: Optional callable used to surface the verification URL and
+            user code (e.g. an app-cli output channel). Defaults to None,
+            which prints to stderr — see :func:`start_device_code_flow`.
 
     Returns:
         Token dict from exchange_code_for_tokens().
@@ -575,52 +612,36 @@ async def login(*, token_file_path: str | None = None) -> dict:
     # can launch on a physical display the user isn't looking at (e.g. SSH into
     # a Pi with HDMI). Device code works everywhere: the user opens the URL on
     # any device they have handy.
-    tasks: list[asyncio.Task] = [asyncio.create_task(start_device_code_flow())]
+    try:
+        result = await start_device_code_flow(print_fn=print_fn)
+    except Exception as exc:
+        raise RuntimeError(f"Device code authentication failed: {exc}") from exc
 
-    pending: set = set(tasks)
-    errors: list[str] = []
+    if result.get("tokens_direct"):
+        # Device code flow returned tokens directly — compute expires_at
+        # from expires_in so the token is never stored with an empty timestamp.
+        expires_in = result.get("expires_in", 3600)
+        expires_at = (
+            datetime.now(tz=timezone.utc) + timedelta(seconds=expires_in)
+        ).isoformat()
+        tokens = {
+            "auth_mode": "oauth",
+            "access_token": result.get("access_token", ""),
+            "refresh_token": result.get("refresh_token", ""),
+            "id_token": result.get("id_token", ""),
+            "account_id": extract_account_id(result.get("id_token", "")),
+            "plan_type": extract_plan_type(result.get("id_token", "")),
+            "expires_at": result.get("expires_at") or expires_at,
+        }
+        save_tokens(tokens, token_file_path)
+        return tokens
 
-    while pending:
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            if task.cancelled():
-                continue
-            exc = task.exception()
-            if exc is None:
-                # Winner found — cancel all remaining tasks
-                for t in pending:
-                    t.cancel()
-                result = task.result()
-
-                if result.get("tokens_direct"):
-                    # Device code flow returned tokens directly — compute expires_at
-                    # from expires_in so the token is never stored with an empty timestamp.
-                    expires_in = result.get("expires_in", 3600)
-                    expires_at = (
-                        datetime.now(tz=timezone.utc) + timedelta(seconds=expires_in)
-                    ).isoformat()
-                    tokens = {
-                        "auth_mode": "oauth",
-                        "access_token": result.get("access_token", ""),
-                        "refresh_token": result.get("refresh_token", ""),
-                        "id_token": result.get("id_token", ""),
-                        "account_id": extract_account_id(result.get("id_token", "")),
-                        "plan_type": extract_plan_type(result.get("id_token", "")),
-                        "expires_at": result.get("expires_at") or expires_at,
-                    }
-                    save_tokens(tokens, token_file_path)
-                    return tokens
-
-                # Use the appropriate redirect_uri based on flow type.
-                # Device code flow uses {issuer}/deviceauth/callback.
-                flow_redirect = result.get("redirect_uri", DEVICE_CODE_CALLBACK_URL)
-                return await exchange_code_for_tokens(
-                    code=result["authorization_code"],
-                    code_verifier=result["code_verifier"],
-                    redirect_uri=flow_redirect,
-                    token_file_path=token_file_path,
-                )
-            else:
-                errors.append(str(exc))
-
-    raise RuntimeError(f"All authentication methods failed: {'; '.join(errors)}")
+    # Use the appropriate redirect_uri based on flow type.
+    # Device code flow uses {issuer}/deviceauth/callback.
+    flow_redirect = result.get("redirect_uri", DEVICE_CODE_CALLBACK_URL)
+    return await exchange_code_for_tokens(
+        code=result["authorization_code"],
+        code_verifier=result["code_verifier"],
+        redirect_uri=flow_redirect,
+        token_file_path=token_file_path,
+    )
