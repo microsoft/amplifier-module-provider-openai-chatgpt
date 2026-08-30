@@ -31,7 +31,43 @@ DEFAULT_MAX_OUTPUT_TOKENS = 128_000
 # Fallback model catalog
 # ---------------------------------------------------------------------------
 
+# Ordered flagship-first to mirror the live catalog's own ordering (confirmed
+# by the live payload's per-entry numeric `priority` field, which increases
+# monotonically in array order -- see the "latest" resolution design note in
+# provider.py above `_resolve_default_model`). FALLBACK_MODELS[0] is load-
+# bearing: it is both the static fallback used when the live catalog can't be
+# reached AND the value "latest" resolves to when unauthenticated.
 FALLBACK_MODELS: list[dict[str, Any]] = [
+    {
+        "slug": "gpt-5.6-sol",
+        "display_name": "GPT 5.6 Sol",
+        "context_window": 1_000_000,
+        "max_context_window": 1_000_000,
+        "additional_speed_tiers": ["fast"],
+        "supported_reasoning_levels": ["none", "low", "medium", "high"],
+        "visibility": "list",
+        "supported_in_api": True,
+    },
+    {
+        "slug": "gpt-5.6-terra",
+        "display_name": "GPT 5.6 Terra",
+        "context_window": 1_000_000,
+        "max_context_window": 1_000_000,
+        "additional_speed_tiers": ["fast"],
+        "supported_reasoning_levels": ["none", "low", "medium", "high"],
+        "visibility": "list",
+        "supported_in_api": True,
+    },
+    {
+        "slug": "gpt-5.6-luna",
+        "display_name": "GPT 5.6 Luna",
+        "context_window": 1_000_000,
+        "max_context_window": 1_000_000,
+        "additional_speed_tiers": ["fast"],
+        "supported_reasoning_levels": ["none", "low", "medium", "high"],
+        "visibility": "list",
+        "supported_in_api": True,
+    },
     {
         "slug": "gpt-5.5",
         "display_name": "GPT 5.5",
@@ -64,27 +100,24 @@ FALLBACK_MODELS: list[dict[str, Any]] = [
         "visibility": "list",
         "supported_in_api": True,
     },
-    {
-        "slug": "gpt-5.3-codex",
-        "display_name": "GPT-5.3 codex",
-        "context_window": 400_000,
-        "max_context_window": 400_000,
-        "additional_speed_tiers": [],
-        "supported_reasoning_levels": ["none", "low", "medium", "high"],
-        "visibility": "list",
-        "supported_in_api": True,
-    },
-    {
-        "slug": "gpt-5.2",
-        "display_name": "GPT 5.2",
-        "context_window": 272_000,
-        "max_context_window": 272_000,
-        "additional_speed_tiers": ["fast"],
-        "supported_reasoning_levels": ["none", "low", "medium", "high"],
-        "visibility": "list",
-        "supported_in_api": True,
-    },
 ]
+
+# Sentinel value for ChatGPTProvider's `default_model` config: resolve to the
+# live catalog's flagship model at first need instead of a hardcoded id that
+# goes stale as new model generations ship. See provider.py's
+# `_resolve_default_model` for the resolution precedence.
+LATEST_MODEL_SENTINEL = "latest"
+
+
+def is_variant_model_id(model_id: str) -> bool:
+    """True if `model_id` is a speed/size variant, not a flagship base model.
+
+    A variant is a synthetic `-fast` speed-tier id (added by
+    :func:`to_model_infos`) or a `-mini` size tier that is part of the raw
+    slug itself (e.g. ``gpt-5.4-mini``). "latest" resolution skips variants
+    so it always lands on a flagship base model.
+    """
+    return model_id.endswith("-fast") or model_id.endswith("-mini")
 
 
 # ---------------------------------------------------------------------------
