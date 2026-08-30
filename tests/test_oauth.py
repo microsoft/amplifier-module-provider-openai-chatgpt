@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -475,7 +476,9 @@ class TestRefreshTokens:
 
         token_path = str(tmp_path / "tokens.json")
         with open(token_path, "w") as f:
-            json.dump({"account_id": "acct_1", "plan_type": "free", "access_token": "old"}, f)
+            json.dump(
+                {"account_id": "acct_1", "plan_type": "free", "access_token": "old"}, f
+            )
 
         id_token_jwt = _make_jwt(
             {"https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}}
@@ -504,7 +507,9 @@ class TestRefreshTokens:
 
         token_path = str(tmp_path / "tokens.json")
         with open(token_path, "w") as f:
-            json.dump({"account_id": "acct_1", "plan_type": "plus", "access_token": "old"}, f)
+            json.dump(
+                {"account_id": "acct_1", "plan_type": "plus", "access_token": "old"}, f
+            )
 
         mock_async_client = _make_httpx_mock(
             {
@@ -699,3 +704,168 @@ class TestLogin:
             result = asyncio.run(login(token_file_path=token_path))
 
         assert result["expires_at"] == server_expires_at
+
+
+# ---------------------------------------------------------------------------
+# TestRefreshTokensWarningDetail -- refresh_tokens() warning carries status/body
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshTokensWarningDetail:
+    """Verify refresh_tokens() warnings let an operator tell a revoked
+    refresh token (HTTP error with status + body) apart from a bare network
+    failure (oauth.py refresh_tokens, previously discarded both alike)."""
+
+    def test_http_status_error_warning_carries_status_and_body(self, tmp_path, caplog):
+        from amplifier_module_provider_openai_chatgpt.oauth import (
+            OAUTH_TOKEN_URL,
+            refresh_tokens,
+        )
+
+        request = httpx.Request("POST", OAUTH_TOKEN_URL)
+        response = httpx.Response(400, json={"error": "invalid_grant"}, request=request)
+        status_error = httpx.HTTPStatusError(
+            "400 Bad Request", request=request, response=response
+        )
+        mock_async_client = _make_httpx_mock(status_error)
+
+        with (
+            patch(
+                "amplifier_module_provider_openai_chatgpt.oauth.httpx.AsyncClient",
+                mock_async_client,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = asyncio.run(
+                refresh_tokens("bad_refresh", path=str(tmp_path / "tokens.json"))
+            )
+
+        assert result is None
+        assert "400" in caplog.text
+        assert "invalid_grant" in caplog.text
+
+    def test_network_error_warning_is_distinguishable_from_http_error(
+        self, tmp_path, caplog
+    ):
+        from amplifier_module_provider_openai_chatgpt.oauth import refresh_tokens
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            side_effect=httpx.ConnectError("connection refused")
+        )
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_async_client = MagicMock(return_value=mock_client)
+
+        with (
+            patch(
+                "amplifier_module_provider_openai_chatgpt.oauth.httpx.AsyncClient",
+                mock_async_client,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = asyncio.run(
+                refresh_tokens("bad_refresh", path=str(tmp_path / "tokens.json"))
+            )
+
+        assert result is None
+        assert "network error" in caplog.text
+        # Must not look like the HTTP-status-error message from the sibling test.
+        assert "400" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# TestDeviceCodePollTimeout -- overall wall-clock bound on the poll loop
+# ---------------------------------------------------------------------------
+
+
+class TestDeviceCodePollTimeout:
+    """Verify start_device_code_flow() enforces an overall wall-clock bound
+    instead of polling forever (oauth.py's poll loop was `while True` with
+    no upper bound)."""
+
+    def test_overall_timeout_raises_runtime_error(self):
+        from amplifier_module_provider_openai_chatgpt.oauth import (
+            start_device_code_flow,
+        )
+
+        mock_async_client = _make_httpx_mock(
+            {"user_code": "ABC-123", "device_auth_id": "dev_001", "interval": 5},
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.oauth.httpx.AsyncClient",
+            mock_async_client,
+        ):
+            with pytest.raises(RuntimeError, match="timed out"):
+                # A negative overall_timeout_s guarantees the deadline is
+                # already in the past by the poll loop's first wall-clock
+                # check -- proves the bound is enforced deterministically,
+                # without waiting, without mocking time.monotonic (which
+                # would also corrupt asyncio's own internal clock), and
+                # without needing to exhaust a sequence of mocked poll
+                # responses.
+                asyncio.run(start_device_code_flow(overall_timeout_s=-1.0))
+
+
+# ---------------------------------------------------------------------------
+# TestPrintFnRouting -- print_fn routes device-code output instead of stderr
+# ---------------------------------------------------------------------------
+
+
+class TestPrintFnRouting:
+    """Verify start_device_code_flow()/login() route the verification URL
+    and user code through print_fn when given, instead of stderr
+    (oauth.py's device-code prompt, previously hardcoded to stderr)."""
+
+    def test_print_fn_receives_url_and_code_instead_of_stderr(self, capsys):
+        from amplifier_module_provider_openai_chatgpt.oauth import (
+            start_device_code_flow,
+        )
+
+        mock_async_client = _make_httpx_mock(
+            {"user_code": "ABC-123", "device_auth_id": "dev_001", "interval": 5},
+            {"authorization_code": "auth_code_xyz"},
+        )
+        captured: list[str] = []
+
+        with (
+            patch(
+                "amplifier_module_provider_openai_chatgpt.oauth.httpx.AsyncClient",
+                mock_async_client,
+            ),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            asyncio.run(start_device_code_flow(print_fn=captured.append))
+
+        assert any("codex/device" in line for line in captured)
+        assert any("ABC-123" in line for line in captured)
+
+        # Nothing should have gone to stderr when print_fn is given.
+        captured_std = capsys.readouterr()
+        assert captured_std.err == ""
+
+    def test_login_passes_print_fn_through_to_start_device_code_flow(self, tmp_path):
+        from amplifier_module_provider_openai_chatgpt.oauth import login
+
+        direct_tokens_result = {
+            "tokens_direct": True,
+            "access_token": "direct_access",
+            "refresh_token": "direct_refresh",
+            "id_token": "",
+            "expires_in": 3600,
+        }
+        token_path = str(tmp_path / "tokens.json")
+        mock_flow = AsyncMock(return_value=direct_tokens_result)
+        sentinel_print_fn = MagicMock()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.oauth.start_device_code_flow",
+            mock_flow,
+        ):
+            result = asyncio.run(
+                login(token_file_path=token_path, print_fn=sentinel_print_fn)
+            )
+
+        assert result["access_token"] == "direct_access"
+        mock_flow.assert_awaited_once_with(print_fn=sentinel_print_fn)
