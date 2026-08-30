@@ -124,8 +124,7 @@ def _coerce_float(value: Any, *, key: str, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         logger.warning(
-            "[PROVIDER] Config key '%s' has invalid float value %r; "
-            "defaulting to %s.",
+            "[PROVIDER] Config key '%s' has invalid float value %r; defaulting to %s.",
             key,
             value,
             default,
@@ -148,6 +147,7 @@ def _coerce_int(value: Any, *, key: str, default: int) -> int:
             default,
         )
         return default
+
 
 # Full endpoint for the ChatGPT Responses API
 CHATGPT_CODEX_ENDPOINT = CHATGPT_CODEX_BASE_URL + "/responses"
@@ -341,12 +341,22 @@ class ChatGPTProvider:
                 models = to_model_infos(entries)
                 self._models_cache = (time.monotonic(), models)
                 return models
+            except kernel_errors.AuthenticationError:
+                # Let this propagate untouched -- no fallback, no traceback,
+                # no stale model list masquerading as success. app-cli renders
+                # AuthenticationError cleanly (see auth_status()/login() above);
+                # swallowing it here (like the fallback path below does for
+                # other errors) used to be the headline onboarding defect.
+                raise
             except Exception as exc:
+                # Non-auth failure (network blip, parse error, ...): keep the
+                # fallback catalog, but do not dump a full traceback at WARNING
+                # -- one line is enough for an operator; the traceback is still
+                # available at DEBUG for anyone actually investigating.
                 logger.warning(
-                    "Failed to fetch live model catalog, using fallback: %s",
-                    exc,
-                    exc_info=True,
+                    "Failed to fetch live model catalog, using fallback: %s", exc
                 )
+                logger.debug("Live model catalog fetch failure detail", exc_info=True)
                 # Do not cache the fallback — next call should retry.
                 return to_model_infos(FALLBACK_MODELS)
 
@@ -848,7 +858,8 @@ class ChatGPTProvider:
                 return
 
         raise kernel_errors.AuthenticationError(
-            "No valid OAuth tokens available — please run the login flow again",
+            "No valid OAuth tokens — run `amplifier provider login "
+            "openai-chatgpt` (or start a session to trigger login)",
             provider=self.name,
             retryable=False,
         )
@@ -913,7 +924,7 @@ class ChatGPTProvider:
         request_id: str = str(uuid.uuid4())
         seq: dict[int, int] = {}
         block_types: dict[int, str] = {}
-        any_emitted: bool = False          # True once any delta/thinking event is emitted
+        any_emitted: bool = False  # True once any delta/thinking event is emitted
         stream_aborted_emitted: bool = False
 
         # Local guard variable — concurrency-safe (no instance-level mutation).
