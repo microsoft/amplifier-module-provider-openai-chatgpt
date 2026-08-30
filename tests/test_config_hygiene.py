@@ -109,9 +109,18 @@ class TestProviderConfigCoercionIntegration:
         assert provider.extra_request_params == {}
         assert "extra_request_params" in caplog.text
 
-    def test_default_model_matches_fallback_first_entry(self):
-        """Guards the docstring-vs-code mismatch found in the survey:
-        __init__.py's mount() docstring said 'gpt-4o' while the actual
-        default (and FALLBACK_MODELS[0]) is 'gpt-5.5'."""
+    def test_default_model_sentinel_and_fallback_first_entry_match(self):
+        """Guards the "latest" default-model design (see provider.py's
+        _resolve_default_model): the CONFIGURED default is now the "latest"
+        sentinel, not a hardcoded model id that goes stale. The STATIC
+        fallback that "latest" resolves to when unauthenticated/unreachable
+        is FALLBACK_MODELS[0] -- this test pins that relationship so the
+        two can never silently drift apart."""
+        from amplifier_module_provider_openai_chatgpt.models import (
+            FALLBACK_MODELS,
+            LATEST_MODEL_SENTINEL,
+        )
+
         provider = ChatGPTProvider(config={})
-        assert provider.default_model == "gpt-5.5"
+        assert provider.default_model == LATEST_MODEL_SENTINEL == "latest"
+        assert FALLBACK_MODELS[0]["slug"] == "gpt-5.6-sol"
