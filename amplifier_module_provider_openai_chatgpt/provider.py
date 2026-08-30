@@ -33,6 +33,7 @@ from amplifier_core.utils import redact_secrets
 from ._sse import ParsedResponse, SSEError, parse_sse_events
 from .models import (
     DEFAULT_CACHE_TTL_SECONDS,
+    DEFAULT_MAX_OUTPUT_TOKENS,
     FALLBACK_MODELS,
     MODELS_CLIENT_VERSION,
     fetch_models,
@@ -258,11 +259,35 @@ class ChatGPTProvider:
     # ------------------------------------------------------------------
 
     def get_info(self) -> ProviderInfo:
-        """Return provider metadata."""
+        """Return provider metadata.
+
+        ``capabilities`` includes ``"auth:oauth-device-code"`` -- the
+        extensible-capabilities route app-cli uses to detect that this
+        provider needs an OAuth login step (via :meth:`auth_status` /
+        :meth:`login`) rather than a static API key. No kernel change
+        needed: capabilities is already a free-form ``list[str]``.
+
+        ``credential_env_vars`` is deliberately empty: this provider
+        authenticates via OAuth device-code login, not an environment
+        variable API key.
+
+        ``config_fields`` is deliberately empty too: login is a *flow*
+        (device-code OAuth), not a config *field* a wizard can prompt for.
+        app-cli's model-picker phase is responsible for the one field this
+        provider does expose meaningfully (``default_model``); it is set
+        via ``settings.yaml``, not a wizard prompt.
+        """
         return ProviderInfo(
             id="openai-chatgpt",
             display_name="OpenAI ChatGPT",
-            capabilities=["streaming", "tools", "reasoning"],
+            capabilities=["streaming", "tools", "reasoning", "auth:oauth-device-code"],
+            credential_env_vars=[],  # deliberately empty: OAuth, not env keys
+            defaults={
+                "model": self.default_model,
+                "context_window": 1_000_000,
+                "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+            },
+            config_fields=[],  # deliberately empty: see docstring above
         )
 
     async def list_models(self) -> list[ModelInfo]:
