@@ -64,8 +64,15 @@ async def mount(
             try:
                 tokens = await login(token_file_path=token_file_path)
             except Exception as exc:
+                # Actionable, not a traceback: name the fix. exc_info is
+                # deliberately omitted -- the provider is simply absent from
+                # this session (see the return None below); a full traceback
+                # here does not help the operator do anything differently.
                 logger.warning(
-                    "ChatGPT OAuth login failed during mount: %s", exc, exc_info=True
+                    "ChatGPT OAuth login failed during mount: %s. Run "
+                    "`amplifier provider login openai-chatgpt` to authenticate, "
+                    "then restart the session.",
+                    exc,
                 )
                 return None
         else:
