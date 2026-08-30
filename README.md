@@ -24,7 +24,7 @@ Connects Amplifier to the ChatGPT backend API using OAuth device code authentica
 
 ```toml
 [providers.provider-openai-chatgpt]
-default_model = "gpt-5.5"
+default_model = "latest"
 ```
 
 ### All Config Options
@@ -39,7 +39,7 @@ Every key below is a fully supported config key -- set it directly in
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `default_model` | str | `"gpt-5.5"` | Model to use for inference |
+| `default_model` | str | `"latest"` | Model to use for inference. `"latest"` is a sentinel meaning "resolve dynamically" -- see "Default Model Resolution" below. Set an explicit model id (e.g. `"gpt-5.4"`) to pin one. |
 | `raw` | bool | `false` | Include full request/response payloads in `llm:request`/`llm:response` hook events (for debugging) |
 | `login_on_mount` | bool | `true` | Trigger interactive device code login if tokens are absent or expired. Set `false` for non-interactive environments. |
 | `token_file_path` | str | `~/.amplifier/openai-chatgpt-oauth.json` | Path to the OAuth token JSON file |
@@ -54,6 +54,48 @@ Boolean and numeric keys accept native types or the string forms a config
 wizard writes (`"true"`/`"false"`); invalid numeric strings warn and fall
 back to the default rather than crashing at mount. Unrecognized config
 keys produce a mount-time warning (with a did-you-mean suggestion).
+
+### Default Model Resolution
+
+`default_model` defaults to `"latest"` -- a sentinel meaning "resolve
+dynamically" instead of a hardcoded model id that goes stale as new model
+generations ship. Resolution precedence:
+
+1. **Explicit non-sentinel config value** (e.g. `default_model = "gpt-5.4"`)
+   -- used verbatim, no resolution, no network call.
+2. **Live-catalog resolution** -- the raw ChatGPT models-endpoint payload
+   does not mark any entry as a "default"/"recommended"/"current" model
+   (verified directly against the live payload), but the catalog IS ordered
+   flagship-first (confirmed by the payload's own per-entry numeric
+   `priority` field). "latest" resolves to the first catalog entry whose id
+   is not a speed/size variant (i.e. does not end in `-fast` or `-mini`) --
+   today that's `gpt-5.6-sol`.
+3. **Static fallback** -- `FALLBACK_MODELS[0]` (also `gpt-5.6-sol` today),
+   used when unauthenticated or when the live catalog can't be reached. No
+   authentication error is raised for this fallback -- auth errors surface
+   from actual requests (`complete()`/`list_models()`), never from resolving
+   what model name to use.
+
+Resolution happens **lazily**, at the first moment a concrete model name is
+actually needed (the first `complete()` call), and is **cached** for the
+provider instance's lifetime -- it does not re-fetch on every request. A
+single `INFO`-level log line records what `"latest"` resolved to and why
+(e.g. `default_model 'latest' resolved to 'gpt-5.6-sol' (live catalog)`).
+
+`get_info()` never triggers a network call to answer this (app-cli's wizard
+calls it eagerly, possibly before login): before resolution has happened it
+reports something honest like `"latest (resolves lazily; falls back to
+gpt-5.6-sol)"` rather than a bare `"latest"` that could be mistaken for a
+real, pinned model id; after resolution it reports the concrete resolved id.
+
+**Wizard interplay:** app-cli's model-picker prompts with the provider's
+current `default_model` and shows the live catalog when authenticated. A
+saved `default_model: latest` is a fully valid, supported settings.yaml
+value -- if the picker's "current" model isn't found in the live catalog
+list (which is expected for the literal string `"latest"`, since it is
+never itself a catalog entry), app-cli's existing "not in list" handling
+shows it as an explicit extra "(current)" choice rather than failing; the
+provider resolves it the same way regardless of how it got there.
 
 ### Authentication
 
@@ -209,11 +251,12 @@ If the live API is unreachable (or `auth_status()` would say `"unauthenticated"`
 
 | Model | Context Window | Max Context Window | Speed Tiers | Reasoning Levels |
 |-------|----------------|---------------------|-------------|------------------|
+| gpt-5.6-sol | 1M | 1M | fast | none/low/medium/high |
+| gpt-5.6-terra | 1M | 1M | fast | none/low/medium/high |
+| gpt-5.6-luna | 1M | 1M | fast | none/low/medium/high |
 | gpt-5.5 | 1M | 1M | fast | none/low/medium/high |
 | gpt-5.4 | 272K | 1.05M | fast | none/low/medium/high |
 | gpt-5.4-mini | ~1.05M | ~1.05M | -- | none/low/medium |
-| gpt-5.3-codex | 400K | 400K | -- | none/low/medium/high |
-| gpt-5.2 | 272K | 272K | fast | none/low/medium/high |
 
 (`context_window` is the effective limit; `max_context_window` is the
 full capacity available on higher-tier plans -- your live catalog may

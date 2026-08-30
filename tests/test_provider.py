@@ -28,24 +28,41 @@ class TestFallbackCatalog:
         for entry in FALLBACK_MODELS:
             assert "slug" in entry, f"Missing 'slug' in {entry}"
 
-    def test_fallback_first_entry_is_gpt_55(self) -> None:
+    def test_fallback_first_entry_is_gpt_56_sol(self) -> None:
         from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
 
         assert len(FALLBACK_MODELS) > 0, "FALLBACK_MODELS must not be empty"
-        assert FALLBACK_MODELS[0]["slug"] == "gpt-5.5", (
-            f"Expected gpt-5.5 as first fallback entry, got {FALLBACK_MODELS[0]['slug']!r}"
+        assert FALLBACK_MODELS[0]["slug"] == "gpt-5.6-sol", (
+            f"Expected gpt-5.6-sol as first fallback entry, got {FALLBACK_MODELS[0]['slug']!r}"
         )
 
-    def test_fallback_contains_gpt_52(self) -> None:
+    def test_fallback_does_not_contain_stale_models(self) -> None:
+        """gpt-5.2 and gpt-5.3-codex are no longer served by the live catalog
+        (confirmed via the raw models-endpoint payload -- see PR description)
+        and must not linger in the fallback catalog."""
         from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
 
         slugs = [m["slug"] for m in FALLBACK_MODELS]
-        assert "gpt-5.2" in slugs
+        assert "gpt-5.2" not in slugs
+        assert "gpt-5.3-codex" not in slugs
 
-    def test_fallback_gpt_52_has_fast_tier(self) -> None:
+    def test_fallback_contains_current_generation(self) -> None:
         from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
 
-        entry = next(m for m in FALLBACK_MODELS if m["slug"] == "gpt-5.2")
+        slugs = [m["slug"] for m in FALLBACK_MODELS]
+        assert slugs == [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+        ]
+
+    def test_fallback_gpt_56_sol_has_fast_tier(self) -> None:
+        from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
+
+        entry = next(m for m in FALLBACK_MODELS if m["slug"] == "gpt-5.6-sol")
         assert "fast" in entry.get("additional_speed_tiers", [])
 
 
@@ -82,6 +99,43 @@ class TestGetInfo:
         provider = self._make_provider()
         info = provider.get_info()  # type: ignore[union-attr]
         assert "tools" in info.capabilities
+
+    def test_get_info_model_default_shows_sentinel_with_fallback_noted(self) -> None:
+        """Before resolution, defaults["model"] must be honest: it names the
+        "latest" sentinel AND the fallback it would resolve to -- never a
+        bare "latest" that looks like a real pinned model id, and never a
+        network call (get_info() stays synchronous/side-effect-free)."""
+        provider = self._make_provider()
+        info = provider.get_info()  # type: ignore[union-attr]
+        assert "latest" in info.defaults["model"]
+        assert "gpt-5.6-sol" in info.defaults["model"]
+
+    def test_get_info_model_shows_resolved_id_once_resolved(self) -> None:
+        """After resolution has happened (cached on the instance),
+        defaults["model"] shows the concrete resolved id, not the sentinel."""
+        provider = self._make_provider()
+        provider._resolved_default_model = "gpt-5.6-terra"  # type: ignore[union-attr]
+        info = provider.get_info()  # type: ignore[union-attr]
+        assert info.defaults["model"] == "gpt-5.6-terra"
+
+    def test_get_info_explicit_model_shown_verbatim(self) -> None:
+        """An explicit non-sentinel default_model is shown as-is, with no
+        sentinel/fallback framing."""
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        provider = ChatGPTProvider(config={"default_model": "gpt-5.4"})
+        info = provider.get_info()  # type: ignore[union-attr]
+        assert info.defaults["model"] == "gpt-5.4"
+
+    def test_get_info_never_awaits_anything(self) -> None:
+        """get_info() must stay synchronous and must not trigger a live
+        catalog fetch -- app-cli's wizard calls it eagerly at mount time,
+        potentially before login."""
+        import inspect
+
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        assert not inspect.iscoroutinefunction(ChatGPTProvider.get_info)
 
 
 # ---------------------------------------------------------------------------
@@ -1544,6 +1598,255 @@ class TestListModelsDynamic:
         # All 5 callers should receive the same non-empty result.
         for result in results:
             assert len(result) > 0
+
+
+# ---------------------------------------------------------------------------
+# TestResolveDefaultModel — "latest" sentinel resolution (_resolve_default_model)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveDefaultModel:
+    """Tests for the "latest" default-model resolution design.
+
+    Precedence: explicit config value > live-catalog resolution (first
+    non-variant, flagship-first per the live-payload evidence) > static
+    FALLBACK_MODELS[0]. Resolved lazily, cached for the provider instance's
+    lifetime, one INFO log line. Unauthenticated resolution falls back
+    silently -- unlike list_models()/_get_catalog(), which correctly
+    propagate AuthenticationError (see TestListModelsAuthPropagation) since
+    those ARE actual requests for the live catalog, not "what model name do
+    I use" resolution.
+    """
+
+    def _make_provider(
+        self,
+        default_model: str = "latest",
+        tokens: dict | None = None,
+        token_file_path: str | None = None,
+        coordinator: object | None = None,
+    ) -> object:
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        config: dict = {"default_model": default_model}
+        if token_file_path is not None:
+            config["token_file_path"] = token_file_path
+        if coordinator is None:
+            coordinator = MagicMock()
+        return ChatGPTProvider(config, coordinator, tokens)
+
+    def _authenticated_tokens(self) -> dict:
+        from datetime import datetime, timedelta, timezone
+
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        return {
+            "access_token": "tok",
+            "account_id": "acct-123",
+            "expires_at": expires_at,
+        }
+
+    def _sample_live_entries(self) -> list[dict]:
+        """Flagship-first order with a -fast variant, mirroring the live
+        catalog's own shape (see the raw-payload evidence in the PR body)."""
+        return [
+            {
+                "slug": "gpt-5.6-sol",
+                "display_name": "GPT-5.6-Sol",
+                "context_window": 272000,
+                "supported_in_api": True,
+                "visibility": "list",
+                "additional_speed_tiers": ["fast"],
+                "supported_reasoning_levels": [],
+            },
+            {
+                "slug": "gpt-5.4-mini",
+                "display_name": "GPT-5.4-Mini",
+                "context_window": 272000,
+                "supported_in_api": True,
+                "visibility": "list",
+                "additional_speed_tiers": [],
+                "supported_reasoning_levels": [],
+            },
+        ]
+
+    # ------------------------------------------------------------------
+    # Precedence: explicit config value bypasses resolution entirely
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_explicit_model_untouched_by_resolution(self) -> None:
+        """An explicit non-sentinel default_model is returned as-is --
+        no catalog fetch, no network call at all."""
+        provider = self._make_provider(
+            default_model="gpt-5.4", tokens=self._authenticated_tokens()
+        )
+        mock_fetch = AsyncMock(side_effect=AssertionError("must not fetch"))
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            mock_fetch,
+        ):
+            resolved = await provider._resolve_default_model()  # type: ignore[union-attr]
+
+        assert resolved == "gpt-5.4"
+        mock_fetch.assert_not_awaited()
+
+    # ------------------------------------------------------------------
+    # Sentinel + authenticated -> first non-variant catalog entry
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_sentinel_authenticated_resolves_first_non_variant(self) -> None:
+        provider = self._make_provider(tokens=self._authenticated_tokens())
+        mock_fetch = AsyncMock(return_value=self._sample_live_entries())
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            mock_fetch,
+        ):
+            resolved = await provider._resolve_default_model()  # type: ignore[union-attr]
+
+        assert resolved == "gpt-5.6-sol"
+        mock_fetch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sentinel_authenticated_skips_variant_ids(self) -> None:
+        """Defensive ordering case: even if a -mini/-fast id sorted first in
+        the catalog, resolution skips it for the first NON-variant entry --
+        matching the decision rule ('first catalog entry whose id has no
+        variant suffix')."""
+        provider = self._make_provider(tokens=self._authenticated_tokens())
+        entries = [
+            {
+                "slug": "gpt-5.4-mini",
+                "display_name": "GPT-5.4-Mini",
+                "context_window": 272000,
+                "supported_in_api": True,
+                "visibility": "list",
+                "additional_speed_tiers": [],
+                "supported_reasoning_levels": [],
+            },
+            {
+                "slug": "gpt-5.6-sol",
+                "display_name": "GPT-5.6-Sol",
+                "context_window": 272000,
+                "supported_in_api": True,
+                "visibility": "list",
+                "additional_speed_tiers": ["fast"],
+                "supported_reasoning_levels": [],
+            },
+        ]
+        mock_fetch = AsyncMock(return_value=entries)
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            mock_fetch,
+        ):
+            resolved = await provider._resolve_default_model()  # type: ignore[union-attr]
+
+        assert resolved == "gpt-5.6-sol"
+
+    # ------------------------------------------------------------------
+    # Unauthenticated -> FALLBACK_MODELS[0], no auth error raised
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_falls_back_silently(self, tmp_path) -> None:
+        from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
+
+        provider = self._make_provider(
+            tokens=None, token_file_path=str(tmp_path / "tokens.json")
+        )
+
+        # No fetch_models mock needed -- _ensure_valid_tokens() fails before
+        # any HTTP call is attempted (no tokens in memory, on disk, or via
+        # refresh_token anywhere). Resolution must not raise.
+        resolved = await provider._resolve_default_model()  # type: ignore[union-attr]
+
+        assert resolved == FALLBACK_MODELS[0]["slug"] == "gpt-5.6-sol"
+
+    # ------------------------------------------------------------------
+    # Cache: catalog fetched (and resolved) once per provider instance
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_resolution_cached_for_instance_lifetime(self) -> None:
+        provider = self._make_provider(tokens=self._authenticated_tokens())
+        mock_fetch = AsyncMock(return_value=self._sample_live_entries())
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            mock_fetch,
+        ):
+            first = await provider._resolve_default_model()  # type: ignore[union-attr]
+            second = await provider._resolve_default_model()  # type: ignore[union-attr]
+
+        assert first == second == "gpt-5.6-sol"
+        mock_fetch.assert_awaited_once()
+
+    # ------------------------------------------------------------------
+    # Exactly one INFO log line names the resolution
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_resolution_logs_one_info_line(self, caplog) -> None:
+        import logging
+
+        provider = self._make_provider(tokens=self._authenticated_tokens())
+        mock_fetch = AsyncMock(return_value=self._sample_live_entries())
+
+        with (
+            patch(
+                "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+                mock_fetch,
+            ),
+            caplog.at_level(logging.INFO),
+        ):
+            await provider._resolve_default_model()  # type: ignore[union-attr]
+            await provider._resolve_default_model()  # type: ignore[union-attr]  # cached -- no 2nd log line
+
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        matching = [r for r in info_records if "gpt-5.6-sol" in r.getMessage()]
+        assert len(matching) == 1, (
+            f"Expected exactly one INFO line naming the resolution, got {info_records}"
+        )
+
+    # ------------------------------------------------------------------
+    # complete() resolves "latest" and sends the resolved model
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_complete_sends_resolved_model_not_literal_sentinel(self) -> None:
+        """End-to-end: complete() must never send the literal string
+        "latest" to the ChatGPT backend -- it resolves first."""
+        from amplifier_core.message_models import ChatRequest, Message
+
+        coordinator = MagicMock()
+        coordinator.hooks.emit = AsyncMock()
+        provider = self._make_provider(
+            tokens=self._authenticated_tokens(), coordinator=coordinator
+        )
+        mock_fetch = AsyncMock(return_value=self._sample_live_entries())
+        request = ChatRequest(messages=[Message(role="user", content="hi")])
+        sse_lines = _make_sse_lines(text="OK")
+
+        with (
+            patch(
+                "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+                mock_fetch,
+            ),
+            patch(
+                "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+            ) as MockClient,
+        ):
+            MockClient.return_value = _make_sse_response(sse_lines)
+            await provider.complete(request)  # type: ignore[union-attr]
+
+            # Inspect the actual JSON payload sent to the backend.
+            _, call_kwargs = MockClient.return_value._value.stream.call_args
+            sent_model = call_kwargs["json"]["model"]
+
+        assert sent_model == "gpt-5.6-sol"
+        assert provider._resolved_default_model == "gpt-5.6-sol"  # type: ignore[union-attr]
 
 
 # ---------------------------------------------------------------------------

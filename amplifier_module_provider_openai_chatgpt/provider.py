@@ -35,8 +35,10 @@ from .models import (
     DEFAULT_CACHE_TTL_SECONDS,
     DEFAULT_MAX_OUTPUT_TOKENS,
     FALLBACK_MODELS,
+    LATEST_MODEL_SENTINEL,
     MODELS_CLIENT_VERSION,
     fetch_models,
+    is_variant_model_id,
     to_model_infos,
 )
 from .oauth import (
@@ -205,7 +207,15 @@ class ChatGPTProvider:
             self._config.get("priority"), key="priority", default=100
         )
         self.raw: bool = _coerce_bool(self._config.get("raw"), key="raw", default=False)
-        self.default_model: str = self._config.get("default_model", "gpt-5.5")
+        # "latest" is the sentinel default: config absent OR explicitly
+        # "latest" means dynamic resolution (see _resolve_default_model()).
+        # An explicit non-sentinel value (e.g. "gpt-5.4") bypasses resolution
+        # entirely and is used verbatim -- this attribute always holds the
+        # CONFIGURED value, not the resolved one (see
+        # self._resolved_default_model for the resolution cache).
+        self.default_model: str = self._config.get(
+            "default_model", LATEST_MODEL_SENTINEL
+        )
         self.timeout: float = _coerce_float(
             self._config.get("timeout"), key="timeout", default=300.0
         )
@@ -251,6 +261,11 @@ class ChatGPTProvider:
         self._models_cache: tuple[float, list[ModelInfo]] | None = None
         self._models_lock = asyncio.Lock()
 
+        # "latest" resolution cache: None until resolved, then held for the
+        # provider instance's lifetime (see _resolve_default_model()).
+        self._resolved_default_model: str | None = None
+        self._default_model_lock = asyncio.Lock()
+
         # No persistent client — httpx.AsyncClient is created per-request in complete().
         # This is intentional: token refresh may change headers between calls.
 
@@ -261,7 +276,7 @@ class ChatGPTProvider:
     def get_info(self) -> ProviderInfo:
         """Return provider metadata.
 
-        ``capabilities`` includes ``"auth:oauth-device-code"`` -- the
+        ``capabilities`` includes ``"auth:oauth_device_code"`` -- the
         extensible-capabilities route app-cli uses to detect that this
         provider needs an OAuth login step (via :meth:`auth_status` /
         :meth:`login`) rather than a static API key. No kernel change
@@ -276,14 +291,35 @@ class ChatGPTProvider:
         app-cli's model-picker phase is responsible for the one field this
         provider does expose meaningfully (``default_model``); it is set
         via ``settings.yaml``, not a wizard prompt.
+
+        ``defaults["model"]`` never triggers a network call (this method
+        must stay synchronous and side-effect-free -- app-cli's wizard calls
+        it eagerly). When ``default_model`` is the ``"latest"`` sentinel and
+        resolution hasn't happened yet on this instance (no `complete()` or
+        `list_models()` call has occurred), it presents the sentinel plus
+        the fallback that would apply if resolution can't reach the live
+        catalog -- e.g. ``"latest (resolves lazily; falls back to
+        gpt-5.6-sol)"`` -- rather than silently showing a placeholder as if
+        it were a real, pinned model id. Once resolved, the concrete
+        resolved model id is shown instead.
         """
+        if self._resolved_default_model is not None:
+            model_display = self._resolved_default_model
+        elif self.default_model == LATEST_MODEL_SENTINEL:
+            model_display = (
+                f"{LATEST_MODEL_SENTINEL} (resolves lazily; "
+                f"falls back to {FALLBACK_MODELS[0]['slug']})"
+            )
+        else:
+            model_display = self.default_model
+
         return ProviderInfo(
             id="openai-chatgpt",
             display_name="OpenAI ChatGPT",
-            capabilities=["streaming", "tools", "reasoning", "auth:oauth-device-code"],
-            credential_env_vars=[],  # deliberately empty: OAuth, not env keys
+            capabilities=["streaming", "tools", "reasoning", "auth:oauth_device_code"],
+            credential_env_vars=[],
             defaults={
-                "model": self.default_model,
+                "model": model_display,
                 "context_window": 1_000_000,
                 "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
             },
@@ -359,6 +395,73 @@ class ChatGPTProvider:
                 logger.debug("Live model catalog fetch failure detail", exc_info=True)
                 # Do not cache the fallback — next call should retry.
                 return to_model_infos(FALLBACK_MODELS)
+
+    async def _resolve_default_model(self) -> str:
+        """Resolve ``self.default_model`` to a concrete model id.
+
+        ``self.default_model`` holds the CONFIGURED value verbatim (see
+        ``__init__``). When it is the ``"latest"`` sentinel, this method
+        performs the dynamic resolution; otherwise the configured value is
+        returned as-is (no network, no caching needed -- an explicit config
+        value is never ambiguous).
+
+        Resolution precedence (evaluated in order):
+
+        1. Explicit non-sentinel config value -- returned unchanged.
+        2. Live-catalog resolution: the first model in the live catalog
+           (:meth:`_get_catalog`, already ordered flagship-first -- see the
+           evidence note on :data:`~.models.FALLBACK_MODELS`) whose id is
+           not a speed/size variant (:func:`~.models.is_variant_model_id`).
+           The live ChatGPT models endpoint does not mark any entry as a
+           "default" -- this provider was verified against the raw payload
+           and no such field exists -- so flagship-first ordering is the
+           strongest available signal.
+        3. :data:`~.models.FALLBACK_MODELS`[0] -- used when unauthenticated
+           (no auth error is raised for this; auth errors belong to actual
+           requests, not to resolving what model name to use) or when the
+           live catalog is reachable but returns no non-variant entry.
+
+        Resolved LAZILY on first call (from :meth:`complete` or
+        :meth:`list_models`), then cached on ``self._resolved_default_model``
+        for the provider instance's lifetime. Emits exactly one INFO log
+        line recording what "latest" resolved to and why.
+        """
+        if self.default_model != LATEST_MODEL_SENTINEL:
+            return self.default_model
+
+        if self._resolved_default_model is not None:
+            return self._resolved_default_model
+
+        async with self._default_model_lock:
+            # Double-check under lock (mirrors _get_catalog's pattern).
+            if self._resolved_default_model is not None:
+                return self._resolved_default_model
+
+            try:
+                models = await self._get_catalog()
+                resolved = next(
+                    (m.id for m in models if not is_variant_model_id(m.id)),
+                    None,
+                )
+                if resolved is None:
+                    resolved = models[0].id if models else FALLBACK_MODELS[0]["slug"]
+                reason = "live catalog"
+            except kernel_errors.AuthenticationError:
+                # Unauthenticated: fall back silently. Auth errors belong to
+                # actual requests (complete()/list_models()) -- resolving a
+                # model NAME should never fail just because no one is
+                # logged in yet.
+                resolved = FALLBACK_MODELS[0]["slug"]
+                reason = "unauthenticated -- using static fallback"
+
+            self._resolved_default_model = resolved
+            logger.info(
+                "[PROVIDER] default_model '%s' resolved to '%s' (%s)",
+                LATEST_MODEL_SENTINEL,
+                resolved,
+                reason,
+            )
+            return resolved
 
     # ------------------------------------------------------------------
     # Auth surface (capability marker: "auth:oauth-device-code")
@@ -465,7 +568,9 @@ class ChatGPTProvider:
             # ToolCallBlock and ToolResultBlock are handled in _build_payload
         return result
 
-    def _build_payload(self, request: ChatRequest) -> dict[str, Any]:
+    def _build_payload(
+        self, request: ChatRequest, *, default_model: str | None = None
+    ) -> dict[str, Any]:
         """Build Responses API payload from an Amplifier ChatRequest.
 
         Key rules enforced:
@@ -476,13 +581,18 @@ class ChatGPTProvider:
           parallel_tool_calls, include) are never included
         - ``-fast`` model suffix → strip suffix + ``service_tier: 'priority'``
         - request.model overrides default_model
+        - `default_model` param overrides self.default_model when given
+          (used by complete() to pass the already-resolved "latest" model
+          instead of the literal sentinel string)
         - Tools → {type, name, description, parameters} + tool_choice: 'auto'
         - ToolResultBlock → {type: function_call_output, call_id, output}
         - ToolCallBlock → {type: function_call, call_id, name, arguments}
         - Reasoning effort → {reasoning: {effort, summary: 'detailed'}}
         """
-        # Resolve model (request overrides provider default)
-        model: str = request.model or self.default_model
+        # Resolve model (request overrides provider default, which itself
+        # is overridden by an already-resolved `default_model` param when
+        # the caller -- complete() -- has one).
+        model: str = request.model or default_model or self.default_model
 
         # Handle -fast suffix → priority service tier
         service_tier: str | None = None
@@ -885,11 +995,18 @@ class ChatGPTProvider:
         # 1. Ensure valid OAuth tokens.
         await self._ensure_valid_tokens()
 
+        # 1b. Resolve "latest" (if configured) to a concrete model id. This
+        # is the "first need" moment for a completion request -- resolved
+        # once, cached on self._resolved_default_model for the provider
+        # instance's lifetime. No-op (returns immediately) when an explicit
+        # non-sentinel default_model is configured.
+        effective_default_model = await self._resolve_default_model()
+
         # 2. Build request payload.
-        payload = self._build_payload(request)
+        payload = self._build_payload(request, default_model=effective_default_model)
 
         # Resolve effective model name (mirrors _build_payload logic) for events.
-        model: str = request.model or self.default_model
+        model: str = request.model or effective_default_model
         if model.endswith("-fast"):
             model = model.removesuffix("-fast")
 
