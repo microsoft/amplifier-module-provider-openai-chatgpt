@@ -29,9 +29,13 @@ default_model = "gpt-5.5"
 
 ### All Config Options
 
-This provider has no interactive setup wizard (no `ConfigField` prompts) --
-it authenticates via OAuth device-code login on mount instead. Every key
-below is a fully supported config key -- set it directly in `settings.yaml`.
+This provider has no `ConfigField`-based setup wizard -- `config_fields` is
+deliberately empty (see `get_info()`), because login is a *flow* (OAuth
+device-code), not a config *field* a wizard prompts for. The one field
+this provider meaningfully exposes, `default_model`, is set by app-cli's
+model-picker phase. See "Onboarding" below for the login step itself.
+Every key below is a fully supported config key -- set it directly in
+`settings.yaml`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -53,13 +57,22 @@ keys produce a mount-time warning (with a did-you-mean suggestion).
 
 ### Authentication
 
-On first use, the provider initiates an OAuth device code flow:
+On first use (via `amplifier provider add openai-chatgpt` or
+`amplifier provider login openai-chatgpt`), the provider initiates an
+OAuth device code flow:
 
 1. Displays a verification URL (`https://auth.openai.com/codex/device`) and a code in the terminal
 2. You open the URL in a browser and enter the code
 3. Tokens are cached to `~/.amplifier/openai-chatgpt-oauth.json` for subsequent use
 
-Tokens auto-refresh silently when they expire. If the refresh token itself expires, the device code flow runs again.
+Tokens auto-refresh silently **mid-session** when the access token expires
+(a 4-step in-memory/disk/refresh fallback chain -- see "Features" below).
+If the *refresh* token itself has expired, there is no automatic mid-session
+recovery: the device code flow only runs again the next time this provider
+mounts (a new session) or when you explicitly run
+`amplifier provider login openai-chatgpt`. Call `auth_status()` at any time
+to check the current state: `"authenticated"`, `"expired"`, or
+`"unauthenticated"`.
 
 Requires "Sign in with device code" to be enabled in your ChatGPT account security settings (Settings > Security).
 
@@ -73,7 +86,9 @@ Works in SSH/headless sessions -- the device code flow only requires a browser o
 - Dynamic model catalog from live API (cached, with fallback)
 - Subscription plan type detection from OAuth JWT
 - Tool calling support
-- Reasoning effort support (`low`/`medium`/`high`/`xhigh` on all gpt-5.x models)
+- Reasoning effort support (`low`/`medium`/`high` across all catalog models;
+  `xhigh` is additionally accepted for `gpt-5.5-pro`-prefixed model IDs via a
+  dedicated pre-flight validator)
 - `-fast` model suffix support (e.g. `gpt-5.5-fast` -> `gpt-5.5` with `service_tier: "priority"`)
 - Production routing matrix for all 13 Amplifier agent roles
 - `llm:request`/`llm:response` hook events with optional raw payload inclusion
@@ -111,15 +126,25 @@ amplifier module add provider-openai-chatgpt \
 # 2. Install the provider
 amplifier provider install openai-chatgpt --force
 
-# 3. Add the provider (no interactive config wizard -- this provider has no
-#    ConfigField prompts; it authenticates via OAuth device-code login on
-#    mount instead. Set any config keys directly in settings.yaml -- see
-#    "All config keys" below)
+# 3. Add the provider. `provider add` runs the OAuth device-code login step
+#    as part of onboarding (there is no ConfigField wizard to fill in -- see
+#    "All Config Options" above; login is a flow, not a field). You will see
+#    a verification URL and a code to enter in a browser.
 amplifier provider add openai-chatgpt
 
-# 4. Or use the management dashboard
+# 4. Already added but need to (re-)authenticate? Run login directly
+#    instead of re-adding the provider:
+amplifier provider login openai-chatgpt
+
+# 5. Or use the management dashboard
 amplifier provider manage
 ```
+
+`login_on_mount` (default `true`) remains a runtime safety net: if a
+session starts and this provider's tokens are missing or expired,
+`mount()` triggers the same device-code flow automatically. Set it
+`false` in non-interactive environments where a stuck login prompt
+would hang session startup.
 
 You can also wire it into a bundle directly with an inline `source:` field:
 
@@ -179,19 +204,28 @@ See the matrix YAML header for full documentation on glob strategy, fallback phi
 
 The model catalog is fetched dynamically from the ChatGPT backend API at `GET /backend-api/codex/models`. Available models depend on your subscription tier. The catalog is cached for 1 hour (configurable via `models_cache_ttl`).
 
-Example catalog for a **Plus** subscription (as of April 2026):
+If the live API is unreachable (or `auth_status()` would say `"unauthenticated"`/`"expired"` -- see below), this module's built-in
+`FALLBACK_MODELS` catalog (`models.py`) is used instead:
 
-| Model | Context Window | Priority | Speed Tiers | Reasoning |
-|-------|---------------|----------|-------------|-----------|
-| gpt-5.5 | 272K | 0 (highest) | fast | low/med/high/xhigh |
-| gpt-5.4 | 272K | 2 | fast | low/med/high/xhigh |
-| gpt-5.4-mini | 272K | 4 | -- | low/med/high/xhigh |
-| gpt-5.3-codex | 272K | 6 | -- | low/med/high/xhigh |
-| gpt-5.2 | 272K | 10 | -- | low/med/high/xhigh |
+| Model | Context Window | Max Context Window | Speed Tiers | Reasoning Levels |
+|-------|----------------|---------------------|-------------|------------------|
+| gpt-5.5 | 1M | 1M | fast | none/low/medium/high |
+| gpt-5.4 | 272K | 1.05M | fast | none/low/medium/high |
+| gpt-5.4-mini | ~1.05M | ~1.05M | -- | none/low/medium |
+| gpt-5.3-codex | 400K | 400K | -- | none/low/medium/high |
+| gpt-5.2 | 272K | 272K | fast | none/low/medium/high |
+
+(`context_window` is the effective limit; `max_context_window` is the
+full capacity available on higher-tier plans -- your live catalog may
+differ; check `list_models()` for what your subscription actually exposes.)
 
 Models with a "fast" speed tier support a `-fast` suffix (e.g. `gpt-5.5-fast`) which maps to `service_tier: "priority"` in the request. This consumes priority quota faster.
 
-If the live API is unreachable, a minimal fallback catalog (gpt-5.2, gpt-5.2-codex, gpt-4o) is used. The fallback is not cached, so the next `list_models()` call retries the live API.
+The fallback is only used when `list_models()` cannot reach or successfully
+parse the live catalog and the failure is **not** an `AuthenticationError`
+(an auth failure propagates instead of silently falling back -- see "Known
+Limitations"). The fallback is not cached, so the next `list_models()` call
+retries the live API.
 
 ## DTU Validation
 
@@ -217,7 +251,8 @@ See [docs/DTU_VALIDATION.md](docs/DTU_VALIDATION.md) for the full guide covering
 - **Automatic mid-session 401 recovery** -- if the access token expires mid-session, the provider performs one silent token refresh and retries the request automatically. A second consecutive 401 raises `AuthenticationError`.
 - **No `response.incomplete` continuation** -- if a reasoning model hits its output limit, the partial response is lost. Auto-continuation is planned.
 - **Streaming is mandatory** -- the ChatGPT backend requires `stream=True`. The provider always streams internally but returns a complete `ChatResponse` to the orchestrator.
-- **No `response.content_part.delta` handling** -- only `response.output_item.done` events are accumulated. Streaming delta forwarding is planned.
+- **No dedicated `response.content_part.delta` handling** -- the delta event types the ChatGPT backend actually emits (`response.output_text.delta` for text, `response.reasoning_text.delta`/`response.reasoning_summary_text.delta` for reasoning) are forwarded live via the standard `llm:stream_block_delta` contract. `response.content_part.delta` is a distinct event type this provider does not special-case.
+- **`list_models()` does not mask auth failures** -- `AuthenticationError` from the catalog fetch propagates to the caller instead of silently substituting the fallback catalog; only non-auth failures (network errors, parse errors, ...) fall back.
 
 ## Dependencies
 

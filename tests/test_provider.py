@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import pytest
 import httpx
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -1310,6 +1311,62 @@ class TestMount:
 
 
 # ---------------------------------------------------------------------------
+# TestMountCallsLogin -- fail-before proof for the headline onboarding defect
+# ---------------------------------------------------------------------------
+
+
+class TestMountCallsLogin:
+    """mount() with no valid tokens and login_on_mount=True (the default)
+    must call oauth.login(). This is the fail-before proof for the headline
+    onboarding defect: `amplifier provider add` constructs ChatGPTProvider
+    directly and never calls mount() at all, so this login trigger --
+    mount()'s ONLY entrypoint before this PR -- never fires from that path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mount_calls_login_when_no_valid_tokens_and_login_on_mount_true(
+        self,
+    ) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from amplifier_module_provider_openai_chatgpt import mount
+
+        coordinator = MagicMock()
+        coordinator.mount = AsyncMock()
+        config = {"login_on_mount": True}
+
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        logged_in_tokens = {
+            "access_token": "fresh_access",
+            "account_id": "acct-123",
+            "expires_at": expires_at,
+        }
+        mock_login = AsyncMock(return_value=logged_in_tokens)
+
+        with (
+            patch(
+                "amplifier_module_provider_openai_chatgpt.load_tokens",
+                return_value=None,
+            ),
+            patch(
+                "amplifier_module_provider_openai_chatgpt.is_token_valid",
+                side_effect=[False, True],
+            ),
+            patch(
+                "amplifier_module_provider_openai_chatgpt.login",
+                mock_login,
+            ),
+        ):
+            cleanup = await mount(coordinator, config)
+
+        mock_login.assert_awaited_once()
+        coordinator.mount.assert_called_once_with(
+            "providers", ANY, name="openai-chatgpt"
+        )
+        assert callable(cleanup)
+
+
+# ---------------------------------------------------------------------------
 # TestListModelsDynamic — caching logic in _get_catalog() / list_models()
 # ---------------------------------------------------------------------------
 
@@ -2192,3 +2249,235 @@ class TestGpt55ProValidator:
 
         with pytest.raises(kernel_errors.InvalidRequestError):
             provider._build_payload(request)  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# TestAuthStatus -- ChatGPTProvider.auth_status() across all three states
+# ---------------------------------------------------------------------------
+
+
+class TestAuthStatus:
+    """Verify auth_status() returns "authenticated" | "expired" |
+    "unauthenticated" per its documented contract (provider.py)."""
+
+    def _make_provider(self, tokens=None, token_file_path=None):
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        config: dict = {}
+        if token_file_path is not None:
+            config["token_file_path"] = token_file_path
+        coordinator = MagicMock()
+        return ChatGPTProvider(config, coordinator, tokens)
+
+    def test_authenticated_when_in_memory_tokens_valid(self):
+        from datetime import datetime, timedelta, timezone
+
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        provider = self._make_provider(
+            tokens={"access_token": "tok", "expires_at": expires_at}
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.load_tokens",
+            return_value=None,
+        ):
+            assert provider.auth_status() == "authenticated"  # type: ignore[union-attr]
+
+    def test_authenticated_when_disk_tokens_valid_and_memory_empty(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        provider = self._make_provider(
+            tokens=None, token_file_path=str(tmp_path / "tokens.json")
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.load_tokens",
+            return_value={"access_token": "tok", "expires_at": expires_at},
+        ):
+            assert provider.auth_status() == "authenticated"  # type: ignore[union-attr]
+
+    def test_expired_when_tokens_present_but_invalid(self):
+        provider = self._make_provider(tokens={"access_token": "", "expires_at": None})
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.load_tokens",
+            return_value=None,
+        ):
+            assert provider.auth_status() == "expired"  # type: ignore[union-attr]
+
+    def test_expired_when_only_disk_tokens_are_present_but_invalid(self, tmp_path):
+        provider = self._make_provider(
+            tokens=None, token_file_path=str(tmp_path / "tokens.json")
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.load_tokens",
+            return_value={"access_token": "", "expires_at": None},
+        ):
+            assert provider.auth_status() == "expired"  # type: ignore[union-attr]
+
+    def test_unauthenticated_when_nothing_found_anywhere(self):
+        provider = self._make_provider(tokens=None)
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.load_tokens",
+            return_value=None,
+        ):
+            assert provider.auth_status() == "unauthenticated"  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# TestChatGPTProviderLogin -- instance login() wrapper
+# ---------------------------------------------------------------------------
+
+
+class TestChatGPTProviderLogin:
+    """Verify ChatGPTProvider.login() adopts returned tokens and forwards
+    print_fn through to oauth.login() (provider.py's thin wrapper)."""
+
+    def _make_provider(self):
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        config = {"token_file_path": "/tmp/chatgpt-provider-login-test-tokens.json"}
+        coordinator = MagicMock()
+        return ChatGPTProvider(config, coordinator, None)
+
+    @pytest.mark.asyncio
+    async def test_login_adopts_returned_tokens_and_forwards_print_fn(self):
+        from datetime import datetime, timedelta, timezone
+
+        provider = self._make_provider()
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        new_tokens = {
+            "access_token": "brand_new",
+            "account_id": "acct-999",
+            "expires_at": expires_at,
+        }
+        mock_oauth_login = AsyncMock(return_value=new_tokens)
+        sentinel_print_fn = MagicMock()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.oauth_login",
+            mock_oauth_login,
+        ):
+            result = await provider.login(print_fn=sentinel_print_fn)  # type: ignore[union-attr]
+
+        assert result is True
+        assert provider._tokens == new_tokens  # type: ignore[union-attr]
+        mock_oauth_login.assert_awaited_once_with(
+            token_file_path=provider._token_file_path,  # type: ignore[union-attr]
+            print_fn=sentinel_print_fn,
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestListModelsAuthPropagation -- AuthenticationError propagates, no fallback
+# ---------------------------------------------------------------------------
+
+
+class TestListModelsAuthPropagation:
+    """Verify list_models() lets AuthenticationError propagate instead of
+    silently substituting the fallback catalog with a raw traceback --
+    the headline onboarding defect this PR fixes (provider.py _get_catalog()).
+    """
+
+    def _make_provider(self):
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        config: dict = {}
+        coordinator = MagicMock()
+        # No tokens at all -- _ensure_valid_tokens() will raise AuthenticationError.
+        return ChatGPTProvider(config, coordinator, None)
+
+    @pytest.mark.asyncio
+    async def test_list_models_raises_authentication_error(self):
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.load_tokens",
+            return_value=None,
+        ):
+            with pytest.raises(kernel_errors.AuthenticationError):
+                await provider.list_models()  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_list_models_auth_failure_logs_no_traceback_anywhere(self, caplog):
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+
+        with (
+            patch(
+                "amplifier_module_provider_openai_chatgpt.provider.load_tokens",
+                return_value=None,
+            ),
+            caplog.at_level(logging.DEBUG),
+        ):
+            with pytest.raises(kernel_errors.AuthenticationError):
+                await provider.list_models()  # type: ignore[union-attr]
+
+        for record in caplog.records:
+            assert record.exc_info is None, (
+                "AuthenticationError must propagate without any traceback "
+                "being logged anywhere (no fallback path, no exc_info)"
+            )
+
+
+# ---------------------------------------------------------------------------
+# TestListModelsFallbackLogging -- non-auth errors: one WARNING line, no
+# exc_info; full traceback demoted to DEBUG
+# ---------------------------------------------------------------------------
+
+
+class TestListModelsFallbackLogging:
+    """Verify the fallback path for non-auth errors logs a single WARNING
+    line without exc_info, with the full traceback demoted to DEBUG
+    (provider.py _get_catalog())."""
+
+    def _make_provider(self):
+        from datetime import datetime, timedelta, timezone
+
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        tokens = {
+            "access_token": "tok",
+            "account_id": "acct-123",
+            "expires_at": expires_at,
+        }
+        config: dict = {}
+        coordinator = MagicMock()
+        return ChatGPTProvider(config, coordinator, tokens)
+
+    @pytest.mark.asyncio
+    async def test_transport_error_falls_back_with_single_line_warning(self, caplog):
+        provider = self._make_provider()
+        mock_fetch = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+
+        with (
+            patch(
+                "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+                mock_fetch,
+            ),
+            caplog.at_level(logging.DEBUG),
+        ):
+            models = await provider.list_models()  # type: ignore[union-attr]
+
+        assert len(models) > 0  # fallback catalog returned, not an empty list
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f"expected exactly one WARNING record, got {len(warning_records)}: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+        assert warning_records[0].exc_info is None, (
+            "the WARNING record must not carry exc_info -- one line is enough"
+        )
+
+        debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any(r.exc_info is not None for r in debug_records), (
+            "the full traceback must still be available at DEBUG"
+        )

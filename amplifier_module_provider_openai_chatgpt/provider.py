@@ -12,7 +12,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -33,6 +33,7 @@ from amplifier_core.utils import redact_secrets
 from ._sse import ParsedResponse, SSEError, parse_sse_events
 from .models import (
     DEFAULT_CACHE_TTL_SECONDS,
+    DEFAULT_MAX_OUTPUT_TOKENS,
     FALLBACK_MODELS,
     MODELS_CLIENT_VERSION,
     fetch_models,
@@ -44,6 +45,7 @@ from .oauth import (
     load_tokens,
     refresh_tokens,
 )
+from .oauth import login as oauth_login
 
 logger = logging.getLogger(__name__)
 
@@ -122,8 +124,7 @@ def _coerce_float(value: Any, *, key: str, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         logger.warning(
-            "[PROVIDER] Config key '%s' has invalid float value %r; "
-            "defaulting to %s.",
+            "[PROVIDER] Config key '%s' has invalid float value %r; defaulting to %s.",
             key,
             value,
             default,
@@ -146,6 +147,7 @@ def _coerce_int(value: Any, *, key: str, default: int) -> int:
             default,
         )
         return default
+
 
 # Full endpoint for the ChatGPT Responses API
 CHATGPT_CODEX_ENDPOINT = CHATGPT_CODEX_BASE_URL + "/responses"
@@ -257,11 +259,35 @@ class ChatGPTProvider:
     # ------------------------------------------------------------------
 
     def get_info(self) -> ProviderInfo:
-        """Return provider metadata."""
+        """Return provider metadata.
+
+        ``capabilities`` includes ``"auth:oauth-device-code"`` -- the
+        extensible-capabilities route app-cli uses to detect that this
+        provider needs an OAuth login step (via :meth:`auth_status` /
+        :meth:`login`) rather than a static API key. No kernel change
+        needed: capabilities is already a free-form ``list[str]``.
+
+        ``credential_env_vars`` is deliberately empty: this provider
+        authenticates via OAuth device-code login, not an environment
+        variable API key.
+
+        ``config_fields`` is deliberately empty too: login is a *flow*
+        (device-code OAuth), not a config *field* a wizard can prompt for.
+        app-cli's model-picker phase is responsible for the one field this
+        provider does expose meaningfully (``default_model``); it is set
+        via ``settings.yaml``, not a wizard prompt.
+        """
         return ProviderInfo(
             id="openai-chatgpt",
             display_name="OpenAI ChatGPT",
-            capabilities=["streaming", "tools", "reasoning"],
+            capabilities=["streaming", "tools", "reasoning", "auth:oauth-device-code"],
+            credential_env_vars=[],  # deliberately empty: OAuth, not env keys
+            defaults={
+                "model": self.default_model,
+                "context_window": 1_000_000,
+                "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+            },
+            config_fields=[],  # deliberately empty: see docstring above
         )
 
     async def list_models(self) -> list[ModelInfo]:
@@ -315,14 +341,85 @@ class ChatGPTProvider:
                 models = to_model_infos(entries)
                 self._models_cache = (time.monotonic(), models)
                 return models
+            except kernel_errors.AuthenticationError:
+                # Let this propagate untouched -- no fallback, no traceback,
+                # no stale model list masquerading as success. app-cli renders
+                # AuthenticationError cleanly (see auth_status()/login() above);
+                # swallowing it here (like the fallback path below does for
+                # other errors) used to be the headline onboarding defect.
+                raise
             except Exception as exc:
+                # Non-auth failure (network blip, parse error, ...): keep the
+                # fallback catalog, but do not dump a full traceback at WARNING
+                # -- one line is enough for an operator; the traceback is still
+                # available at DEBUG for anyone actually investigating.
                 logger.warning(
-                    "Failed to fetch live model catalog, using fallback: %s",
-                    exc,
-                    exc_info=True,
+                    "Failed to fetch live model catalog, using fallback: %s", exc
                 )
+                logger.debug("Live model catalog fetch failure detail", exc_info=True)
                 # Do not cache the fallback — next call should retry.
                 return to_model_infos(FALLBACK_MODELS)
+
+    # ------------------------------------------------------------------
+    # Auth surface (capability marker: "auth:oauth-device-code")
+    # ------------------------------------------------------------------
+    #
+    # These two members are the onboarding contract app-cli's wizard/login
+    # step duck-types onto: auth_status() to know whether login is needed,
+    # login() to actually run it. mount() (the only entrypoint before this
+    # change) remains the runtime safety net for `login_on_mount`.
+
+    def auth_status(self) -> str:
+        """Return this provider's current OAuth authentication state.
+
+        Checks in-memory tokens first (fast path), then re-reads tokens from
+        disk (another process -- e.g. `amplifier provider login` -- may have
+        completed a login since this instance was constructed).
+
+        Returns:
+            ``"authenticated"``: a valid, unexpired token is available.
+            ``"expired"``: tokens exist (in memory or on disk) but do not
+                pass :func:`~.oauth.is_token_valid` (missing/expired).
+            ``"unauthenticated"``: no tokens were found anywhere.
+        """
+        if is_token_valid(self._tokens):
+            return "authenticated"
+
+        disk_tokens = load_tokens(path=self._token_file_path)
+        if is_token_valid(disk_tokens):
+            return "authenticated"
+
+        if self._tokens or disk_tokens:
+            return "expired"
+
+        return "unauthenticated"
+
+    async def login(self, print_fn: Callable[[str], None] | None = None) -> bool:
+        """Run the OAuth device-code login flow and adopt the resulting tokens.
+
+        Thin instance wrapper over :func:`~.oauth.login`. This is the
+        out-of-band entrypoint app-cli's `amplifier provider login` command
+        (and its onboarding wizard) call directly -- unlike `mount()`, this
+        can run at any time, not just at session start.
+
+        Args:
+            print_fn: Optional callable to receive the device-code
+                verification URL and user code, instead of stderr (e.g. an
+                app-cli output channel). Defaults to None, which prints to
+                stderr -- the same behavior `mount()` has always used.
+
+        Returns:
+            True on success.
+
+        Raises:
+            RuntimeError: If the device-code flow fails (see
+                :func:`~.oauth.login`).
+        """
+        tokens = await oauth_login(
+            token_file_path=self._token_file_path, print_fn=print_fn
+        )
+        self._tokens = tokens
+        return True
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         """Parse tool calls from a ChatResponse.
@@ -761,7 +858,8 @@ class ChatGPTProvider:
                 return
 
         raise kernel_errors.AuthenticationError(
-            "No valid OAuth tokens available — please run the login flow again",
+            "No valid OAuth tokens — run `amplifier provider login "
+            "openai-chatgpt` (or start a session to trigger login)",
             provider=self.name,
             retryable=False,
         )
@@ -826,7 +924,7 @@ class ChatGPTProvider:
         request_id: str = str(uuid.uuid4())
         seq: dict[int, int] = {}
         block_types: dict[int, str] = {}
-        any_emitted: bool = False          # True once any delta/thinking event is emitted
+        any_emitted: bool = False  # True once any delta/thinking event is emitted
         stream_aborted_emitted: bool = False
 
         # Local guard variable — concurrency-safe (no instance-level mutation).
