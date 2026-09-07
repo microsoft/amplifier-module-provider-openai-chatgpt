@@ -68,6 +68,7 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "use_streaming",
         "instance_id",
         "extra_request_params",
+        "reasoning_effort",
     }
 )
 
@@ -161,6 +162,60 @@ CHATGPT_CODEX_ENDPOINT = CHATGPT_CODEX_BASE_URL + "/responses"
 
 _GPT_5_5_PRO_ALLOWED_EFFORTS = frozenset({"medium", "high", "xhigh"})
 
+# Vocabulary of the canonical `reasoning_effort` config key -- the Responses
+# API set ("minimal".."xhigh") plus "none" (the provisioning-UI default,
+# meaning "leave it to the model") and "max" (added with gpt-5.6). Kept in
+# step with provider-openai's `_KNOWN_REASONING_EFFORTS`: the two backends
+# serve the same models, so they must accept the same spellings.
+_KNOWN_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+
+
+def _resolve_config_reasoning_effort(value: Any, model_id: str) -> str | None:
+    """Validate/normalize the canonical `reasoning_effort` config key at mount.
+
+    This is the config -> request bridge provider-openai has had all along
+    (its __init__.py:1046-1049) and this provider lacked. Without it a
+    `reasoning_effort:` in mount config -- the way the routing-matrix hook
+    delivers per-role effort -- was read by nothing and silently did nothing.
+
+    Returns the normalized effort string, or None when the key should not
+    inject a reasoning block:
+      - value is None / "" (key absent or blank)
+      - value is "none" -- the provisioned default, meaning "use the model's
+        own default". Deliberately does NOT emit reasoning={"effort": "none"}:
+        absence must not start injecting a value.
+
+    Raises:
+        ValueError: when the value is not a recognized effort, or when the
+            default model's accepted set is known and excludes it
+            (gpt-5.5-pro accepts only {medium, high, xhigh}). Failing at
+            mount is loud and immediate; failing as an HTTP 400 mid-session
+            is neither.
+    """
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized or normalized == "none":
+        return None
+    if normalized not in _KNOWN_REASONING_EFFORTS:
+        raise ValueError(
+            f"Invalid config 'reasoning_effort'={value!r} for "
+            f"provider-openai-chatgpt. Valid values: "
+            f"{', '.join(sorted(_KNOWN_REASONING_EFFORTS))}. "
+            f"Fix the provider config (settings.yaml / bundle config block)."
+        )
+    if model_id.startswith("gpt-5.5-pro") and (
+        normalized not in _GPT_5_5_PRO_ALLOWED_EFFORTS
+    ):
+        raise ValueError(
+            f"Config 'reasoning_effort'={value!r} is not accepted by model "
+            f"{model_id!r}: gpt-5.5-pro requires one of "
+            f"{sorted(_GPT_5_5_PRO_ALLOWED_EFFORTS)}."
+        )
+    return normalized
+
 
 def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
     """Pre-flight: reject effort below 'medium' for gpt-5.5-pro models."""
@@ -220,6 +275,14 @@ class ChatGPTProvider:
             self._config.get("timeout"), key="timeout", default=300.0
         )
         self._token_file_path: str | None = self._config.get("token_file_path")
+
+        # Canonical effort knob from mount config -- validated here so a bad
+        # value fails at mount, not as an HTTP 400 mid-session. `None` means
+        # "don't inject": the request-time branch in _build_payload then
+        # falls through to whatever the model does by default.
+        self.reasoning_effort: str | None = _resolve_config_reasoning_effort(
+            self._config.get("reasoning_effort"), self.default_model
+        )
 
         # Streaming flag: emit token-level streaming events when True
         self.use_streaming: bool = _coerce_bool(
@@ -600,8 +663,13 @@ class ChatGPTProvider:
             model = model.removesuffix("-fast")
             service_tier = "priority"
 
+        # Effort precedence: an explicit per-request value wins, then the
+        # mount-config value (the routing-matrix hook's per-role knob), then
+        # nothing -- mirroring provider-openai's own order.
+        effort: str | None = request.reasoning_effort or self.reasoning_effort
+
         # Pre-flight: validate effort level for gpt-5.5-pro models
-        _validate_gpt_5_5_pro_effort(model, request.reasoning_effort)
+        _validate_gpt_5_5_pro_effort(model, effort)
 
         # Build input array and extract instructions from system/developer message
         instructions: str | None = None
@@ -716,10 +784,10 @@ class ChatGPTProvider:
             ]
             payload["tool_choice"] = "auto"
 
-        # Reasoning effort
-        if request.reasoning_effort:
+        # Reasoning effort (resolved above: request > mount config > none)
+        if effort:
             payload["reasoning"] = {
-                "effort": request.reasoning_effort,
+                "effort": effort,
                 "summary": "detailed",
             }
 

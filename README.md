@@ -47,6 +47,7 @@ Every key below is a fully supported config key -- set it directly in
 | `models_cache_ttl` | float | `3600` | How long (seconds) to cache the live model catalog before re-fetching |
 | `models_client_version` | str | `"99.99.99"` | Settings-only override for the model-catalog version-gating constant (see `models.py`'s `MODELS_CLIENT_VERSION` -- FRAGILE, relies on the ChatGPT backend treating any unknown high version as "give me everything") |
 | `use_streaming` | bool | `true` | Set `false` to force non-streaming completions |
+| `reasoning_effort` | str | *(unset)* | Canonical effort knob, same vocabulary as `provider-openai`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Lands as `reasoning.effort` in the Responses-API payload; an explicit per-request `reasoning_effort` still wins. `none` (the provisioning default) or unset means "don't inject -- let the model decide". Invalid values fail at **mount**, not as an HTTP 400 mid-session. This is the key the routing-matrix hook sets per role, so it must resolve here. |
 | `priority` | int | `100` | Read by the orchestrator's provider-selection logic |
 | `extra_request_params` | dict | `{}` | Merged last into the Responses-API payload -- an escape hatch for any field not listed above. **Warning:** this backend enforces a strict payload schema and is known to reject unrecognized top-level fields (e.g. Chat-Completions-style params like `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `logprobs` are NOT accepted here) -- verify any new key against the live backend first. |
 

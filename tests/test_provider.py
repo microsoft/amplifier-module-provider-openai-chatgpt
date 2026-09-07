@@ -577,6 +577,81 @@ class TestBuildPayload:
         payload = provider._build_payload(request)  # type: ignore[union-attr]
         assert "reasoning" not in payload
 
+    # ------------------------------------------------------------------
+    # Mount-config `reasoning_effort` -- the config -> request bridge.
+    #
+    # This is how the routing-matrix hook delivers per-role effort: it merges
+    # a candidate's `config:` block into the provider's MOUNT config, not into
+    # the request. Before this bridge existed, that key was read by nothing
+    # here and silently did nothing -- the same defect class the routing-matrix
+    # loader guards against on gemini (matrix_loader.INERT_CONFIG_RULES).
+    # ------------------------------------------------------------------
+
+    def _make_provider_with_config(self, **config) -> object:
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        config.setdefault("default_model", "gpt-5.6-terra")
+        return ChatGPTProvider(config, MagicMock(), None)
+
+    def test_mount_config_reasoning_effort_reaches_the_payload(self) -> None:
+        """`reasoning_effort` in MOUNT config lands as payload.reasoning.effort."""
+        from amplifier_core.message_models import Message
+
+        provider = self._make_provider_with_config(reasoning_effort="xhigh")
+        request = self._make_request(messages=[Message(role="user", content="hi")])
+        payload = provider._build_payload(request)  # type: ignore[union-attr]
+        assert payload["reasoning"] == {"effort": "xhigh", "summary": "detailed"}
+
+    def test_request_effort_beats_mount_config_effort(self) -> None:
+        """Precedence: per-request value > mount config -- provider-openai's order."""
+        from amplifier_core.message_models import Message
+
+        provider = self._make_provider_with_config(reasoning_effort="low")
+        request = self._make_request(
+            messages=[Message(role="user", content="hi")], reasoning_effort="high"
+        )
+        payload = provider._build_payload(request)  # type: ignore[union-attr]
+        assert payload["reasoning"]["effort"] == "high"
+
+    def test_mount_config_effort_none_means_do_not_inject(self) -> None:
+        """'none' is the provisioning default: absence, not reasoning.effort='none'."""
+        from amplifier_core.message_models import Message
+
+        provider = self._make_provider_with_config(reasoning_effort="none")
+        assert provider.reasoning_effort is None  # type: ignore[attr-defined]
+        request = self._make_request(messages=[Message(role="user", content="hi")])
+        payload = provider._build_payload(request)  # type: ignore[union-attr]
+        assert "reasoning" not in payload
+
+    def test_mount_config_effort_is_normalized(self) -> None:
+        """Whitespace/case from a hand-edited settings.yaml is tolerated."""
+        provider = self._make_provider_with_config(reasoning_effort="  High ")
+        assert provider.reasoning_effort == "high"  # type: ignore[attr-defined]
+
+    def test_mount_config_effort_invalid_fails_at_mount(self) -> None:
+        """A bad value is loud at mount, not an HTTP 400 mid-session."""
+        with pytest.raises(ValueError, match="Invalid config 'reasoning_effort'"):
+            self._make_provider_with_config(reasoning_effort="extra_high")
+
+    def test_mount_config_effort_respects_gpt_5_5_pro_floor(self) -> None:
+        """gpt-5.5-pro's known restricted set is enforced at mount too."""
+        with pytest.raises(ValueError, match="gpt-5.5-pro requires one of"):
+            self._make_provider_with_config(
+                default_model="gpt-5.5-pro", reasoning_effort="low"
+            )
+
+    def test_mount_config_effort_applies_to_fast_variant(self) -> None:
+        """`-fast` is a service tier, not a model; effort still applies to the base id."""
+        from amplifier_core.message_models import Message
+
+        provider = self._make_provider_with_config(
+            default_model="gpt-5.6-terra-fast", reasoning_effort="medium"
+        )
+        request = self._make_request(messages=[Message(role="user", content="hi")])
+        payload = provider._build_payload(request)  # type: ignore[union-attr]
+        assert payload["model"] == "gpt-5.6-terra"
+        assert payload["reasoning"]["effort"] == "medium"
+
 
 # ---------------------------------------------------------------------------
 # TestBuildHeaders — provider._build_headers()
