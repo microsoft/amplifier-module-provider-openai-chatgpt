@@ -63,6 +63,19 @@ class TestUnknownConfigKeySweep:
             _warn_unknown_config_keys({"extra_request_params": {}})
         assert caplog.text == ""
 
+    def test_reasoning_effort_allowlisted(self, caplog):
+        """The canonical effort knob is a recognised key -- it must not be
+        flagged as unknown, because the routing-matrix hook sets it on every
+        openai-family candidate and a spurious warning per mount would be
+        noise that trains people to ignore the real ones."""
+        from amplifier_module_provider_openai_chatgpt.provider import (
+            _warn_unknown_config_keys,
+        )
+
+        with caplog.at_level("WARNING"):
+            _warn_unknown_config_keys({"reasoning_effort": "high"})
+        assert "reasoning_effort" not in caplog.text
+
     def test_unknown_key_warns_with_suggestion(self, caplog):
         with caplog.at_level(logging.WARNING):
             _warn_unknown_config_keys({"tiemout": 5})
