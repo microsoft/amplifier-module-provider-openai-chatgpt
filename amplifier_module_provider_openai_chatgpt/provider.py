@@ -254,6 +254,20 @@ class ChatGPTProvider:
         tokens: dict[str, Any] | None = None,
     ) -> None:
         self._config = config or {}
+        # PUBLIC alias of the same dict, by ecosystem convention. Every other
+        # provider module (anthropic, openai, gemini, github-copilot, ollama,
+        # chat-completions, vllm) exposes its mount config as `self.config`,
+        # and routing-layer code reads it by that name -- hooks-routing's
+        # role_pin compares a session's declared provider pin against
+        # `getattr(provider, "config")`, loop-streaming reads
+        # `provider.config["priority"]` as a fallback. This provider was the
+        # one outlier: with only `_config`, role_pin saw `None`, declared every
+        # pinned config key "drifted", and on every delegate spawn that landed
+        # here warned that reasoning_effort had been "snapshotted differently
+        # at mount" -- a claim it never checked, and false (the wire carried the
+        # pinned effort). Measured 2026-09-07. Same object, not a copy: a write
+        # through either name is visible through the other.
+        self.config: dict[str, Any] = self._config
         self._coordinator = coordinator
         self._tokens = tokens
         _warn_unknown_config_keys(self._config)

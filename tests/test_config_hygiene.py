@@ -137,3 +137,43 @@ class TestProviderConfigCoercionIntegration:
         provider = ChatGPTProvider(config={})
         assert provider.default_model == LATEST_MODEL_SENTINEL == "latest"
         assert FALLBACK_MODELS[0]["slug"] == "gpt-5.6-sol"
+
+
+class TestPublicConfigAttribute:
+    """`self.config` is the ecosystem's name for a provider's mount config.
+
+    Every sibling provider exposes it; routing-layer code reads it by that
+    name (hooks-routing's role_pin, loop-streaming's priority fallback). This
+    provider stored only `_config`, so role_pin saw None, declared every
+    pinned config key drifted, and falsely warned on each delegate spawn.
+    """
+
+    def _provider(self, **config):
+        from unittest.mock import MagicMock
+
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        config.setdefault("default_model", "gpt-5.6-terra")
+        return ChatGPTProvider(config, MagicMock(), None)
+
+    def test_config_is_exposed_publicly(self) -> None:
+        p = self._provider(reasoning_effort="medium", priority=0)
+        assert isinstance(p.config, dict)
+        assert p.config["reasoning_effort"] == "medium"
+        assert p.config["priority"] == 0
+
+    def test_config_is_the_same_object_as_the_private_name(self) -> None:
+        """Alias, not copy: a write through either name is visible via the other,
+        so nothing that already read `_config` changes behaviour."""
+        p = self._provider()
+        assert p.config is p._config
+        p.config["reasoning_effort"] = "high"
+        assert p._config["reasoning_effort"] == "high"
+
+    def test_role_pin_style_read_sees_the_pinned_value(self) -> None:
+        """The exact read hooks-routing's role_pin performs, against a provider
+        constructed with a promoted mount plan. Before: None -> false drift."""
+        p = self._provider(reasoning_effort="medium")
+        provider_config = getattr(p, "config", None)
+        assert isinstance(provider_config, dict)
+        assert provider_config.get("reasoning_effort") == "medium"
