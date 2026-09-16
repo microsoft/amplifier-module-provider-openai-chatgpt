@@ -292,6 +292,21 @@ See [docs/DTU_VALIDATION.md](docs/DTU_VALIDATION.md) for the full guide covering
 
 ## Known Limitations
 
+- **No native arbitrary-request input counter** -- this raw HTTP/SSE adapter
+  has no source-supported preflight count operation for
+  `chatgpt.com/backend-api/codex/responses`, so it does not advertise
+  `request_budget:provider_count`. Subscription OAuth credentials are never
+  forwarded to the separate OpenAI Platform counter.
+- **Advisory planning metadata is selected-model-only** -- `get_info()`
+  reports `context_window` and `max_output_tokens` together only when both
+  positive values are known for the configured/resolved model from the
+  already-cached catalog, or the built-in catalog when no live catalog is
+  cached. Unresolved `latest` and unknown models omit both. These values are
+  for context-compaction planning, not backend admission proof or an enforced
+  output reservation.
+- **No request-level output cap** -- this backend omits or rejects
+  `max_output_tokens`; the advisory `get_info()` metadata is never sent in a
+  request payload and does not guarantee the backend accepts that output size.
 - **Automatic mid-session 401 recovery** -- if the access token expires mid-session, the provider performs one silent token refresh and retries the request automatically. A second consecutive 401 raises `AuthenticationError`.
 - **No `response.incomplete` continuation** -- if a reasoning model hits its output limit, the partial response is lost. Auto-continuation is planned.
 - **Streaming is mandatory** -- the ChatGPT backend requires `stream=True`. The provider always streams internally but returns a complete `ChatResponse` to the orchestrator.

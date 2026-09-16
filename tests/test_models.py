@@ -169,6 +169,37 @@ class TestToModelInfos:
         fast = next(m for m in result if m.id == "gpt-5.2-fast")
         assert "(fast)" in fast.display_name
 
+    def test_to_model_infos_preserves_valid_output_limit_for_fast_variants(self) -> None:
+        """Raw catalog output limits remain model-specific for both variants."""
+        from amplifier_module_provider_openai_chatgpt.models import to_model_infos
+
+        entry = _make_entry("gpt-5.2", context_window=272000, speed_tiers=["fast"])
+        entry["max_output_tokens"] = 64_000
+
+        result = to_model_infos([entry])
+
+        assert {model.max_output_tokens for model in result} == {64_000}
+
+    @pytest.mark.parametrize("max_output_tokens", [None, 0, True])
+    def test_to_model_infos_uses_fallback_for_absent_or_invalid_output_limit(
+        self, max_output_tokens: int | bool | None
+    ) -> None:
+        """Missing, non-positive, and boolean raw limits use the planning fallback."""
+        from amplifier_module_provider_openai_chatgpt.models import (
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            to_model_infos,
+        )
+
+        entry = _make_entry("gpt-5.2", speed_tiers=["fast"])
+        if max_output_tokens is not None:
+            entry["max_output_tokens"] = max_output_tokens
+
+        result = to_model_infos([entry])
+
+        assert {model.max_output_tokens for model in result} == {
+            DEFAULT_MAX_OUTPUT_TOKENS
+        }
+
     def test_to_model_infos_no_fast_when_absent(self) -> None:
         """Entry without 'fast' in speed_tiers produces exactly one ModelInfo."""
         from amplifier_module_provider_openai_chatgpt.models import to_model_infos

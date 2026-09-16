@@ -33,7 +33,6 @@ from amplifier_core.utils import redact_secrets
 from ._sse import ParsedResponse, SSEError, parse_sse_events
 from .models import (
     DEFAULT_CACHE_TTL_SECONDS,
-    DEFAULT_MAX_OUTPUT_TOKENS,
     FALLBACK_MODELS,
     LATEST_MODEL_SENTINEL,
     MODELS_CLIENT_VERSION,
@@ -350,6 +349,43 @@ class ChatGPTProvider:
     # Provider Protocol
     # ------------------------------------------------------------------
 
+    def _known_model_limits(self) -> tuple[int, int] | None:
+        """Return valid planning limits for the selected known model.
+
+        This accessor is intentionally synchronous and consults only the
+        in-memory catalog cache or the built-in fallback catalog. It never
+        authenticates or fetches a catalog merely to answer ``get_info()``.
+        A model with either limit absent, non-positive, or boolean remains
+        unknown rather than being represented by a provider-wide default.
+        """
+        model_id = self._resolved_default_model or self.default_model
+        if model_id == LATEST_MODEL_SENTINEL:
+            return None
+        if model_id.endswith("-fast"):
+            model_id = model_id.removesuffix("-fast")
+
+        models = (
+            self._models_cache[1]
+            if self._models_cache is not None
+            else to_model_infos(FALLBACK_MODELS)
+        )
+        for model in models:
+            if model.id != model_id:
+                continue
+            context_window = model.context_window
+            max_output_tokens = model.max_output_tokens
+            if (
+                isinstance(context_window, int)
+                and not isinstance(context_window, bool)
+                and context_window > 0
+                and isinstance(max_output_tokens, int)
+                and not isinstance(max_output_tokens, bool)
+                and max_output_tokens > 0
+            ):
+                return context_window, max_output_tokens
+            return None
+        return None
+
     def get_info(self) -> ProviderInfo:
         """Return provider metadata.
 
@@ -369,10 +405,19 @@ class ChatGPTProvider:
         provider does expose meaningfully (``default_model``); it is set
         via ``settings.yaml``, not a wizard prompt.
 
-        ``defaults["model"]`` never triggers a network call (this method
-        must stay synchronous and side-effect-free -- app-cli's wizard calls
-        it eagerly). When ``default_model`` is the ``"latest"`` sentinel and
-        resolution hasn't happened yet on this instance (no `complete()` or
+        ``defaults["model"]`` and reported planning limits never trigger a
+        network call (this method must stay synchronous and side-effect-free
+        -- app-cli's wizard calls it eagerly). ``context_window`` and
+        ``max_output_tokens`` are included together only when both positive,
+        non-boolean values are known for the selected model from the
+        in-memory catalog cache or built-in catalog. They are advisory
+        planning metadata for context-compaction consumers, not an enforced
+        output reservation, backend acceptance guarantee, or request payload
+        parameter. Unknown and unresolved models omit both rather than
+        inheriting a provider-wide 1M claim.
+
+        When ``default_model`` is the ``"latest"`` sentinel and resolution
+        hasn't happened yet on this instance (no `complete()` or
         `list_models()` call has occurred), it presents the sentinel plus
         the fallback that would apply if resolution can't reach the live
         catalog -- e.g. ``"latest (resolves lazily; falls back to
@@ -390,16 +435,19 @@ class ChatGPTProvider:
         else:
             model_display = self.default_model
 
+        defaults: dict[str, Any] = {"model": model_display}
+        model_limits = self._known_model_limits()
+        if model_limits is not None:
+            context_window, max_output_tokens = model_limits
+            defaults["context_window"] = context_window
+            defaults["max_output_tokens"] = max_output_tokens
+
         return ProviderInfo(
             id="openai-chatgpt",
             display_name="OpenAI ChatGPT",
             capabilities=["streaming", "tools", "reasoning", "auth:oauth_device_code"],
             credential_env_vars=[],
-            defaults={
-                "model": model_display,
-                "context_window": 1_000_000,
-                "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
-            },
+            defaults=defaults,
             config_fields=[],  # deliberately empty: see docstring above
         )
 
@@ -908,7 +956,9 @@ class ChatGPTProvider:
 
         Raises:
             kernel_errors.RateLimitError: 429.
-            kernel_errors.ContextLengthError: 400 with context-length keywords.
+            kernel_errors.ContextLengthError: 400 with the known
+                ``context_length_exceeded`` code, or legacy context-length
+                keywords when no error code is supplied.
             kernel_errors.ContentFilterError: 400 with content-filter keywords.
             kernel_errors.InvalidRequestError: 400 without special keywords.
             kernel_errors.ProviderUnavailableError: 403 Cloudflare challenge or 5xx.
@@ -934,13 +984,26 @@ class ChatGPTProvider:
                 retry_after=retry_after,
             )
         elif status == 400:
+            error_code: str | None = None
+            try:
+                error_payload = json.loads(body)
+            except (TypeError, json.JSONDecodeError, UnicodeDecodeError):
+                error_payload = None
+            if isinstance(error_payload, dict):
+                error = error_payload.get("error")
+                if isinstance(error, dict) and isinstance(error.get("code"), str):
+                    error_code = error["code"]
+
             body_lower = body_text.lower()
-            if any(
-                kw in body_lower
-                for kw in (
-                    "context length",
-                    "too many tokens",
-                    "maximum context",
+            if error_code == "context_length_exceeded" or (
+                error_code is None
+                and any(
+                    kw in body_lower
+                    for kw in (
+                        "context length",
+                        "too many tokens",
+                        "maximum context",
+                    )
                 )
             ):
                 raise kernel_errors.ContextLengthError(
@@ -1195,7 +1258,15 @@ class ChatGPTProvider:
                                 except json.JSONDecodeError:
                                     continue
 
-                                et = event.get("type", "")
+                                if not isinstance(event, dict):
+                                    continue
+
+                                raw_event_type = event.get("type", "")
+                                et = (
+                                    raw_event_type
+                                    if isinstance(raw_event_type, str)
+                                    else ""
+                                )
 
                                 if et == "response.output_item.added":
                                     idx: int = event.get("output_index", 0)
@@ -1270,16 +1341,34 @@ class ChatGPTProvider:
                                             },
                                         )
 
-                                elif et == "error":
+                                elif et in (
+                                    "error",
+                                    "response.failed",
+                                    "response.incomplete",
+                                ):
                                     # Emit stream_aborted now if we already sent deltas.
                                     # parse_sse_events will raise SSEError after the loop.
                                     if any_emitted and not stream_aborted_emitted:
-                                        error_obj = event.get("error", {})
-                                        err_msg = (
-                                            error_obj.get("message", str(event))
-                                            if isinstance(error_obj, dict)
-                                            else str(error_obj)
-                                        )
+                                        if et == "error":
+                                            error_obj = event.get("error")
+                                        else:
+                                            response = event.get("response")
+                                            error_obj = (
+                                                response.get("error")
+                                                if isinstance(response, dict)
+                                                else None
+                                            )
+                                        if isinstance(error_obj, str):
+                                            err_msg = error_obj
+                                        elif isinstance(error_obj, dict):
+                                            raw_message = error_obj.get("message")
+                                            err_msg = (
+                                                raw_message
+                                                if isinstance(raw_message, str)
+                                                else f"ChatGPT SSE {et} event"
+                                            )
+                                        else:
+                                            err_msg = f"ChatGPT SSE {et} event"
                                         await self._coordinator.hooks.emit(
                                             "llm:stream_aborted",
                                             {
@@ -1291,6 +1380,7 @@ class ChatGPTProvider:
                                             },
                                         )
                                         stream_aborted_emitted = True
+                                    break
 
                                 # response.function_call_arguments.delta: silently consumed
 
@@ -1366,7 +1456,9 @@ class ChatGPTProvider:
                 mapped_exc: kernel_errors.LLMError = kernel_errors.RateLimitError(
                     str(exc), provider=self.name, retryable=True
                 )
-            elif any(kw in msg for kw in ("context length", "too many tokens")):
+            elif code == "context_length_exceeded" or (
+                not code and any(kw in msg for kw in ("context length", "too many tokens"))
+            ):
                 mapped_exc = kernel_errors.ContextLengthError(
                     str(exc), provider=self.name, retryable=False
                 )
