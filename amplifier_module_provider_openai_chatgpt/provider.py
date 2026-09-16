@@ -33,7 +33,6 @@ from amplifier_core.utils import redact_secrets
 from ._sse import ParsedResponse, SSEError, parse_sse_events
 from .models import (
     DEFAULT_CACHE_TTL_SECONDS,
-    DEFAULT_MAX_OUTPUT_TOKENS,
     FALLBACK_MODELS,
     LATEST_MODEL_SENTINEL,
     MODELS_CLIENT_VERSION,
@@ -350,6 +349,39 @@ class ChatGPTProvider:
     # Provider Protocol
     # ------------------------------------------------------------------
 
+    def _known_context_window(self) -> int | None:
+        """Return a positive context window for the selected known model.
+
+        This accessor is intentionally synchronous and consults only the
+        in-memory catalog cache or the built-in fallback catalog. It never
+        authenticates or fetches a catalog merely to answer ``get_info()``.
+        A model with no positive, non-boolean limit remains unknown rather
+        than being represented by a provider-wide default.
+        """
+        model_id = self._resolved_default_model or self.default_model
+        if model_id == LATEST_MODEL_SENTINEL:
+            return None
+        if model_id.endswith("-fast"):
+            model_id = model_id.removesuffix("-fast")
+
+        models = (
+            self._models_cache[1]
+            if self._models_cache is not None
+            else to_model_infos(FALLBACK_MODELS)
+        )
+        for model in models:
+            if model.id != model_id:
+                continue
+            context_window = model.context_window
+            if (
+                isinstance(context_window, int)
+                and not isinstance(context_window, bool)
+                and context_window > 0
+            ):
+                return context_window
+            return None
+        return None
+
     def get_info(self) -> ProviderInfo:
         """Return provider metadata.
 
@@ -369,10 +401,18 @@ class ChatGPTProvider:
         provider does expose meaningfully (``default_model``); it is set
         via ``settings.yaml``, not a wizard prompt.
 
-        ``defaults["model"]`` never triggers a network call (this method
-        must stay synchronous and side-effect-free -- app-cli's wizard calls
-        it eagerly). When ``default_model`` is the ``"latest"`` sentinel and
-        resolution hasn't happened yet on this instance (no `complete()` or
+        ``defaults["model"]`` and any reported ``context_window`` never
+        trigger a network call (this method must stay synchronous and
+        side-effect-free -- app-cli's wizard calls it eagerly). A positive
+        context window is included only for the selected model when it is
+        known from the in-memory catalog cache or built-in catalog. Unknown
+        and unresolved models omit capacity defaults rather than inheriting a
+        provider-wide 1M claim. The backend rejects or omits a request-level
+        output cap, so this method deliberately does not advertise one as an
+        enforceable reservation.
+
+        When ``default_model`` is the ``"latest"`` sentinel and resolution
+        hasn't happened yet on this instance (no `complete()` or
         `list_models()` call has occurred), it presents the sentinel plus
         the fallback that would apply if resolution can't reach the live
         catalog -- e.g. ``"latest (resolves lazily; falls back to
@@ -390,16 +430,17 @@ class ChatGPTProvider:
         else:
             model_display = self.default_model
 
+        defaults: dict[str, Any] = {"model": model_display}
+        context_window = self._known_context_window()
+        if context_window is not None:
+            defaults["context_window"] = context_window
+
         return ProviderInfo(
             id="openai-chatgpt",
             display_name="OpenAI ChatGPT",
             capabilities=["streaming", "tools", "reasoning", "auth:oauth_device_code"],
             credential_env_vars=[],
-            defaults={
-                "model": model_display,
-                "context_window": 1_000_000,
-                "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
-            },
+            defaults=defaults,
             config_fields=[],  # deliberately empty: see docstring above
         )
 
@@ -908,7 +949,9 @@ class ChatGPTProvider:
 
         Raises:
             kernel_errors.RateLimitError: 429.
-            kernel_errors.ContextLengthError: 400 with context-length keywords.
+            kernel_errors.ContextLengthError: 400 with the known
+                ``context_length_exceeded`` code, or legacy context-length
+                keywords when no error code is supplied.
             kernel_errors.ContentFilterError: 400 with content-filter keywords.
             kernel_errors.InvalidRequestError: 400 without special keywords.
             kernel_errors.ProviderUnavailableError: 403 Cloudflare challenge or 5xx.
@@ -934,13 +977,26 @@ class ChatGPTProvider:
                 retry_after=retry_after,
             )
         elif status == 400:
+            error_code: str | None = None
+            try:
+                error_payload = json.loads(body)
+            except (TypeError, json.JSONDecodeError, UnicodeDecodeError):
+                error_payload = None
+            if isinstance(error_payload, dict):
+                error = error_payload.get("error")
+                if isinstance(error, dict) and isinstance(error.get("code"), str):
+                    error_code = error["code"]
+
             body_lower = body_text.lower()
-            if any(
-                kw in body_lower
-                for kw in (
-                    "context length",
-                    "too many tokens",
-                    "maximum context",
+            if error_code == "context_length_exceeded" or (
+                error_code is None
+                and any(
+                    kw in body_lower
+                    for kw in (
+                        "context length",
+                        "too many tokens",
+                        "maximum context",
+                    )
                 )
             ):
                 raise kernel_errors.ContextLengthError(
@@ -1366,7 +1422,9 @@ class ChatGPTProvider:
                 mapped_exc: kernel_errors.LLMError = kernel_errors.RateLimitError(
                     str(exc), provider=self.name, retryable=True
                 )
-            elif any(kw in msg for kw in ("context length", "too many tokens")):
+            elif code == "context_length_exceeded" or (
+                not code and any(kw in msg for kw in ("context length", "too many tokens"))
+            ):
                 mapped_exc = kernel_errors.ContextLengthError(
                     str(exc), provider=self.name, retryable=False
                 )

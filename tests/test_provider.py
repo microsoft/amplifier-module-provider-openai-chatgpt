@@ -109,6 +109,8 @@ class TestGetInfo:
         info = provider.get_info()  # type: ignore[union-attr]
         assert "latest" in info.defaults["model"]
         assert "gpt-5.6-sol" in info.defaults["model"]
+        assert "context_window" not in info.defaults
+        assert "max_output_tokens" not in info.defaults
 
     def test_get_info_model_shows_resolved_id_once_resolved(self) -> None:
         """After resolution has happened (cached on the instance),
@@ -117,6 +119,7 @@ class TestGetInfo:
         provider._resolved_default_model = "gpt-5.6-terra"  # type: ignore[union-attr]
         info = provider.get_info()  # type: ignore[union-attr]
         assert info.defaults["model"] == "gpt-5.6-terra"
+        assert info.defaults["context_window"] == 1_000_000
 
     def test_get_info_explicit_model_shown_verbatim(self) -> None:
         """An explicit non-sentinel default_model is shown as-is, with no
@@ -127,6 +130,80 @@ class TestGetInfo:
         info = provider.get_info()  # type: ignore[union-attr]
         assert info.defaults["model"] == "gpt-5.4"
 
+    def test_get_info_uses_selected_builtin_context_window(self) -> None:
+        """A configured 272K model must not inherit a provider-wide 1M limit."""
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        provider = ChatGPTProvider(config={"default_model": "gpt-5.4"})
+        info = provider.get_info()
+
+        assert info.defaults["context_window"] == 272_000
+        assert "max_output_tokens" not in info.defaults
+
+    def test_get_info_uses_cached_dynamic_model_context_window(self) -> None:
+        """A cached live catalog is safe to consult without fetching again."""
+        from amplifier_core import ModelInfo
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        provider = ChatGPTProvider(config={"default_model": "dynamic-model"})
+        provider._models_cache = (0.0, [  # type: ignore[attr-defined]
+            ModelInfo(
+                id="dynamic-model",
+                display_name="Dynamic Model",
+                context_window=321_000,
+                max_output_tokens=128_000,
+            )
+        ])
+
+        info = provider.get_info()
+
+        assert info.defaults["context_window"] == 321_000
+        assert "max_output_tokens" not in info.defaults
+
+    def test_get_info_latest_uses_cached_context_only_after_resolution(self) -> None:
+        """Unresolved latest omits limits; a resolved cached model supplies its own."""
+        from amplifier_core import ModelInfo
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        provider = ChatGPTProvider(config={"default_model": "latest"})
+        provider._models_cache = (0.0, [  # type: ignore[attr-defined]
+            ModelInfo(
+                id="dynamic-model",
+                display_name="Dynamic Model",
+                context_window=321_000,
+                max_output_tokens=128_000,
+            )
+        ])
+
+        assert "context_window" not in provider.get_info().defaults
+        provider._resolved_default_model = "dynamic-model"  # type: ignore[attr-defined]
+        assert provider.get_info().defaults["context_window"] == 321_000
+
+    def test_get_info_does_not_treat_zero_as_known_capacity(self) -> None:
+        from amplifier_core import ModelInfo
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        provider = ChatGPTProvider(config={"default_model": "zero-limit-model"})
+        provider._models_cache = (0.0, [  # type: ignore[attr-defined]
+            ModelInfo(
+                id="zero-limit-model",
+                display_name="Zero Limit Model",
+                context_window=0,
+                max_output_tokens=128_000,
+            )
+        ])
+
+        assert "context_window" not in provider.get_info().defaults
+
+    def test_get_info_omits_capacity_for_unknown_model(self) -> None:
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        provider = ChatGPTProvider(config={"default_model": "unknown-model"})
+        info = provider.get_info()
+
+        assert "context_window" not in info.defaults
+        assert "max_output_tokens" not in info.defaults
+
     def test_get_info_never_awaits_anything(self) -> None:
         """get_info() must stay synchronous and must not trigger a live
         catalog fetch -- app-cli's wizard calls it eagerly at mount time,
@@ -136,6 +213,25 @@ class TestGetInfo:
         from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
 
         assert not inspect.iscoroutinefunction(ChatGPTProvider.get_info)
+
+    def test_get_info_does_not_fetch_or_authenticate(self) -> None:
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        provider = ChatGPTProvider(config={"default_model": "gpt-5.4"})
+        fetch_models = AsyncMock()
+        ensure_valid_tokens = AsyncMock()
+
+        with (
+            patch(
+                "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+                fetch_models,
+            ),
+            patch.object(provider, "_ensure_valid_tokens", ensure_valid_tokens),
+        ):
+            provider.get_info()
+
+        fetch_models.assert_not_awaited()
+        ensure_valid_tokens.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +1059,34 @@ class TestComplete:
         assert result.usage.input_tokens == 10
         assert result.usage.output_tokens == 5
         assert result.usage.total_tokens == 15
+
+    @pytest.mark.asyncio
+    async def test_completion_and_response_hook_report_the_same_usage_once(self) -> None:
+        """The completed response and success hook share parsed SSE usage."""
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(text="Hello!", input_tokens=10, output_tokens=5)
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            result = await provider.complete(request)  # type: ignore[union-attr]
+
+        response_calls = [
+            call
+            for call in provider._coordinator.hooks.emit.call_args_list  # type: ignore[union-attr]
+            if call.args[0] == "llm:response"
+        ]
+        assert len(response_calls) == 1
+        hook_usage = response_calls[0].args[1]["usage"]
+        assert hook_usage == {"input_tokens": 10, "output_tokens": 5}
+        assert result.usage is not None
+        assert result.usage.input_tokens == hook_usage["input_tokens"]
+        assert result.usage.output_tokens == hook_usage["output_tokens"]
+        assert result.usage.total_tokens == (
+            hook_usage["input_tokens"] + hook_usage["output_tokens"]
+        )
 
     @pytest.mark.asyncio
     async def test_simple_text_completion_finish_reason_stop(self) -> None:
@@ -2129,6 +2253,71 @@ class TestCompleteErrorMapping:
         assert exc_info.value.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_400_context_length_code_with_neutral_message(self) -> None:
+        """Known context code must not depend on descriptive message wording."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(
+                [],
+                status_code=400,
+                error_body=(
+                    b'{"error":{"code":"context_length_exceeded",'
+                    b'"message":"Request rejected"}}'
+                ),
+            )
+            with pytest.raises(kernel_errors.ContextLengthError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.retryable is False
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_400_unknown_code_with_context_words_is_not_a_context_error(self) -> None:
+        """An explicit unknown code prevents text heuristics from over-classifying."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(
+                [],
+                status_code=400,
+                error_body=(
+                    b'{"error":{"code":"unknown_code",'
+                    b'"message":"context length limit reached"}}'
+                ),
+            )
+            with pytest.raises(kernel_errors.InvalidRequestError):
+                await provider.complete(request)  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_400_malformed_json_without_context_words_is_invalid_request(self) -> None:
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(
+                [],
+                status_code=400,
+                error_body=b'{"error":',
+            )
+            with pytest.raises(kernel_errors.InvalidRequestError):
+                await provider.complete(request)  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
     async def test_400_content_filter_error(self) -> None:
         """HTTP 400 with 'content filter' in body → ContentFilterError(retryable=False)."""
         from amplifier_core import llm_errors as kernel_errors
@@ -2262,6 +2451,90 @@ class TestCompleteErrorMapping:
             MockClient.return_value = _make_sse_response(error_lines)
             with pytest.raises(kernel_errors.RateLimitError):
                 await provider.complete(request)  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_partial_sse_context_error_uses_code_and_aborts_once(self) -> None:
+        """A partial stream remains abort-safe when a neutral context error follows."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+        error_lines = [
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "message"},
+                }
+            ),
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "partial",
+                }
+            ),
+            "data: "
+            + json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "message": "Request rejected",
+                    },
+                }
+            ),
+            "data: [DONE]",
+        ]
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(error_lines)
+            with pytest.raises(kernel_errors.ContextLengthError):
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        calls = provider._coordinator.hooks.emit.call_args_list  # type: ignore[union-attr]
+        delta_calls = [call for call in calls if call.args[0] == "llm:stream_block_delta"]
+        aborted_calls = [call for call in calls if call.args[0] == "llm:stream_aborted"]
+        response_calls = [call for call in calls if call.args[0] == "llm:response"]
+        assert len(delta_calls) == 1
+        assert delta_calls[0].args[1]["text"] == "partial"
+        assert len(aborted_calls) == 1
+        assert calls.index(delta_calls[0]) < calls.index(aborted_calls[0])
+        assert len(response_calls) == 1
+        assert response_calls[0].args[1]["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_sse_content_filter_error_remains_content_filter_error(self) -> None:
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+        error_lines = [
+            "data: "
+            + json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "code": "content_filter",
+                        "message": "Request blocked by safety policy",
+                    },
+                }
+            ),
+            "data: [DONE]",
+        ]
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(error_lines)
+            with pytest.raises(kernel_errors.ContentFilterError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.retryable is False
 
     # ------------------------------------------------------------------
     # httpx.TimeoutException → LLMTimeoutError
