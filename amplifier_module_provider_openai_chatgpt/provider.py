@@ -1251,7 +1251,15 @@ class ChatGPTProvider:
                                 except json.JSONDecodeError:
                                     continue
 
-                                et = event.get("type", "")
+                                if not isinstance(event, dict):
+                                    continue
+
+                                raw_event_type = event.get("type", "")
+                                et = (
+                                    raw_event_type
+                                    if isinstance(raw_event_type, str)
+                                    else ""
+                                )
 
                                 if et == "response.output_item.added":
                                     idx: int = event.get("output_index", 0)
@@ -1326,16 +1334,34 @@ class ChatGPTProvider:
                                             },
                                         )
 
-                                elif et == "error":
+                                elif et in (
+                                    "error",
+                                    "response.failed",
+                                    "response.incomplete",
+                                ):
                                     # Emit stream_aborted now if we already sent deltas.
                                     # parse_sse_events will raise SSEError after the loop.
                                     if any_emitted and not stream_aborted_emitted:
-                                        error_obj = event.get("error", {})
-                                        err_msg = (
-                                            error_obj.get("message", str(event))
-                                            if isinstance(error_obj, dict)
-                                            else str(error_obj)
-                                        )
+                                        if et == "error":
+                                            error_obj = event.get("error")
+                                        else:
+                                            response = event.get("response")
+                                            error_obj = (
+                                                response.get("error")
+                                                if isinstance(response, dict)
+                                                else None
+                                            )
+                                        if isinstance(error_obj, str):
+                                            err_msg = error_obj
+                                        elif isinstance(error_obj, dict):
+                                            raw_message = error_obj.get("message")
+                                            err_msg = (
+                                                raw_message
+                                                if isinstance(raw_message, str)
+                                                else f"ChatGPT SSE {et} event"
+                                            )
+                                        else:
+                                            err_msg = f"ChatGPT SSE {et} event"
                                         await self._coordinator.hooks.emit(
                                             "llm:stream_aborted",
                                             {
@@ -1347,6 +1373,7 @@ class ChatGPTProvider:
                                             },
                                         )
                                         stream_aborted_emitted = True
+                                    break
 
                                 # response.function_call_arguments.delta: silently consumed
 

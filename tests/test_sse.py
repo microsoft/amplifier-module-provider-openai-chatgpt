@@ -186,6 +186,23 @@ class TestParseSSEEvents:
         result = parse_sse_events(lines)
         assert result.content == "recovered"
 
+    def test_non_object_json_records_are_ignored(self) -> None:
+        """Valid JSON records that are not event objects do not break parsing."""
+        text_event = {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "recovered"}],
+            },
+        }
+        result = parse_sse_events(
+            ["data: null", "data: []", _line(text_event), _done()],
+            collect_raw=True,
+        )
+
+        assert result.content == "recovered"
+        assert result.raw_events == [text_event]
+
     def test_done_sentinel_stops_parsing(self) -> None:
         """[DONE] stops parsing; subsequent lines are ignored."""
         lines = [
@@ -496,6 +513,51 @@ class TestSSEErrors:
             parse_sse_events(lines)
         # Should have some message even without error detail
         assert exc_info.value.message is not None
+
+    @pytest.mark.parametrize("code", [7, ["rate_limit"], {"rate_limit": True}])
+    def test_non_string_error_codes_are_ignored(self, code: object) -> None:
+        """Only string error codes may drive provider error classification."""
+        lines = [
+            _line(
+                {
+                    "type": "error",
+                    "error": {"message": "Malformed code", "code": code},
+                }
+            )
+        ]
+
+        with pytest.raises(SSEError) as exc_info:
+            parse_sse_events(lines)
+
+        assert exc_info.value.message == "Malformed code"
+        assert exc_info.value.code is None
+
+    def test_non_string_error_message_uses_fallback(self) -> None:
+        """Malformed messages do not escape the parser as arbitrary values."""
+        with pytest.raises(SSEError) as exc_info:
+            parse_sse_events(
+                [_line({"type": "error", "error": {"message": ["bad"]}})]
+            )
+
+        assert exc_info.value.message == "ChatGPT SSE error event"
+
+    @pytest.mark.parametrize(
+        ("event", "event_type"),
+        [
+            ({"type": "error", "error": None}, "error"),
+            ({"type": "response.failed", "response": None}, "response.failed"),
+            ({"type": "response.incomplete", "response": []}, "response.incomplete"),
+        ],
+    )
+    def test_missing_or_non_object_error_payload_uses_fallback(
+        self, event: dict, event_type: str
+    ) -> None:
+        """Error events remain typed when their payload is absent or malformed."""
+        with pytest.raises(SSEError) as exc_info:
+            parse_sse_events([_line(event)])
+
+        assert exc_info.value.message == f"ChatGPT SSE {event_type} event"
+        assert exc_info.value.code is None
 
     def test_response_failed_no_error_detail(self) -> None:
         """response.failed with no response.error still raises SSEError."""

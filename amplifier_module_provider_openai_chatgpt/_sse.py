@@ -80,10 +80,16 @@ def parse_sse_events(lines: list[str], collect_raw: bool = False) -> ParsedRespo
         except json.JSONDecodeError:
             continue
 
+        # SSE records may contain valid JSON values that are not events.
+        # Ignore those values rather than assuming a mapping below.
+        if not isinstance(event, dict):
+            continue
+
         if collect_raw:
             result.raw_events.append(event)
 
-        event_type = event.get("type", "")
+        raw_event_type = event.get("type", "")
+        event_type = raw_event_type if isinstance(raw_event_type, str) else ""
 
         # ------------------------------------------------------------------
         # Error detection — raise immediately for error events.
@@ -95,7 +101,9 @@ def parse_sse_events(lines: list[str], collect_raw: bool = False) -> ParsedRespo
         # Metadata extraction.
         # ------------------------------------------------------------------
         if event_type in ("response.created", "response.done"):
-            resp = event.get("response", {})
+            resp = event.get("response")
+            if not isinstance(resp, dict):
+                resp = {}
             if not result.response_id:
                 result.response_id = resp.get("id", "")
             if not result.model:
@@ -105,7 +113,8 @@ def parse_sse_events(lines: list[str], collect_raw: bool = False) -> ParsedRespo
         # Usage extraction from response.done.
         # ------------------------------------------------------------------
         if event_type == "response.done":
-            usage = event.get("response", {}).get("usage", {})
+            response = event.get("response")
+            usage = response.get("usage", {}) if isinstance(response, dict) else {}
             if usage:
                 result.input_tokens = usage.get("input_tokens", 0)
                 result.output_tokens = usage.get("output_tokens", 0)
@@ -145,17 +154,24 @@ def parse_sse_events(lines: list[str], collect_raw: bool = False) -> ParsedRespo
 def _raise_sse_error(event: dict, event_type: str) -> None:
     """Extract error details from *event* and raise an :exc:`SSEError`."""
     if event_type == "error":
-        error_obj = event.get("error", {})
+        error_obj = event.get("error")
     else:
         # response.failed / response.incomplete — error nested under "response"
-        error_obj = event.get("response", {}).get("error", {})
+        response = event.get("response")
+        error_obj = response.get("error") if isinstance(response, dict) else None
 
     if isinstance(error_obj, str):
         message: str = error_obj
         code: str | None = None
     elif isinstance(error_obj, dict):
-        message = error_obj.get("message") or f"ChatGPT SSE {event_type} event"
-        code = error_obj.get("code") or None
+        raw_message = error_obj.get("message")
+        message = (
+            raw_message
+            if isinstance(raw_message, str)
+            else f"ChatGPT SSE {event_type} event"
+        )
+        raw_code = error_obj.get("code")
+        code = raw_code if isinstance(raw_code, str) else None
     else:
         message = f"ChatGPT SSE {event_type} event"
         code = None

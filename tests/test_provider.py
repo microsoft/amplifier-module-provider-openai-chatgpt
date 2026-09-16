@@ -2453,6 +2453,37 @@ class TestCompleteErrorMapping:
                 await provider.complete(request)  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("code", [7, ["rate_limit"], {"rate_limit": True}])
+    async def test_non_string_sse_error_code_stays_generic(
+        self, code: object
+    ) -> None:
+        """Malformed codes cannot raise incidentally or become a rate limit."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+        error_lines = [
+            "data: "
+            + json.dumps(
+                {
+                    "type": "error",
+                    "error": {"message": "Malformed code", "code": code},
+                }
+            ),
+            "data: [DONE]",
+        ]
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(error_lines)
+            with pytest.raises(kernel_errors.LLMError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert type(exc_info.value) is kernel_errors.LLMError
+        assert str(exc_info.value) == "Malformed code"
+
+    @pytest.mark.asyncio
     async def test_partial_sse_context_error_uses_code_and_aborts_once(self) -> None:
         """A partial stream remains abort-safe when a neutral context error follows."""
         from amplifier_core import llm_errors as kernel_errors
@@ -2504,6 +2535,89 @@ class TestCompleteErrorMapping:
         assert delta_calls[0].args[1]["text"] == "partial"
         assert len(aborted_calls) == 1
         assert calls.index(delta_calls[0]) < calls.index(aborted_calls[0])
+        assert len(response_calls) == 1
+        assert response_calls[0].args[1]["status"] == "error"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("event_type", "response"),
+        [
+            ("response.failed", None),
+            ("response.incomplete", []),
+        ],
+    )
+    async def test_partial_non_object_response_error_aborts_once(
+        self, event_type: str, response: object
+    ) -> None:
+        """Malformed failure events after text remain typed and abort once."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+        text_delta = (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "partial",
+                }
+            )
+        )
+        failure_event = "data: " + json.dumps(
+            {"type": event_type, "response": response}
+        )
+        error_lines = [text_delta, failure_event, "data: [DONE]"]
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(error_lines)
+            with pytest.raises(kernel_errors.LLMError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert type(exc_info.value) is kernel_errors.LLMError
+        assert str(exc_info.value) == f"ChatGPT SSE {event_type} event"
+        calls = provider._coordinator.hooks.emit.call_args_list  # type: ignore[union-attr]
+        aborted_calls = [call for call in calls if call.args[0] == "llm:stream_aborted"]
+        response_calls = [call for call in calls if call.args[0] == "llm:response"]
+        assert len(aborted_calls) == 1
+        assert len(response_calls) == 1
+        assert response_calls[0].args[1]["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_non_object_response_error_before_delta_stops_observing(self) -> None:
+        """A failure before a text delta does not become an empty success."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+        error_lines = [
+            "data: " + json.dumps({"type": "response.failed", "response": None}),
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "must not emit",
+                }
+            ),
+            "data: [DONE]",
+        ]
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(error_lines)
+            with pytest.raises(kernel_errors.LLMError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert type(exc_info.value) is kernel_errors.LLMError
+        assert str(exc_info.value) == "ChatGPT SSE response.failed event"
+        calls = provider._coordinator.hooks.emit.call_args_list  # type: ignore[union-attr]
+        assert [call for call in calls if call.args[0] == "llm:stream_block_delta"] == []
+        assert [call for call in calls if call.args[0] == "llm:stream_aborted"] == []
+        response_calls = [call for call in calls if call.args[0] == "llm:response"]
         assert len(response_calls) == 1
         assert response_calls[0].args[1]["status"] == "error"
 
