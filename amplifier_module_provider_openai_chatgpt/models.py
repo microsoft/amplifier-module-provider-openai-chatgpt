@@ -203,13 +203,21 @@ def to_model_infos(entries: list[dict[str, Any]]) -> list[ModelInfo]:
         slug: str = entry["slug"]
         display_name: str = entry.get("display_name") or slug
         context_window: int = entry.get("context_window", 0)
+        raw_max_output_tokens = entry.get("max_output_tokens")
+        max_output_tokens = (
+            raw_max_output_tokens
+            if isinstance(raw_max_output_tokens, int)
+            and not isinstance(raw_max_output_tokens, bool)
+            and raw_max_output_tokens > 0
+            else DEFAULT_MAX_OUTPUT_TOKENS
+        )
 
         result.append(
             ModelInfo(
                 id=slug,
                 display_name=display_name,
                 context_window=context_window,
-                max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                max_output_tokens=max_output_tokens,
             )
         )
 
@@ -221,7 +229,7 @@ def to_model_infos(entries: list[dict[str, Any]]) -> list[ModelInfo]:
                     id=f"{slug}-fast",
                     display_name=f"{display_name} (fast)",
                     context_window=context_window,
-                    max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                    max_output_tokens=max_output_tokens,
                 )
             )
 

@@ -120,6 +120,7 @@ class TestGetInfo:
         info = provider.get_info()  # type: ignore[union-attr]
         assert info.defaults["model"] == "gpt-5.6-terra"
         assert info.defaults["context_window"] == 1_000_000
+        assert info.defaults["max_output_tokens"] == 128_000
 
     def test_get_info_explicit_model_shown_verbatim(self) -> None:
         """An explicit non-sentinel default_model is shown as-is, with no
@@ -130,7 +131,7 @@ class TestGetInfo:
         info = provider.get_info()  # type: ignore[union-attr]
         assert info.defaults["model"] == "gpt-5.4"
 
-    def test_get_info_uses_selected_builtin_context_window(self) -> None:
+    def test_get_info_uses_selected_builtin_planning_limits(self) -> None:
         """A configured 272K model must not inherit a provider-wide 1M limit."""
         from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
 
@@ -138,9 +139,9 @@ class TestGetInfo:
         info = provider.get_info()
 
         assert info.defaults["context_window"] == 272_000
-        assert "max_output_tokens" not in info.defaults
+        assert info.defaults["max_output_tokens"] == 128_000
 
-    def test_get_info_uses_cached_dynamic_model_context_window(self) -> None:
+    def test_get_info_uses_cached_dynamic_model_planning_limits(self) -> None:
         """A cached live catalog is safe to consult without fetching again."""
         from amplifier_core import ModelInfo
         from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
@@ -151,16 +152,42 @@ class TestGetInfo:
                 id="dynamic-model",
                 display_name="Dynamic Model",
                 context_window=321_000,
-                max_output_tokens=128_000,
+                max_output_tokens=96_000,
             )
         ])
 
         info = provider.get_info()
 
         assert info.defaults["context_window"] == 321_000
-        assert "max_output_tokens" not in info.defaults
+        assert info.defaults["max_output_tokens"] == 96_000
 
-    def test_get_info_latest_uses_cached_context_only_after_resolution(self) -> None:
+    def test_get_info_normalizes_fast_model_for_builtin_planning_limits(self) -> None:
+        """A fast variant uses the selected base model's complete limit pair."""
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        provider = ChatGPTProvider(config={"default_model": "gpt-5.4-fast"})
+
+        info = provider.get_info()
+
+        assert info.defaults["context_window"] == 272_000
+        assert info.defaults["max_output_tokens"] == 128_000
+
+    def test_get_info_tracks_resolved_model_selection(self) -> None:
+        """Changing the resolved selection changes the published limit pair."""
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        provider = ChatGPTProvider(config={"default_model": "latest"})
+        provider._resolved_default_model = "gpt-5.4"  # type: ignore[attr-defined]
+        first_info = provider.get_info()
+        provider._resolved_default_model = "gpt-5.6-sol"  # type: ignore[attr-defined]
+        second_info = provider.get_info()
+
+        assert first_info.defaults["context_window"] == 272_000
+        assert first_info.defaults["max_output_tokens"] == 128_000
+        assert second_info.defaults["context_window"] == 1_000_000
+        assert second_info.defaults["max_output_tokens"] == 128_000
+
+    def test_get_info_latest_uses_cached_limits_only_after_resolution(self) -> None:
         """Unresolved latest omits limits; a resolved cached model supplies its own."""
         from amplifier_core import ModelInfo
         from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
@@ -177,23 +204,34 @@ class TestGetInfo:
 
         assert "context_window" not in provider.get_info().defaults
         provider._resolved_default_model = "dynamic-model"  # type: ignore[attr-defined]
-        assert provider.get_info().defaults["context_window"] == 321_000
+        info = provider.get_info()
+        assert info.defaults["context_window"] == 321_000
+        assert info.defaults["max_output_tokens"] == 128_000
 
-    def test_get_info_does_not_treat_zero_as_known_capacity(self) -> None:
-        from amplifier_core import ModelInfo
+    @pytest.mark.parametrize(
+        ("context_window", "max_output_tokens"),
+        [(0, 128_000), (272_000, 0), (True, 128_000), (272_000, True)],
+    )
+    def test_get_info_omits_incomplete_or_invalid_planning_limits(
+        self, context_window: int | bool, max_output_tokens: int | bool
+    ) -> None:
+        from types import SimpleNamespace
+
         from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
 
-        provider = ChatGPTProvider(config={"default_model": "zero-limit-model"})
+        provider = ChatGPTProvider(config={"default_model": "invalid-limit-model"})
         provider._models_cache = (0.0, [  # type: ignore[attr-defined]
-            ModelInfo(
-                id="zero-limit-model",
-                display_name="Zero Limit Model",
-                context_window=0,
-                max_output_tokens=128_000,
+            SimpleNamespace(
+                id="invalid-limit-model",
+                display_name="Invalid Limit Model",
+                context_window=context_window,
+                max_output_tokens=max_output_tokens,
             )
         ])
 
-        assert "context_window" not in provider.get_info().defaults
+        info = provider.get_info()
+        assert "context_window" not in info.defaults
+        assert "max_output_tokens" not in info.defaults
 
     def test_get_info_omits_capacity_for_unknown_model(self) -> None:
         from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
@@ -214,7 +252,8 @@ class TestGetInfo:
 
         assert not inspect.iscoroutinefunction(ChatGPTProvider.get_info)
 
-    def test_get_info_does_not_fetch_or_authenticate(self) -> None:
+    def test_get_info_publishes_known_limits_without_fetching_or_authenticating(self) -> None:
+        """Known built-in planning limits need neither auth nor a live catalog."""
         from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
 
         provider = ChatGPTProvider(config={"default_model": "gpt-5.4"})
@@ -228,8 +267,10 @@ class TestGetInfo:
             ),
             patch.object(provider, "_ensure_valid_tokens", ensure_valid_tokens),
         ):
-            provider.get_info()
+            info = provider.get_info()
 
+        assert info.defaults["context_window"] == 272_000
+        assert info.defaults["max_output_tokens"] == 128_000
         fetch_models.assert_not_awaited()
         ensure_valid_tokens.assert_not_awaited()
 
@@ -397,6 +438,16 @@ class TestBuildPayload:
         payload = provider._build_payload(request)  # type: ignore[union-attr]
         for param in REJECTED_PARAMS:
             assert param not in payload, f"Rejected param '{param}' found in payload"
+
+    def test_advisory_planning_output_limit_is_not_sent_to_backend(self) -> None:
+        """get_info() planning metadata does not create a wire output-cap parameter."""
+        provider = self._make_provider(default_model="gpt-5.4")
+        info = provider.get_info()  # type: ignore[union-attr]
+
+        assert info.defaults["max_output_tokens"] == 128_000
+
+        payload = provider._build_payload(self._make_request())  # type: ignore[union-attr]
+        assert "max_output_tokens" not in payload
 
     def test_basic_structure_has_model(self) -> None:
         """Payload must include a model field."""

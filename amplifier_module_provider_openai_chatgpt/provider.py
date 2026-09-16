@@ -349,14 +349,14 @@ class ChatGPTProvider:
     # Provider Protocol
     # ------------------------------------------------------------------
 
-    def _known_context_window(self) -> int | None:
-        """Return a positive context window for the selected known model.
+    def _known_model_limits(self) -> tuple[int, int] | None:
+        """Return valid planning limits for the selected known model.
 
         This accessor is intentionally synchronous and consults only the
         in-memory catalog cache or the built-in fallback catalog. It never
         authenticates or fetches a catalog merely to answer ``get_info()``.
-        A model with no positive, non-boolean limit remains unknown rather
-        than being represented by a provider-wide default.
+        A model with either limit absent, non-positive, or boolean remains
+        unknown rather than being represented by a provider-wide default.
         """
         model_id = self._resolved_default_model or self.default_model
         if model_id == LATEST_MODEL_SENTINEL:
@@ -373,12 +373,16 @@ class ChatGPTProvider:
             if model.id != model_id:
                 continue
             context_window = model.context_window
+            max_output_tokens = model.max_output_tokens
             if (
                 isinstance(context_window, int)
                 and not isinstance(context_window, bool)
                 and context_window > 0
+                and isinstance(max_output_tokens, int)
+                and not isinstance(max_output_tokens, bool)
+                and max_output_tokens > 0
             ):
-                return context_window
+                return context_window, max_output_tokens
             return None
         return None
 
@@ -401,15 +405,16 @@ class ChatGPTProvider:
         provider does expose meaningfully (``default_model``); it is set
         via ``settings.yaml``, not a wizard prompt.
 
-        ``defaults["model"]`` and any reported ``context_window`` never
-        trigger a network call (this method must stay synchronous and
-        side-effect-free -- app-cli's wizard calls it eagerly). A positive
-        context window is included only for the selected model when it is
-        known from the in-memory catalog cache or built-in catalog. Unknown
-        and unresolved models omit capacity defaults rather than inheriting a
-        provider-wide 1M claim. The backend rejects or omits a request-level
-        output cap, so this method deliberately does not advertise one as an
-        enforceable reservation.
+        ``defaults["model"]`` and reported planning limits never trigger a
+        network call (this method must stay synchronous and side-effect-free
+        -- app-cli's wizard calls it eagerly). ``context_window`` and
+        ``max_output_tokens`` are included together only when both positive,
+        non-boolean values are known for the selected model from the
+        in-memory catalog cache or built-in catalog. They are advisory
+        planning metadata for context-compaction consumers, not an enforced
+        output reservation, backend acceptance guarantee, or request payload
+        parameter. Unknown and unresolved models omit both rather than
+        inheriting a provider-wide 1M claim.
 
         When ``default_model`` is the ``"latest"`` sentinel and resolution
         hasn't happened yet on this instance (no `complete()` or
@@ -431,9 +436,11 @@ class ChatGPTProvider:
             model_display = self.default_model
 
         defaults: dict[str, Any] = {"model": model_display}
-        context_window = self._known_context_window()
-        if context_window is not None:
+        model_limits = self._known_model_limits()
+        if model_limits is not None:
+            context_window, max_output_tokens = model_limits
             defaults["context_window"] = context_window
+            defaults["max_output_tokens"] = max_output_tokens
 
         return ProviderInfo(
             id="openai-chatgpt",
