@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import hashlib
+from copy import deepcopy
 import json
 import logging
 import time
@@ -21,6 +23,7 @@ from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
+    Message,
     TextBlock,
     ThinkingBlock,
     ToolCall,
@@ -31,6 +34,13 @@ from amplifier_core.message_models import (
 from amplifier_core.utils import redact_secrets
 
 from ._sse import ParsedResponse, SSEError, parse_sse_events
+from ._compaction import (
+    METADATA_KEY,
+    CompactionCheckpoint,
+    checkpoint_message,
+    replay_item,
+    redact_opaque,
+)
 from .models import (
     DEFAULT_CACHE_TTL_SECONDS,
     FALLBACK_MODELS,
@@ -68,6 +78,7 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "instance_id",
         "extra_request_params",
         "reasoning_effort",
+        "experimental_compaction",
     }
 )
 
@@ -273,6 +284,11 @@ class ChatGPTProvider:
 
         self.priority: int = _coerce_int(
             self._config.get("priority"), key="priority", default=100
+        )
+        self.experimental_compaction = _coerce_bool(
+            self._config.get("experimental_compaction"),
+            key="experimental_compaction",
+            default=False,
         )
         self.raw: bool = _coerce_bool(self._config.get("raw"), key="raw", default=False)
         # "latest" is the sentinel default: config absent OR explicitly
@@ -694,7 +710,11 @@ class ChatGPTProvider:
         return result
 
     def _build_payload(
-        self, request: ChatRequest, *, default_model: str | None = None
+        self,
+        request: ChatRequest,
+        *,
+        default_model: str | None = None,
+        compaction: bool = False,
     ) -> dict[str, Any]:
         """Build Responses API payload from an Amplifier ChatRequest.
 
@@ -737,7 +757,72 @@ class ChatGPTProvider:
         instructions: str | None = None
         input_items: list[dict[str, Any]] = []
 
+        has_checkpoint = any(
+            METADATA_KEY in (m.metadata or {}) for m in request.messages
+        )
+        native = compaction or has_checkpoint
+        if native:
+            if not self.experimental_compaction:
+                raise kernel_errors.InvalidRequestError(
+                    "ChatGPT checkpoint experiment is disabled", provider=self.name
+                )
+            unsupported = (
+                "response_format",
+                "temperature",
+                "top_p",
+                "max_output_tokens",
+                "stop",
+                "conversation_id",
+            )
+            if any(getattr(request, field) is not None for field in unsupported):
+                raise kernel_errors.InvalidRequestError(
+                    "Native checkpoint requests cannot silently discard unsupported request fields",
+                    provider=self.name,
+                )
+            for message in request.messages:
+                if isinstance(message.content, list):
+                    allowed = {
+                        "system": (TextBlock,),
+                        "developer": (TextBlock,),
+                        "assistant": (TextBlock, ThinkingBlock, ToolCallBlock),
+                        "tool": (ToolResultBlock,),
+                    }.get(message.role, (TextBlock, ThinkingBlock))
+                    if any(not isinstance(block, allowed) for block in message.content):
+                        raise kernel_errors.InvalidRequestError(
+                            "Unsupported native checkpoint history content",
+                            provider=self.name,
+                        )
+            # All request envelope and transport controls are owned by the
+            # caller/codec. Do not let the generic escape hatch replace them.
+            protected = {
+                "input",
+                "model",
+                "instructions",
+                "tools",
+                "tool_choice",
+                "stream",
+                "store",
+                "previous_response_id",
+                "conversation",
+                "context_management",
+                "truncation",
+            }
+            if protected.intersection(self.extra_request_params):
+                raise kernel_errors.InvalidRequestError(
+                    "Native checkpoint request conflicts with extra_request_params",
+                    provider=self.name,
+                )
         for message in request.messages:
+            if native:
+                try:
+                    item = replay_item(message, self._checkpoint_provenance(model))
+                except ValueError as exc:
+                    raise kernel_errors.InvalidRequestError(
+                        str(exc), provider=self.name
+                    ) from exc
+                if item is not None:
+                    input_items.append(item)
+                    continue
             # First system/developer message becomes top-level instructions
             if message.role in ("system", "developer") and instructions is None:
                 if isinstance(message.content, str):
@@ -819,6 +904,9 @@ class ChatGPTProvider:
                     }
                 )
 
+        if compaction:
+            input_items.append({"type": "compaction_trigger"})
+
         # Assemble base payload (no rejected params)
         payload: dict[str, Any] = {
             "model": model,
@@ -844,7 +932,11 @@ class ChatGPTProvider:
                 }
                 for tool in request.tools
             ]
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = (
+                deepcopy(request.tool_choice)
+                if native and request.tool_choice is not None
+                else "auto"
+            )
 
         # Reasoning effort (resolved above: request > mount config > none)
         if effort:
@@ -1119,7 +1211,50 @@ class ChatGPTProvider:
             retryable=False,
         )
 
+    def supports_native_compaction(self) -> bool:
+        """Automatic manager selection is unqualified, even with the experiment enabled."""
+        return False
+
+    def _checkpoint_provenance(self, model: str) -> dict[str, str]:
+        account = (self._tokens or {}).get("account_id", "")
+        return {
+            "provider": self.name,
+            "endpoint": CHATGPT_CODEX_ENDPOINT,
+            "model": model,
+            "account_sha256": hashlib.sha256(account.encode()).hexdigest(),
+        }
+
+    async def compact_checkpoint(self, request: ChatRequest) -> CompactionCheckpoint:
+        """Explicit experiment on caller-selected history and its actual envelope.
+
+        Returns one checkpoint, not a replacement window. No summary policy,
+        retained-history construction, count estimate, tool execution or fallback.
+        """
+        if not self.experimental_compaction:
+            raise kernel_errors.InvalidRequestError(
+                "ChatGPT checkpoint experiment is disabled", provider=self.name
+            )
+        response = await self._complete(request, compaction=True)
+        metadata = response.metadata or {}
+        checkpoint = Message(
+            role="assistant",
+            content="",
+            metadata={METADATA_KEY: deepcopy(metadata[METADATA_KEY])},
+        )
+        return CompactionCheckpoint(
+            checkpoint=checkpoint,
+            usage=response.usage,
+            raw_usage=deepcopy(metadata["operation_usage"]),
+            response_id=metadata["response_id"],
+            terminal_event=metadata["terminal_event"],
+        )
+
     async def complete(self, request: ChatRequest, **kwargs: Any) -> ChatResponse:
+        return await self._complete(request)
+
+    async def _complete(
+        self, request: ChatRequest, *, compaction: bool = False
+    ) -> ChatResponse:
         """Send a completion request to the ChatGPT Responses API.
 
         Flow:
@@ -1148,7 +1283,9 @@ class ChatGPTProvider:
         effective_default_model = await self._resolve_default_model()
 
         # 2. Build request payload.
-        payload = self._build_payload(request, default_model=effective_default_model)
+        payload = self._build_payload(
+            request, default_model=effective_default_model, compaction=compaction
+        )
 
         # Resolve effective model name (mirrors _build_payload logic) for events.
         model: str = request.model or effective_default_model
@@ -1166,7 +1303,9 @@ class ChatGPTProvider:
                 "message_count": len(request.messages),
             }
             if self.raw:
-                req_event["raw"] = redact_secrets(payload)
+                req_event["raw"] = redact_secrets(redact_opaque(payload))
+            if compaction:
+                req_event["operation"] = "compaction"
             await self._coordinator.hooks.emit("llm:request", req_event)
 
         start_time = time.monotonic()
@@ -1179,7 +1318,9 @@ class ChatGPTProvider:
             _use_streaming = False
 
         # Emit stream events only when coordinator is present AND streaming is on.
-        emit_stream_events: bool = bool(_has_hooks and _use_streaming)
+        emit_stream_events: bool = bool(
+            _has_hooks and _use_streaming and not compaction
+        )
 
         # Streaming state — stable across the 401-retry loop.
         # request_id is generated once; seq/block_types reset per attempt (fresh stream).
@@ -1395,28 +1536,49 @@ class ChatGPTProvider:
                     raise
 
             # 6. Parse SSE events.
-            parsed = parse_sse_events(lines, collect_raw=self.raw)
+            parsed = parse_sse_events(
+                lines, collect_raw=self.raw, require_compaction=compaction
+            )
+            if parsed.compaction_items and not self.experimental_compaction:
+                raise SSEError(
+                    "Unexpected checkpoint while experiment is disabled",
+                    None,
+                    "compaction.invalid",
+                )
 
             duration_ms = (time.monotonic() - start_time) * 1000
+
+            if parsed.compaction_items and parsed.model and parsed.model != model:
+                raise SSEError(
+                    "Compaction response model differs from requested model",
+                    None,
+                    "compaction.invalid",
+                )
+            response = self._to_chat_response(parsed, model)
 
             # 7. Emit llm:response event (success).
             if _has_hooks:
                 resp_event: dict[str, Any] = {
                     "provider": self.name,
                     "model": model,
-                    "usage": {
-                        "input_tokens": parsed.input_tokens,
-                        "output_tokens": parsed.output_tokens,
-                    },
+                    "usage": response.usage.model_dump(
+                        exclude_none=True, exclude={"total_tokens"}
+                    )
+                    if response.usage
+                    else {},
                     "status": "ok",
                     "duration_ms": duration_ms,
                 }
                 if self.raw:
-                    resp_event["raw"] = redact_secrets({"events": parsed.raw_events})
+                    resp_event["raw"] = redact_secrets(
+                        redact_opaque({"events": parsed.raw_events})
+                    )
+                if compaction:
+                    resp_event["operation"] = "compaction"
                 await self._coordinator.hooks.emit("llm:response", resp_event)
 
             # 8. Return ChatResponse.
-            return self._to_chat_response(parsed, model)
+            return response
 
         except kernel_errors.LLMError as exc:
             # Already a typed kernel error — emit hook and re-raise unchanged.
@@ -1457,7 +1619,8 @@ class ChatGPTProvider:
                     str(exc), provider=self.name, retryable=True
                 )
             elif code == "context_length_exceeded" or (
-                not code and any(kw in msg for kw in ("context length", "too many tokens"))
+                not code
+                and any(kw in msg for kw in ("context length", "too many tokens"))
             ):
                 mapped_exc = kernel_errors.ContextLengthError(
                     str(exc), provider=self.name, retryable=False
@@ -1620,12 +1783,37 @@ class ChatGPTProvider:
         usage = Usage(
             input_tokens=parsed.input_tokens,
             output_tokens=parsed.output_tokens,
-            total_tokens=parsed.input_tokens + parsed.output_tokens,
+            total_tokens=parsed.raw_usage.get(
+                "total_tokens", parsed.input_tokens + parsed.output_tokens
+            ),
+            cache_read_tokens=(parsed.raw_usage.get("input_tokens_details") or {}).get(
+                "cached_tokens"
+            ),
+            cache_write_tokens=(parsed.raw_usage.get("input_tokens_details") or {}).get(
+                "cache_write_tokens"
+            ),
+            reasoning_tokens=(parsed.raw_usage.get("output_tokens_details") or {}).get(
+                "reasoning_tokens"
+            ),
         )
+        metadata = None
+        if parsed.compaction_items:
+            message = checkpoint_message(
+                parsed.compaction_items[0], self._checkpoint_provenance(model)
+            )
+            metadata = {
+                **(message.metadata or {}),
+                "operation_usage": deepcopy(parsed.raw_usage),
+                "response_id": parsed.response_id,
+                "terminal_event": parsed.terminal_event,
+            }
+            if not parsed.raw_usage:
+                usage = None  # Missing measurement is unavailable, never zero.
 
         return ChatResponse(
             content=content_blocks,
             tool_calls=tool_call_list if tool_call_list else None,
             usage=usage,
             finish_reason=finish_reason,
+            metadata=metadata,
         )

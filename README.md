@@ -341,3 +341,7 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+
+## Experimental native checkpoint mechanism
+
+A disabled-by-default subscription checkpoint experiment is available for explicit qualification. See [the mechanism contract and limitations](docs/compaction-experiment.md). Automatic native compaction selection remains disabled.
