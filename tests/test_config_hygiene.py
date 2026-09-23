@@ -98,7 +98,7 @@ class TestProviderConfigCoercionIntegration:
 
     def test_invalid_numeric_string_defaults_instead_of_crashing(self):
         provider = ChatGPTProvider(config={"timeout": "not-a-number"})
-        assert provider.timeout == 300.0
+        assert provider.timeout is None
 
     def test_models_client_version_default(self):
         from amplifier_module_provider_openai_chatgpt.models import (

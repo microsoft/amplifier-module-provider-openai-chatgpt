@@ -12,6 +12,7 @@ import hashlib
 from copy import deepcopy
 import json
 import logging
+import math
 import time
 import uuid
 from typing import Any, Callable
@@ -300,9 +301,24 @@ class ChatGPTProvider:
         self.default_model: str = self._config.get(
             "default_model", LATEST_MODEL_SENTINEL
         )
-        self.timeout: float = _coerce_float(
-            self._config.get("timeout"), key="timeout", default=300.0
-        )
+        # Model work may be quiet for an arbitrarily long time. An absent
+        # timeout disables read/write deadlines, including HTTPX defaults.
+        configured_timeout = self._config.get("timeout")
+        self.timeout: float | None = None
+        if configured_timeout is not None:
+            try:
+                value = float(configured_timeout)
+                if (
+                    isinstance(configured_timeout, bool)
+                    or not math.isfinite(value)
+                    or value < 0
+                ):
+                    raise ValueError("invalid timeout")
+                self.timeout = value
+            except (TypeError, ValueError):
+                logger.warning(
+                    "[PROVIDER] Invalid config timeout; defaulting to no model-work timeout."
+                )
         self._token_file_path: str | None = self._config.get("token_file_path")
 
         # Canonical effort knob from mount config -- validated here so a bad
@@ -1249,6 +1265,24 @@ class ChatGPTProvider:
             terminal_event=metadata["terminal_event"],
         )
 
+    def _http_timeout(self, request: ChatRequest) -> httpx.Timeout:
+        """Honor explicit caller limits without timing out healthy model work.
+
+        Connection establishment/pool acquisition have separate setup limits.
+        Request-level explicit None overrides a provider-configured deadline.
+        """
+        value = (
+            request.timeout if "timeout" in request.model_fields_set else self.timeout
+        )
+        if value is None:
+            return httpx.Timeout(None, connect=10.0, pool=10.0)
+        if not math.isfinite(value) or value < 0:
+            raise kernel_errors.InvalidRequestError(
+                "Request timeout must be finite and nonnegative, or None",
+                provider=self.name,
+            )
+        return httpx.Timeout(value)
+
     async def complete(self, request: ChatRequest, **kwargs: Any) -> ChatResponse:
         return await self._complete(request)
 
@@ -1293,6 +1327,7 @@ class ChatGPTProvider:
             model = model.removesuffix("-fast")
 
         headers = self._build_headers()
+        timeout = self._http_timeout(request)
 
         # 3. Emit llm:request event (NOT re-emitted on retry).
         _has_hooks = self._coordinator and hasattr(self._coordinator, "hooks")
@@ -1342,7 +1377,7 @@ class ChatGPTProvider:
                 seq = {}
                 block_types = {}
                 try:
-                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    async with httpx.AsyncClient(timeout=timeout) as client:
                         async with client.stream(
                             "POST",
                             CHATGPT_CODEX_ENDPOINT,
@@ -1384,9 +1419,6 @@ class ChatGPTProvider:
                             async for line in resp.aiter_lines():
                                 lines.append(line)
 
-                                if not emit_stream_events:
-                                    continue
-
                                 if not line.startswith("data: "):
                                     continue
 
@@ -1408,6 +1440,20 @@ class ChatGPTProvider:
                                     if isinstance(raw_event_type, str)
                                     else ""
                                 )
+
+                                # Completion is the end of model work; do not
+                                # wait for server EOF or read another chunk.
+                                if et in ("response.done", "response.completed"):
+                                    break
+                                if not emit_stream_events:
+                                    if et in (
+                                        "error",
+                                        "response.failed",
+                                        "response.incomplete",
+                                        "response.cancelled",
+                                    ):
+                                        break
+                                    continue
 
                                 if et == "response.output_item.added":
                                     idx: int = event.get("output_index", 0)
@@ -1486,6 +1532,7 @@ class ChatGPTProvider:
                                     "error",
                                     "response.failed",
                                     "response.incomplete",
+                                    "response.cancelled",
                                 ):
                                     # Emit stream_aborted now if we already sent deltas.
                                     # parse_sse_events will raise SSEError after the loop.
@@ -1579,6 +1626,33 @@ class ChatGPTProvider:
 
             # 8. Return ChatResponse.
             return response
+
+        except asyncio.CancelledError:
+            # User/caller cancellation must propagate after HTTPX closes the
+            # stream, without becoming a provider error or starting a retry.
+            if _has_hooks:
+                if any_emitted and not stream_aborted_emitted:
+                    await self._coordinator.hooks.emit(
+                        "llm:stream_aborted",
+                        {
+                            "request_id": request_id,
+                            "error": {
+                                "type": "CancelledError",
+                                "msg": "Request cancelled",
+                            },
+                        },
+                    )
+                await self._coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": self.name,
+                        "model": model,
+                        "status": "cancelled",
+                        "duration_ms": (time.monotonic() - start_time) * 1000,
+                        **({"operation": "compaction"} if compaction else {}),
+                    },
+                )
+            raise
 
         except kernel_errors.LLMError as exc:
             # Already a typed kernel error — emit hook and re-raise unchanged.

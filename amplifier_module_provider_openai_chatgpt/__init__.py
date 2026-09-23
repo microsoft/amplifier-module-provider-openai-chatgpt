@@ -39,7 +39,7 @@ async def mount(
               are absent or invalid.
             - raw: Pass raw payloads/events through provider hooks.
             - default_model: Default model name (default: 'gpt-5.5').
-            - timeout: HTTP timeout in seconds (default: 300.0).
+            - timeout: Explicit HTTP phase timeout in seconds (default: no model-work deadline).
 
     Returns:
         Async cleanup callable on success, or None on failure.

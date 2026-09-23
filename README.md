@@ -43,7 +43,7 @@ Every key below is a fully supported config key -- set it directly in
 | `raw` | bool | `false` | Include full request/response payloads in `llm:request`/`llm:response` hook events (for debugging) |
 | `login_on_mount` | bool | `true` | Trigger interactive device code login if tokens are absent or expired. Set `false` for non-interactive environments. |
 | `token_file_path` | str | `~/.amplifier/openai-chatgpt-oauth.json` | Path to the OAuth token JSON file |
-| `timeout` | float | `300.0` | HTTP timeout in seconds for streaming requests |
+| `timeout` | float or null | `null` | Optional caller-chosen HTTP phase timeout; by default model reads/writes have no deadline, with 10-second connection/pool setup limits |
 | `models_cache_ttl` | float | `3600` | How long (seconds) to cache the live model catalog before re-fetching |
 | `models_client_version` | str | `"99.99.99"` | Settings-only override for the model-catalog version-gating constant (see `models.py`'s `MODELS_CLIENT_VERSION` -- FRAGILE, relies on the ChatGPT backend treating any unknown high version as "give me everything") |
 | `use_streaming` | bool | `true` | Set `false` to force non-streaming completions |
@@ -341,6 +341,12 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+
+## Waiting for model completion
+
+Normal completion, streamed responses and experimental compaction have no default elapsed-time or HTTP read/write deadline. They wait for completion, explicit cancellation or a real connection/provider failure. HTTPX's default read timeout is explicitly disabled. Connection establishment and pool acquisition remain limited to 10 seconds; OAuth and model-catalog calls keep their separate setup limits.
+
+An explicit provider `timeout` keeps its HTTP phase limit. `ChatRequest.timeout` takes precedence when supplied; explicit `None` removes the model-work limit for that request. A completed response returns immediately without waiting for socket EOF. Cancelling a pending request closes the stream and propagates cancellation without retrying.
 
 ## Experimental native checkpoint mechanism
 

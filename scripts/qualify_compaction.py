@@ -147,7 +147,7 @@ def safe_error(exc):
     }
 
 
-async def qualify(standalone_only=False):
+async def qualify(standalone_only=False, request_timeout=None):
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model": MODEL,
@@ -177,7 +177,7 @@ async def qualify(standalone_only=False):
             {
                 "experimental_compaction": True,
                 "default_model": MODEL,
-                "timeout": 40,
+                "timeout": request_timeout,
                 "raw": False,
                 "token_file_path": "/nonexistent/qualification-no-refresh",
             },
@@ -190,7 +190,7 @@ async def qualify(standalone_only=False):
         report["model_calls"] += 1
         before = request.model_dump_json()
         try:
-            value = await asyncio.wait_for(operation(request), timeout=45)
+            value = await operation(request)
             case = {
                 "case": name,
                 "passed": True,
@@ -327,6 +327,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
     parser.add_argument("--standalone-only", action="store_true")
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=None,
+        help="Explicit optional HTTP phase timeout; model work has no deadline by default",
+    )
     args = parser.parse_args()
     logging.disable(logging.CRITICAL)
     credential_path = Path(TOKEN_FILE_PATH).expanduser()
@@ -336,9 +342,7 @@ def main():
         else None
     )
     try:
-        report = asyncio.run(
-            asyncio.wait_for(qualify(args.standalone_only), timeout=240)
-        )
+        report = asyncio.run(qualify(args.standalone_only, args.request_timeout))
     except BaseException as exc:
         report = {"status": "probe-aborted", "error": safe_error(exc)}
     after = (

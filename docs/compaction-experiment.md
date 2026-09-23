@@ -31,7 +31,7 @@ Run the bounded live probe only as an explicit experiment:
 .venv/bin/python scripts/qualify_compaction.py --output /absolute/path/results.json
 ```
 
-It uses only disposable synthetic data and already-valid provider credentials held in memory, disables token refresh, never logs or saves ciphertext, performs at most ten model requests within four minutes, and stops at the first failure. `--standalone-only` checks the compact and two continuation variants in three requests. No saved conversations, host settings or installed providers are changed.
+It uses only disposable synthetic data and already-valid provider credentials held in memory, disables token refresh, never logs or saves ciphertext, performs at most ten model requests, and stops at the first failure. `--standalone-only` checks the compact and two continuation variants in three requests. No saved conversations, host settings or installed providers are changed. It imposes no elapsed-time or model-read deadline: healthy requests wait for completion, explicit cancellation or an actual provider/connection failure. `--request-timeout` is an optional caller-chosen HTTP phase limit. Default 10-second connection/pool setup limits apply before model work; OAuth and model-catalog setup retain their own non-inference limits.
 
 ## Sources
 
