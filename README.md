@@ -247,6 +247,20 @@ See the matrix YAML header for full documentation on glob strategy, fallback phi
 
 The model catalog is fetched dynamically from the ChatGPT backend API at `GET /backend-api/codex/models`. Available models depend on your subscription tier. The catalog is cached for 1 hour (configurable via `models_cache_ttl`).
 
+OpenAI documents [GPT-6 Sol and GPT-6 Luna as ChatGPT Work and Codex
+models](https://help.openai.com/en/articles/20001275-chatgpt-work-and-codex);
+they are not available in regular ChatGPT conversations, and availability
+depends on plan, workspace settings, and rollout access. That product
+availability does **not** establish the contract for this provider's
+undocumented OAuth backend. The authenticated live catalog remains the
+authority for whether those IDs are exposed, their context and output limits,
+reasoning options, Fast availability, and request acceptance. Those backend
+details have not been live-verified here.
+
+The static fallback and its `latest` default remain `gpt-5.6-sol`; no GPT-6
+fallback entry, Fast variant, context limit, or reasoning metadata is invented
+from the product announcement.
+
 If the live API is unreachable (or `auth_status()` would say `"unauthenticated"`/`"expired"` -- see below), this module's built-in
 `FALLBACK_MODELS` catalog (`models.py`) is used instead:
 

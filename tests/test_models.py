@@ -62,6 +62,35 @@ def _make_entry(
     }
 
 
+# Synthetic contract fixtures only: these entries are deliberately fabricated
+# test inputs, not captured ChatGPT OAuth catalog data.
+@pytest.fixture
+def synthetic_sol_luna_catalog() -> list[dict]:
+    """Return synthetic backend-advertised GPT-6 catalog entries.
+
+    Values intentionally differ from public direct-API documentation so these
+    tests prove catalog pass-through rather than claim OAuth backend limits.
+    """
+    sol = _make_entry(
+        "gpt-6-sol",
+        display_name="Synthetic GPT-6 Sol",
+        context_window=543_210,
+        speed_tiers=["fast"],
+    )
+    sol["max_output_tokens"] = 54_321
+    sol["supported_reasoning_levels"] = ["low", "medium"]
+
+    luna = _make_entry(
+        "gpt-6-luna",
+        display_name="Synthetic GPT-6 Luna",
+        context_window=321_098,
+    )
+    luna["max_output_tokens"] = 32_109
+    luna["supported_reasoning_levels"] = ["low"]
+
+    return [sol, luna]
+
+
 # ---------------------------------------------------------------------------
 # TestFetchModels — fetch_models()
 # ---------------------------------------------------------------------------
@@ -209,6 +238,27 @@ class TestToModelInfos:
 
         assert len(result) == 1
         assert result[0].id == "gpt-4o"
+
+    def test_synthetic_gpt_6_catalog_preserves_advertised_limits_and_tiers(
+        self, synthetic_sol_luna_catalog: list[dict]
+    ) -> None:
+        """Synthetic catalog metadata passes through without GPT-6 assumptions."""
+        from amplifier_module_provider_openai_chatgpt.models import to_model_infos
+
+        models_by_id = {
+            model.id: model for model in to_model_infos(synthetic_sol_luna_catalog)
+        }
+
+        assert models_by_id["gpt-6-sol"].context_window == 543_210
+        assert models_by_id["gpt-6-sol"].max_output_tokens == 54_321
+        assert models_by_id["gpt-6-sol-fast"].context_window == 543_210
+        assert models_by_id["gpt-6-sol-fast"].max_output_tokens == 54_321
+        assert models_by_id["gpt-6-luna"].context_window == 321_098
+        assert models_by_id["gpt-6-luna"].max_output_tokens == 32_109
+
+        # Only the backend-advertised Sol fast tier is emitted. No GPT-6 model
+        # absent from the synthetic catalog is inferred or promoted.
+        assert set(models_by_id) == {"gpt-6-sol", "gpt-6-sol-fast", "gpt-6-luna"}
 
     def test_fallback_first_entry_is_gpt_56_sol(self) -> None:
         """FALLBACK_MODELS first entry must be gpt-5.6-sol (current flagship).

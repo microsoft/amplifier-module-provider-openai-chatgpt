@@ -9,6 +9,35 @@ import pytest
 import httpx
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
+
+# Synthetic contract fixtures only: these entries are deliberately fabricated
+# test inputs, not captured ChatGPT OAuth catalog data.
+def _synthetic_sol_luna_catalog() -> list[dict]:
+    """Return backend-shaped GPT-6 entries with intentionally synthetic limits."""
+    return [
+        {
+            "slug": "gpt-6-sol",
+            "display_name": "Synthetic GPT-6 Sol",
+            "context_window": 543_210,
+            "max_output_tokens": 54_321,
+            "supported_in_api": True,
+            "visibility": "list",
+            "additional_speed_tiers": ["fast"],
+            "supported_reasoning_levels": ["low", "medium"],
+        },
+        {
+            "slug": "gpt-6-luna",
+            "display_name": "Synthetic GPT-6 Luna",
+            "context_window": 321_098,
+            "max_output_tokens": 32_109,
+            "supported_in_api": True,
+            "visibility": "list",
+            "additional_speed_tiers": [],
+            "supported_reasoning_levels": ["low"],
+        },
+    ]
+
+
 # ---------------------------------------------------------------------------
 # TestFallbackCatalog — FALLBACK_MODELS in models.py
 # ---------------------------------------------------------------------------
@@ -559,6 +588,39 @@ class TestBuildPayload:
         assert payload["model"] == "gpt-5.4"
         assert payload.get("service_tier") == "priority"
 
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    def test_gpt_6_request_preserves_model_reasoning_and_tools(self, model: str) -> None:
+        """Both GPT-6 IDs use the generic request construction path."""
+        from amplifier_core.message_models import Message, ToolSpec
+
+        provider = self._make_provider(default_model="gpt-5.4")
+        request = self._make_request(
+            messages=[Message(role="user", content="use the tool")],
+            model=model,
+            reasoning_effort="medium",
+            tools=[
+                ToolSpec(
+                    name="lookup",
+                    description="Looks up a value",
+                    parameters={"type": "object", "properties": {}},
+                )
+            ],
+        )
+
+        payload = provider._build_payload(request)  # type: ignore[union-attr]
+
+        assert payload["model"] == model
+        assert payload["reasoning"] == {"effort": "medium", "summary": "detailed"}
+        assert payload["tools"] == [
+            {
+                "type": "function",
+                "name": "lookup",
+                "description": "Looks up a value",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+        assert payload["tool_choice"] == "auto"
+
     # ------------------------------------------------------------------
     # Tools conversion
     # ------------------------------------------------------------------
@@ -1092,6 +1154,35 @@ class TestComplete:
         assert len(result.content) == 1
         assert isinstance(result.content[0], TextBlock)
         assert result.content[0].text == "Hello, world!"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    async def test_gpt_6_request_completes_through_sse(self, model: str) -> None:
+        """Both new model strings take the normal request and SSE completion path."""
+        from amplifier_core.message_models import TextBlock
+
+        provider = self._make_provider()
+        request = self._make_request(model=model)
+        sse_lines = _make_sse_lines(text="Synthetic GPT-6 completion")
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            result = await provider.complete(request)  # type: ignore[union-attr]
+
+            _, stream_kwargs = MockClient.return_value._value.stream.call_args
+
+        assert stream_kwargs["json"]["model"] == model
+        assert len(result.content) == 1
+        assert isinstance(result.content[0], TextBlock)
+        assert result.content[0].text == "Synthetic GPT-6 completion"
+        assert result.tool_calls is None
+        assert result.finish_reason == "stop"
+        assert result.usage is not None
+        assert result.usage.input_tokens == 10
+        assert result.usage.output_tokens == 5
+        assert result.usage.total_tokens == 15
 
     @pytest.mark.asyncio
     async def test_simple_text_completion_usage(self) -> None:
@@ -1733,6 +1824,27 @@ class TestListModelsDynamic:
         assert len(result) == 1
         assert result[0].id == "gpt-4o"
 
+    @pytest.mark.asyncio
+    async def test_synthetic_gpt_6_catalog_passes_through_without_inference(self) -> None:
+        """Live-catalog values, rather than static GPT-6 metadata, are authoritative."""
+        provider = self._make_provider()
+        mock_fetch = AsyncMock(return_value=_synthetic_sol_luna_catalog())
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            mock_fetch,
+        ):
+            models = await provider.list_models()  # type: ignore[union-attr]
+
+        models_by_id = {model.id: model for model in models}
+        assert models_by_id["gpt-6-sol"].context_window == 543_210
+        assert models_by_id["gpt-6-sol"].max_output_tokens == 54_321
+        assert models_by_id["gpt-6-sol-fast"].context_window == 543_210
+        assert models_by_id["gpt-6-sol-fast"].max_output_tokens == 54_321
+        assert models_by_id["gpt-6-luna"].context_window == 321_098
+        assert models_by_id["gpt-6-luna"].max_output_tokens == 32_109
+        assert set(models_by_id) == {"gpt-6-sol", "gpt-6-sol-fast", "gpt-6-luna"}
+
     # ------------------------------------------------------------------
     # Cache hit on second call
     # ------------------------------------------------------------------
@@ -1956,6 +2068,24 @@ class TestResolveDefaultModel:
             resolved = await provider._resolve_default_model()  # type: ignore[union-attr]
 
         assert resolved == "gpt-5.6-sol"
+        mock_fetch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sentinel_uses_synthetic_catalog_order_without_gpt_6_promotion(
+        self,
+    ) -> None:
+        """Latest follows catalog order; it does not hardcode a GPT-6 preference."""
+        provider = self._make_provider(tokens=self._authenticated_tokens())
+        entries = list(reversed(_synthetic_sol_luna_catalog()))
+        mock_fetch = AsyncMock(return_value=entries)
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            mock_fetch,
+        ):
+            resolved = await provider._resolve_default_model()  # type: ignore[union-attr]
+
+        assert resolved == "gpt-6-luna"
         mock_fetch.assert_awaited_once()
 
     @pytest.mark.asyncio
