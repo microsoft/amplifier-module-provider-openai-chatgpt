@@ -234,3 +234,35 @@ def to_model_infos(entries: list[dict[str, Any]]) -> list[ModelInfo]:
             )
 
     return result
+
+
+async def fetch_plan_models(
+    *, access_token: str, timeout: float = 30.0
+) -> list[dict[str, Any]]:
+    """Public account-specific catalog: no Codex headers or static fallbacks."""
+    from .plan_auth import RESOURCE
+    from .provider import _raise_plan_error
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        response = await client.get(
+            RESOURCE + "/models",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "accept": "application/json",
+            },
+        )
+    if response.status_code != 200:
+        _raise_plan_error(
+            response.status_code, response.headers, response.content, "openai-chatgpt"
+        )
+    data = response.json()
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        raise TypeError("ChatGPT plan model catalog is invalid")
+    return [
+        dict(entry, additional_speed_tiers=[])
+        for entry in data["models"]
+        if isinstance(entry, dict)
+        and entry.get("visibility") == "list"
+        and isinstance(entry.get("slug"), str)
+        and entry["slug"]
+    ]

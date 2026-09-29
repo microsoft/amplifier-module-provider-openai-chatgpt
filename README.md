@@ -1,5 +1,7 @@
 # Amplifier ChatGPT Subscription Provider Module
 
+For the public **Sign in with ChatGPT / ChatGPT plan** flow, see [ChatGPT plan sign-in](docs/CHATGPT_PLAN_SIGN_IN.md). It is explicitly separate from the legacy Codex-compatible device flow below; existing configurations retain that behavior.
+
 ChatGPT subscription auth provider for [Amplifier](https://github.com/microsoft/amplifier) -- uses raw HTTP + manual SSE against the ChatGPT backend API (`chatgpt.com/backend-api/codex/responses`).
 
 ## Prerequisites

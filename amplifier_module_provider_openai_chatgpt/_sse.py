@@ -45,7 +45,9 @@ class ParsedResponse:
     raw_events: list[dict] = field(default_factory=list)
 
 
-def parse_sse_events(lines: list[str], collect_raw: bool = False) -> ParsedResponse:
+def parse_sse_events(
+    lines: list[str], collect_raw: bool = False, require_completed: bool = False
+) -> ParsedResponse:
     """Parse a list of raw SSE lines into a ParsedResponse.
 
     Args:
@@ -62,6 +64,7 @@ def parse_sse_events(lines: list[str], collect_raw: bool = False) -> ParsedRespo
                   response.incomplete event.
     """
     result = ParsedResponse()
+    completed = False
 
     for line in lines:
         # Only process data lines.
@@ -100,7 +103,9 @@ def parse_sse_events(lines: list[str], collect_raw: bool = False) -> ParsedRespo
         # ------------------------------------------------------------------
         # Metadata extraction.
         # ------------------------------------------------------------------
-        if event_type in ("response.created", "response.done"):
+        if event_type == "response.completed":
+            completed = True
+        if event_type in ("response.created", "response.done", "response.completed"):
             resp = event.get("response")
             if not isinstance(resp, dict):
                 resp = {}
@@ -112,7 +117,7 @@ def parse_sse_events(lines: list[str], collect_raw: bool = False) -> ParsedRespo
         # ------------------------------------------------------------------
         # Usage extraction from response.done.
         # ------------------------------------------------------------------
-        if event_type == "response.done":
+        if event_type in ("response.done", "response.completed"):
             response = event.get("response")
             usage = response.get("usage", {}) if isinstance(response, dict) else {}
             if usage:
@@ -143,6 +148,12 @@ def parse_sse_events(lines: list[str], collect_raw: bool = False) -> ParsedRespo
                     }
                 )
 
+    if require_completed and not completed:
+        raise SSEError(
+            "ChatGPT stream ended before response.completed; completion is unconfirmed.",
+            code="stream_incomplete",
+            event_type="interrupted",
+        )
     return result
 
 
@@ -176,4 +187,7 @@ def _raise_sse_error(event: dict, event_type: str) -> None:
         message = f"ChatGPT SSE {event_type} event"
         code = None
 
-    raise SSEError(message=message, code=code, event_type=event_type)
+    exc = SSEError(message=message, code=code, event_type=event_type)
+    exc.param = error_obj.get("param") if isinstance(error_obj, dict) else None
+    exc.details = event
+    raise exc

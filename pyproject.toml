@@ -1,7 +1,7 @@
 [project]
 name = "amplifier-module-provider-openai-chatgpt"
 version = "0.1.0"
-description = "ChatGPT subscription auth provider module - raw httpx + manual SSE against the ChatGPT backend API for Amplifier"
+description = "ChatGPT plan sign-in and legacy Codex OAuth provider for Amplifier"
 license = "MIT"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -11,7 +11,12 @@ authors = [
 dependencies = [
     "amplifier-core>=1.3.3",
     "httpx>=0.27.0",
+    "PyJWT[crypto]>=2.10.1",
+    "filelock>=3.16.1",
 ]
+
+[project.scripts]
+amplifier-chatgpt-auth = "amplifier_module_provider_openai_chatgpt.plan_auth:main"
 
 [project.entry-points."amplifier.modules"]
 provider-openai-chatgpt = "amplifier_module_provider_openai_chatgpt:mount"

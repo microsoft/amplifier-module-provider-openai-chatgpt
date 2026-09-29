@@ -1,7 +1,7 @@
 """Amplifier ChatGPT subscription auth provider module.
 
-Uses raw httpx + manual SSE against the ChatGPT backend API
-(chatgpt.com/backend-api/codex/responses) with OAuth device code authentication.
+Uses the public Responses API for explicit ChatGPT plan sign-in, preserving
+the legacy Codex-compatible OAuth/device transport for existing configurations.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from .oauth import is_token_valid, load_tokens, login
 from .provider import ChatGPTProvider
+from . import plan_auth
 
 if TYPE_CHECKING:
     from amplifier_core import Coordinator
@@ -55,8 +56,23 @@ async def mount(
         config.get("login_on_mount"), key="login_on_mount", default=True
     )
 
-    # Load tokens from disk.
+    if config.get("auth_mode") == plan_auth.MODE:
+        token_file_path = token_file_path or plan_auth.DEFAULT_TOKEN_FILE
+        try:
+            tokens = await plan_auth.ensure_tokens(token_file_path)
+        except plan_auth.PlanAuthError as exc:
+            # Interactive consent belongs to explicit account setup, never to a
+            # worker mounting providers in the background.
+            logger.warning("ChatGPT plan connection unavailable: %s", exc)
+            return None
+        provider = ChatGPTProvider(config, coordinator, tokens)
+        await coordinator.mount("providers", provider, name="openai-chatgpt")
+        return provider.close
+
+    # Load legacy tokens only; never send plan credentials to Codex endpoints.
     tokens = load_tokens(token_file_path)
+    if tokens and tokens.get("auth_mode") == plan_auth.MODE:
+        raise ValueError("ChatGPT plan credentials require auth_mode=chatgpt_plan")
 
     # If tokens are not valid, try login when permitted.
     if not is_token_valid(tokens):

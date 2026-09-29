@@ -1,7 +1,8 @@
 """ChatGPT subscription provider for Amplifier.
 
 Implements the Amplifier Provider Protocol using raw httpx + manual SSE
-against the ChatGPT backend API with OAuth authentication.
+against the public Responses API with explicit ChatGPT plan authentication,
+or the legacy ChatGPT backend with Codex-compatible OAuth credentials.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ from .oauth import (
     refresh_tokens,
 )
 from .oauth import login as oauth_login
+from . import plan_auth
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,8 @@ logger = logging.getLogger(__name__)
 _KNOWN_CONFIG_KEYS = frozenset(
     {
         "token_file_path",
+        "auth_mode",
+        "host_file_path",
         "login_on_mount",
         "raw",
         "default_model",
@@ -269,6 +273,15 @@ class ChatGPTProvider:
         self.config: dict[str, Any] = self._config
         self._coordinator = coordinator
         self._tokens = tokens
+        self.auth_mode = self._config.get("auth_mode", "legacy_codex")
+        if self.auth_mode not in {"legacy_codex", plan_auth.MODE}:
+            raise ValueError("auth_mode must be legacy_codex or chatgpt_plan")
+        if tokens and (tokens.get("auth_mode") == plan_auth.MODE) != (
+            self.auth_mode == plan_auth.MODE
+        ):
+            raise ValueError(
+                "ChatGPT credentials do not match the selected authentication mode"
+            )
         _warn_unknown_config_keys(self._config)
 
         self.priority: int = _coerce_int(
@@ -288,6 +301,8 @@ class ChatGPTProvider:
             self._config.get("timeout"), key="timeout", default=300.0
         )
         self._token_file_path: str | None = self._config.get("token_file_path")
+        if self.auth_mode == plan_auth.MODE and not self._token_file_path:
+            self._token_file_path = plan_auth.DEFAULT_TOKEN_FILE
 
         # Canonical effort knob from mount config -- validated here so a bad
         # value fails at mount, not as an HTTP 400 mid-session. `None` means
@@ -361,13 +376,17 @@ class ChatGPTProvider:
         model_id = self._resolved_default_model or self.default_model
         if model_id == LATEST_MODEL_SENTINEL:
             return None
-        if model_id.endswith("-fast"):
+        if self.auth_mode != plan_auth.MODE and model_id.endswith("-fast"):
             model_id = model_id.removesuffix("-fast")
 
         models = (
             self._models_cache[1]
             if self._models_cache is not None
-            else to_model_infos(FALLBACK_MODELS)
+            else (
+                []
+                if self.auth_mode == plan_auth.MODE
+                else to_model_infos(FALLBACK_MODELS)
+            )
         )
         for model in models:
             if model.id != model_id:
@@ -427,6 +446,11 @@ class ChatGPTProvider:
         """
         if self._resolved_default_model is not None:
             model_display = self._resolved_default_model
+        elif (
+            self.default_model == LATEST_MODEL_SENTINEL
+            and self.auth_mode == plan_auth.MODE
+        ):
+            model_display = "latest (from the selected ChatGPT account)"
         elif self.default_model == LATEST_MODEL_SENTINEL:
             model_display = (
                 f"{LATEST_MODEL_SENTINEL} (resolves lazily; "
@@ -435,7 +459,7 @@ class ChatGPTProvider:
         else:
             model_display = self.default_model
 
-        defaults: dict[str, Any] = {"model": model_display}
+        defaults: dict[str, Any] = {"model": model_display, "auth_mode": self.auth_mode}
         model_limits = self._known_model_limits()
         if model_limits is not None:
             context_window, max_output_tokens = model_limits
@@ -444,8 +468,17 @@ class ChatGPTProvider:
 
         return ProviderInfo(
             id="openai-chatgpt",
-            display_name="OpenAI ChatGPT",
-            capabilities=["streaming", "tools", "reasoning", "auth:oauth_device_code"],
+            display_name="ChatGPT plan"
+            if self.auth_mode == plan_auth.MODE
+            else "OpenAI ChatGPT",
+            capabilities=[
+                "streaming",
+                "tools",
+                "reasoning",
+                "auth:oauth_pkce"
+                if self.auth_mode == plan_auth.MODE
+                else "auth:oauth_device_code",
+            ],
             credential_env_vars=[],
             defaults=defaults,
             config_fields=[],  # deliberately empty: see docstring above
@@ -493,10 +526,17 @@ class ChatGPTProvider:
 
             try:
                 await self._ensure_valid_tokens()
-                entries = await fetch_models(
-                    access_token=self._tokens["access_token"],  # type: ignore[index]
-                    account_id=self._tokens["account_id"],  # type: ignore[index]
-                )
+                if self.auth_mode == plan_auth.MODE:
+                    from .models import fetch_plan_models
+
+                    entries = await fetch_plan_models(
+                        access_token=self._tokens["access_token"]
+                    )
+                else:
+                    entries = await fetch_models(
+                        access_token=self._tokens["access_token"],
+                        account_id=self._tokens["account_id"],
+                    )
                 if not entries:
                     raise ValueError("Live model catalog returned 0 usable entries")
                 models = to_model_infos(entries)
@@ -510,6 +550,10 @@ class ChatGPTProvider:
                 # other errors) used to be the headline onboarding defect.
                 raise
             except Exception as exc:
+                if self.auth_mode == plan_auth.MODE:
+                    # Account-specific availability must never be invented from
+                    # the legacy fallback catalog, including on network failure.
+                    raise
                 # Non-auth failure (network blip, parse error, ...): keep the
                 # fallback catalog, but do not dump a full traceback at WARNING
                 # -- one line is enough for an operator; the traceback is still
@@ -564,14 +608,20 @@ class ChatGPTProvider:
 
             try:
                 models = await self._get_catalog()
-                resolved = next(
-                    (m.id for m in models if not is_variant_model_id(m.id)),
-                    None,
+                resolved = (
+                    models[0].id
+                    if self.auth_mode == plan_auth.MODE and models
+                    else next(
+                        (m.id for m in models if not is_variant_model_id(m.id)),
+                        None,
+                    )
                 )
                 if resolved is None:
                     resolved = models[0].id if models else FALLBACK_MODELS[0]["slug"]
                 reason = "live catalog"
             except kernel_errors.AuthenticationError:
+                if self.auth_mode == plan_auth.MODE:
+                    raise
                 # Unauthenticated: fall back silently. Auth errors belong to
                 # actual requests (complete()/list_models()) -- resolving a
                 # model NAME should never fail just because no one is
@@ -610,6 +660,13 @@ class ChatGPTProvider:
                 pass :func:`~.oauth.is_token_valid` (missing/expired).
             ``"unauthenticated"``: no tokens were found anywhere.
         """
+        if self.auth_mode == plan_auth.MODE:
+            status = plan_auth.auth_status(self._token_file_path)
+            return (
+                "authenticated"
+                if status["authenticated"] and status["plan_enabled"]
+                else "unauthenticated"
+            )
         if is_token_valid(self._tokens):
             return "authenticated"
 
@@ -643,10 +700,19 @@ class ChatGPTProvider:
             RuntimeError: If the device-code flow fails (see
                 :func:`~.oauth.login`).
         """
-        tokens = await oauth_login(
-            token_file_path=self._token_file_path, print_fn=print_fn
-        )
+        if self.auth_mode == plan_auth.MODE:
+            tokens = await plan_auth.login(
+                token_file_path=self._token_file_path,
+                host_file_path=self._config.get("host_file_path"),
+                print_fn=print_fn,
+            )
+        else:
+            tokens = await oauth_login(
+                token_file_path=self._token_file_path, print_fn=print_fn
+            )
         self._tokens = tokens
+        self._models_cache = None
+        self._resolved_default_model = None
         return True
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
@@ -721,7 +787,7 @@ class ChatGPTProvider:
 
         # Handle -fast suffix → priority service tier
         service_tier: str | None = None
-        if model.endswith("-fast"):
+        if self.auth_mode != plan_auth.MODE and model.endswith("-fast"):
             model = model.removesuffix("-fast")
             service_tier = "priority"
 
@@ -861,6 +927,12 @@ class ChatGPTProvider:
         if self.extra_request_params:
             payload.update(self.extra_request_params)
 
+        if self.auth_mode == plan_auth.MODE:
+            # These are mandatory for every plan request, even when callers
+            # supply extra_request_params. No background/stored response mode.
+            payload["store"] = False
+            payload["stream"] = True
+            payload.pop("background", None)
         return payload
 
     # ------------------------------------------------------------------
@@ -888,6 +960,12 @@ class ChatGPTProvider:
                 retryable=False,
             )
 
+        if self.auth_mode == plan_auth.MODE:
+            return {
+                "Authorization": f"Bearer {self._tokens['access_token']}",
+                "Content-Type": "application/json",
+                "accept": "text/event-stream",
+            }
         account_id = self._tokens.get("account_id")
         if not account_id:
             raise kernel_errors.AuthenticationError(
@@ -1084,6 +1162,25 @@ class ChatGPTProvider:
             kernel_errors.AuthenticationError: If no valid tokens can be
                 obtained by any means.
         """
+        if self.auth_mode == plan_auth.MODE:
+            try:
+                self._tokens = await plan_auth.ensure_tokens(self._token_file_path)
+            except plan_auth.PlanAuthError as exc:
+                if exc.code == "temporarily_unavailable":
+                    raise kernel_errors.ProviderUnavailableError(
+                        str(exc), provider=self.name, retryable=True
+                    ) from exc
+                raise kernel_errors.AuthenticationError(
+                    str(exc), provider=self.name, retryable=False
+                ) from exc
+            return
+        disk_mode = load_tokens(path=self._token_file_path)
+        if disk_mode and disk_mode.get("auth_mode") == plan_auth.MODE:
+            raise kernel_errors.AuthenticationError(
+                "ChatGPT plan credentials require auth_mode=chatgpt_plan.",
+                provider=self.name,
+                retryable=False,
+            )
         # 1. In-memory tokens still valid.
         if is_token_valid(self._tokens):
             return
@@ -1152,7 +1249,7 @@ class ChatGPTProvider:
 
         # Resolve effective model name (mirrors _build_payload logic) for events.
         model: str = request.model or effective_default_model
-        if model.endswith("-fast"):
+        if self.auth_mode != plan_auth.MODE and model.endswith("-fast"):
             model = model.removesuffix("-fast")
 
         headers = self._build_headers()
@@ -1191,6 +1288,7 @@ class ChatGPTProvider:
 
         # Local guard variable — concurrency-safe (no instance-level mutation).
         retry_attempted = False
+        service_request_id: str | None = None
 
         try:
             # 4. Two-attempt loop: first attempt + one optional retry on 401.
@@ -1204,15 +1302,22 @@ class ChatGPTProvider:
                     async with httpx.AsyncClient(timeout=self.timeout) as client:
                         async with client.stream(
                             "POST",
-                            CHATGPT_CODEX_ENDPOINT,
+                            plan_auth.RESOURCE + "/responses"
+                            if self.auth_mode == plan_auth.MODE
+                            else CHATGPT_CODEX_ENDPOINT,
                             json=payload,
                             headers=headers,
                         ) as resp:
+                            service_request_id = resp.headers.get("x-request-id")
                             # 5. Check HTTP status — map to kernel error types.
                             if resp.status_code != 200:
                                 error_body = await resp.aread()
                                 status = resp.status_code
 
+                                if self.auth_mode == plan_auth.MODE:
+                                    _raise_plan_error(
+                                        status, resp.headers, error_body, self.name
+                                    )
                                 if status == 401 and not retry_attempted:
                                     # Mid-session expiry: refresh once, rebuild
                                     # headers, and retry.  The llm:request hook
@@ -1395,7 +1500,11 @@ class ChatGPTProvider:
                     raise
 
             # 6. Parse SSE events.
-            parsed = parse_sse_events(lines, collect_raw=self.raw)
+            parsed = parse_sse_events(
+                lines,
+                collect_raw=self.raw,
+                require_completed=self.auth_mode == plan_auth.MODE,
+            )
 
             duration_ms = (time.monotonic() - start_time) * 1000
 
@@ -1452,12 +1561,17 @@ class ChatGPTProvider:
             code = exc.code or ""
             msg = str(exc).lower()
 
-            if "rate_limit" in code:
+            if self.auth_mode == plan_auth.MODE and (
+                code.startswith(("subscription_sharing_", "chatpass_v2_"))
+            ):
+                mapped_exc = _plan_error(code, str(exc), provider=self.name)
+            elif "rate_limit" in code:
                 mapped_exc: kernel_errors.LLMError = kernel_errors.RateLimitError(
                     str(exc), provider=self.name, retryable=True
                 )
             elif code == "context_length_exceeded" or (
-                not code and any(kw in msg for kw in ("context length", "too many tokens"))
+                not code
+                and any(kw in msg for kw in ("context length", "too many tokens"))
             ):
                 mapped_exc = kernel_errors.ContextLengthError(
                     str(exc), provider=self.name, retryable=False
@@ -1471,6 +1585,11 @@ class ChatGPTProvider:
                     str(exc), provider=self.name, retryable=False
                 )
 
+            if self.auth_mode == plan_auth.MODE:
+                mapped_exc.error_code = exc.code
+                mapped_exc.error_param = getattr(exc, "param", None)
+                mapped_exc.request_id = service_request_id
+                mapped_exc.response_body = redact_secrets(getattr(exc, "details", {}))
             if _has_hooks:
                 await self._coordinator.hooks.emit(
                     "llm:response",
@@ -1629,3 +1748,76 @@ class ChatGPTProvider:
             usage=usage,
             finish_reason=finish_reason,
         )
+
+
+def _plan_error(
+    code: str, message: str, *, provider: str, status: int | None = None
+) -> kernel_errors.LLMError:
+    """Keep plan billing failures distinct; never change accounts or billing."""
+    if code == "subscription_sharing_usage_limit_exceeded":
+        return kernel_errors.RateLimitError(
+            message
+            + " Review this app's ChatGPT plan limits at https://chatgpt.com/settings/usage.",
+            provider=provider,
+            status_code=status or 429,
+            retryable=False,
+        )
+    if code in {
+        "subscription_sharing_usage_unavailable",
+        "subscription_sharing_user_unavailable",
+    } or (status is not None and status >= 500):
+        return kernel_errors.ProviderUnavailableError(
+            message, provider=provider, status_code=status or 503, retryable=True
+        )
+    if code == "subscription_sharing_invalid_user" or status == 401:
+        return kernel_errors.AuthenticationError(
+            message, provider=provider, status_code=status or 401, retryable=False
+        )
+    if code == "subscription_sharing_unsupported_capability" or status == 400:
+        return kernel_errors.InvalidRequestError(
+            message, provider=provider, status_code=status or 400, retryable=False
+        )
+    if status == 429:
+        return kernel_errors.RateLimitError(
+            message, provider=provider, status_code=status, retryable=True
+        )
+    if (
+        status == 403
+        or code.startswith("chatpass_v2_")
+        or code
+        in {
+            "subscription_sharing_user_not_eligible",
+            "subscription_sharing_route_not_supported",
+        }
+    ):
+        return kernel_errors.AccessDeniedError(
+            message, provider=provider, status_code=status or 403, retryable=False
+        )
+    return kernel_errors.LLMError(
+        message, provider=provider, status_code=status, retryable=False
+    )
+
+
+def _raise_plan_error(
+    status: int, headers: httpx.Headers, body: bytes, provider: str
+) -> None:
+    try:
+        details = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        details = {"detail": body.decode(errors="replace")[:2000]}
+    safe = redact_secrets(details)
+    error = details.get("error") if isinstance(details, dict) else None
+    code = error.get("code", "") if isinstance(error, dict) else ""
+    code = code if isinstance(code, str) else ""
+    request_id = headers.get("x-request-id", "")
+    message = f"ChatGPT plan request failed (HTTP {status}): {json.dumps(safe, ensure_ascii=False)[:3000]}"
+    if request_id:
+        message += f" Request ID: {request_id[:200]}"
+    exc = _plan_error(code, message, provider=provider, status=status)
+    # Preserve the structured response shape and exact service code/parameter for
+    # host diagnostics, including direct admission responses with only 'detail'.
+    exc.error_code = code or None
+    exc.error_param = error.get("param") if isinstance(error, dict) else None
+    exc.request_id = request_id or None
+    exc.response_body = safe
+    raise exc
