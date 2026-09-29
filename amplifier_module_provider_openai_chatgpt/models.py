@@ -253,7 +253,11 @@ async def fetch_plan_models(
         )
     if response.status_code != 200:
         _raise_plan_error(
-            response.status_code, response.headers, response.content, "openai-chatgpt"
+            response.status_code,
+            response.headers,
+            response.content,
+            "openai-chatgpt",
+            access_token=access_token,
         )
     data = response.json()
     if not isinstance(data, dict) or not isinstance(data.get("models"), list):

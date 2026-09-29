@@ -1316,7 +1316,13 @@ class ChatGPTProvider:
 
                                 if self.auth_mode == plan_auth.MODE:
                                     _raise_plan_error(
-                                        status, resp.headers, error_body, self.name
+                                        status,
+                                        resp.headers,
+                                        error_body,
+                                        self.name,
+                                        access_token=self._tokens.get("access_token")
+                                        if self._tokens
+                                        else None,
                                     )
                                 if status == 401 and not retry_attempted:
                                     # Mid-session expiry: refresh once, rebuild
@@ -1346,6 +1352,19 @@ class ChatGPTProvider:
                             # and collect all lines for parse_sse_events below (pass 2).
                             # Each data: line is JSON-parsed twice — acceptable overhead.
                             async for line in resp.aiter_lines():
+                                if self.auth_mode == plan_auth.MODE and self._tokens:
+                                    # A proxy/service error may echo the bearer
+                                    # credential in otherwise unstructured text.
+                                    for token_key in (
+                                        "access_token",
+                                        "refresh_token",
+                                        "id_token",
+                                    ):
+                                        token_value = self._tokens.get(token_key)
+                                        if isinstance(token_value, str) and token_value:
+                                            line = line.replace(
+                                                token_value, "[REDACTED]"
+                                            )
                                 lines.append(line)
 
                                 if not emit_stream_events:
@@ -1799,8 +1818,15 @@ def _plan_error(
 
 
 def _raise_plan_error(
-    status: int, headers: httpx.Headers, body: bytes, provider: str
+    status: int,
+    headers: httpx.Headers,
+    body: bytes,
+    provider: str,
+    *,
+    access_token: str | None = None,
 ) -> None:
+    if access_token:
+        body = body.replace(access_token.encode(), b"[REDACTED]")
     try:
         details = json.loads(body)
     except (ValueError, UnicodeDecodeError):

@@ -280,3 +280,34 @@ async def test_background_mount_never_opens_consent(monkeypatch):
         is None
     )
     assert not login.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_plan_service_error_cannot_echo_bearer_token(monkeypatch, streaming):
+    p = provider()
+    p._ensure_valid_tokens = AsyncMock()
+
+    def handle(request):
+        if streaming:
+            return httpx.Response(
+                200,
+                text=stream_events(
+                    {
+                        "type": "response.failed",
+                        "response": {
+                            "error": {
+                                "code": "subscription_sharing_invalid_user",
+                                "message": "Rejected opaque-plan-token",
+                            }
+                        },
+                    }
+                ),
+            )
+        return httpx.Response(401, json={"detail": "Rejected opaque-plan-token"})
+
+    install_transport(monkeypatch, handle)
+    with pytest.raises(llm_errors.AuthenticationError) as error:
+        await p.complete(ChatRequest(messages=[Message(role="user", content="hi")]))
+    assert "opaque-plan-token" not in str(error.value)
+    assert "opaque-plan-token" not in json.dumps(error.value.response_body)
