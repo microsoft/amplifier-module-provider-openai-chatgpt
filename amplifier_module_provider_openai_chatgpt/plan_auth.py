@@ -36,6 +36,7 @@ PLAN_SCOPE = "chatgpt.tokens.use.direct"
 SCOPES = "openid profile email offline_access resource.invoke " + PLAN_SCOPE
 DYNAMIC_CLIENT = "dynamic_agent_client"
 DEFAULT_TOKEN_FILE = "~/.amplifier/chatgpt-plan/default.json"
+DEFAULT_APP_NAME = "Amplifier ChatGPT provider"
 TERMINAL_REFRESH_ERRORS = frozenset(
     {
         "invalid_grant",
@@ -65,6 +66,10 @@ class PlanAuthError(RuntimeError):
 
 
 def _path(value: str | Path) -> Path:
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        raise PlanAuthError(
+            "A non-empty credential path is required.", code="invalid_record"
+        )
     return Path(value).expanduser().absolute()
 
 
@@ -142,7 +147,11 @@ async def host_id(host_file_path: str) -> str:
 
 
 def _host_path(token_file: Path, host_file_path: str | None) -> str:
-    return host_file_path or str(token_file.parent / "host.json")
+    return (
+        host_file_path
+        if host_file_path is not None
+        else str(token_file.parent / "host.json")
+    )
 
 
 def _assert_mode(record: dict[str, Any]) -> None:
@@ -349,7 +358,7 @@ async def login(
     *,
     token_file_path: str = DEFAULT_TOKEN_FILE,
     host_file_path: str | None = None,
-    app_name: str = "Amplifier Unified",
+    app_name: str = DEFAULT_APP_NAME,
     print_fn: Callable[[str], None] | None = None,
     timeout: float = 180,
     open_browser: bool = False,
@@ -363,12 +372,18 @@ async def login(
     A cancelled/failed attempt leaves the active credential record untouched.
     """
     path = _path(token_file_path)
-    source_path = _path(source_token_file_path) if source_token_file_path else None
+    source_path = (
+        _path(source_token_file_path) if source_token_file_path is not None else None
+    )
     pending_path = (
         _path(registration_file_path)
-        if registration_file_path
+        if registration_file_path is not None
         else path.with_name(path.name + ".registration")
     )
+    if not isinstance(app_name, str) or not app_name.strip():
+        raise PlanAuthError(
+            "An application name is required for sign-in.", code="invalid_request"
+        )
     if source_path == path or pending_path == path or pending_path == source_path:
         raise PlanAuthError(
             "Sign-in candidate, source, and registration paths must be separate.",
@@ -711,7 +726,7 @@ def main() -> None:
     )
     parser.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)
     parser.add_argument("--host-file")
-    parser.add_argument("--app-name", default="Amplifier Unified")
+    parser.add_argument("--app-name", default=DEFAULT_APP_NAME)
     parser.add_argument("--source-file")
     parser.add_argument("--enable-plan", action="store_true")
     args = parser.parse_args()

@@ -3,18 +3,31 @@
 The provider owns OAuth credentials, validated identity, refresh/revocation,
 account-specific models, and Responses transport. The host app owns the account
 picker, explicit connection IDs, consent UI, and safe status/error presentation.
-Nothing here requires Amplifier app-cli or Codex to be installed.
+Both transports are implemented by this provider; no application or peer module
+is an implementation dependency.
 
 ## Two explicit modes
 
-- `auth_mode: chatgpt_plan`: the documented Sign in with ChatGPT flow. Uses the
-  selected account's ChatGPT plan permission and the public OpenAI Responses API.
-- `auth_mode: legacy_codex`: the existing Codex-compatible device authorization
-  and backend transport. Existing configurations without `auth_mode` retain this
-  behavior. This compatibility mode is not the new ChatGPT plan flow.
+- `auth_mode: chatgpt_codex` **(default)**: Codex-compatible device authorization
+  and `chatgpt.com/backend-api/codex/responses`. Existing configurations without
+  `auth_mode` retain this behavior. `legacy_codex` remains an accepted alias;
+  mounted metadata always reports the canonical `chatgpt_codex` name.
+- `auth_mode: chatgpt_plan`: the documented Sign in with ChatGPT browser flow.
+  Uses the selected account's ChatGPT plan permission and the public OpenAI
+  Responses API at `api.openai.com/v1/responses`.
+
+The kernel's `ProviderInfo.config_fields` contract exposes `auth_mode` as a
+choice, so configuration hosts can present both modes without provider-specific
+configuration logic. The optional `token_file_path` field has no shared default:
+omitting it selects `~/.amplifier/openai-chatgpt-oauth.json` for Codex or
+`~/.amplifier/chatgpt-plan/default.json` for plan mode. An explicitly empty path
+is invalid. A custom path must belong to the selected mode. When changing modes,
+omit the old path or choose a new file; login will not overwrite other-mode
+credentials. The plan-only fields `host_file_path` and `app_name` are also
+declared as optional configuration fields.
 
 Credentials cannot cross modes. A failed new sign-in never replaces existing
-credentials. When migrating an existing legacy connection, use a new plan file
+credentials. When migrating an existing Codex connection, use a new plan file
 and commit the app's configuration only after sign-in succeeds. There is no
 fallback to an API key, another account, another billing path, or the legacy
 backend when plan usage fails.
@@ -29,7 +42,7 @@ Then run:
 amplifier-chatgpt-auth login \
   --token-file ~/.amplifier/chatgpt-plan/personal.json \
   --host-file ~/.amplifier/chatgpt-plan/host.json \
-  --app-name 'Amplifier Unified'
+  --app-name 'Your application name'
 ```
 
 The command starts an HTTP listener on **127.0.0.1**, chooses an available port,
@@ -51,6 +64,7 @@ config:
   auth_mode: chatgpt_plan
   token_file_path: ~/.amplifier/chatgpt-plan/personal.json
   host_file_path: ~/.amplifier/chatgpt-plan/host.json
+  app_name: Your application name
   login_on_mount: false
 ```
 
@@ -99,6 +113,9 @@ From `amplifier_module_provider_openai_chatgpt.plan_auth`:
   print_fn=..., timeout=180, request_plan_permission=False)` returns credentials.
   Keep this result in the trusted runtime. `print_fn` receives an authorization
   URL without an ID-token hint; there is no callback URL/code paste workflow.
+  The neutral default name is `Amplifier ChatGPT provider`. Hosts should pass
+  their actual application name, either here or through provider config
+  `app_name`, which `provider.login()` forwards. This name is not a routing key.
   Hosts that need cancellation/edit safety can pass `source_token_file_path`
   (the active plan profile), a fresh `token_file_path` candidate, and a stable
   per-connection `registration_file_path`. The provider snapshots source data
@@ -132,6 +149,42 @@ failures. Plan usage limit errors are not retried automatically and do not chang
 billing. Request IDs and structured error codes/parameters remain available for
 host diagnostics.
 
+## Plan request limits
+
+Local function tools are sent in a developer-role `additional_tools` input item
+before conversation history. Function names, arguments, and call IDs are kept
+unchanged across the response and next tool-result request. Flat top-level
+function tools are not sent to the plan route. Hosted `web_search` can remain
+in top-level `tools`, subject to model and account policy. This adapter does not
+currently translate custom or namespaced tool-call histories; those definitions
+fail clearly instead of being dropped.
+
+The typed plan adapter currently accepts text/thinking and function-call/result
+history. Other typed content blocks, including images, are rejected explicitly
+instead of silently disappearing. This adapter limit is narrower than the
+service's model-dependent image/file support; adding that conversion is separate
+work.
+
+The plan preview rejects stored/background conversations and several ordinary
+Responses parameters. Explicit unsupported parameters, including `temperature`,
+`top_p`, `max_output_tokens`, `metadata`, and `previous_response_id`, raise a
+nonretryable `InvalidRequestError` with `error_code` and `error_param`. This
+applies to non-null request values and `extra_request_params` wire fields.
+Default unset kernel fields are not treated as requests for those capabilities.
+Callers that depend on enforced output caps, including some internal naming,
+judging, and reduced-output recovery calls, cannot use this preview adapter with
+`max_output_tokens` set. The provider rejects the request rather than remove a
+spending constraint. Bundle/feature compatibility must be assessed separately.
+The provider enforces `store: false` and `stream: true` and converts later system
+messages to developer messages. Supplying tool lists in both a typed request and
+`extra_request_params` is rejected rather than replacing a list silently.
+
+Image generation, native computer use, hosted MCP/connectors, Code Interpreter,
+file search, `tool_search`, and `programmatic_tool_calling` are unavailable on the
+plan route. These restrictions are specific to `chatgpt_plan`; this change does
+not alter the Codex transport or establish new voice, audio, or realtime support
+for either connection.
+
 ## Validation boundaries and official sources
 
 Tests cover protocol contracts, signed JWT rejection, callback binding, rotation,
@@ -144,3 +197,5 @@ steps; mocked tests do not establish account eligibility or plan availability.
 - [Models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
 - [Self-hosted VMs](https://developers.openai.com/siwc/token-sharing-open-source/self-hosted-vms)
 - [Errors and recovery](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery)
+- [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
+- [Additional tool input items](https://developers.openai.com/api/docs/guides/tools-tool-search#add-tools-at-a-specific-point-in-the-input)

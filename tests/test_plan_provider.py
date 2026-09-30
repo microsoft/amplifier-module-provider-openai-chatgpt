@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 from amplifier_core import llm_errors
-from amplifier_core.message_models import ChatRequest, Message
+from amplifier_core.message_models import (
+    ChatRequest,
+    Message,
+    ToolResultBlock,
+    ToolSpec,
+)
 
 from amplifier_module_provider_openai_chatgpt import mount, plan_auth
 from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
@@ -21,7 +26,6 @@ def provider():
             "extra_request_params": {
                 "store": True,
                 "stream": False,
-                "background": True,
             },
         },
         tokens={"auth_mode": "chatgpt_plan", "access_token": "opaque-plan-token"},
@@ -264,6 +268,311 @@ def test_mode_is_explicit_and_plan_metadata_has_no_codex_fallback():
     assert "auth:oauth_pkce" in p.get_info().capabilities
     assert "gpt-5.6" not in p.get_info().defaults["model"]
     assert "context_window" not in p.get_info().defaults
+
+
+@pytest.mark.parametrize("mode", [None, "chatgpt_codex", "legacy_codex"])
+def test_codex_is_default_and_old_mode_is_compatibility_alias(mode):
+    p = ChatGPTProvider({} if mode is None else {"auth_mode": mode})
+    info = p.get_info()
+    assert p.auth_mode == info.defaults["auth_mode"] == "chatgpt_codex"
+    assert "auth:oauth_device_code" in info.capabilities
+    fields = {field.id: field.model_dump() for field in info.config_fields}
+    assert fields["auth_mode"]["choices"] == ["chatgpt_codex", "chatgpt_plan"]
+    assert fields["auth_mode"]["default"] == "chatgpt_codex"
+    assert fields["token_file_path"]["default"] is None
+    assert fields["token_file_path"]["required"] is False
+    assert fields["host_file_path"]["show_when"] == {"auth_mode": "chatgpt_plan"}
+
+
+@pytest.mark.asyncio
+async def test_plan_provider_login_passes_actual_application_name(
+    monkeypatch, tmp_path
+):
+    login = AsyncMock(return_value={"access_token": "test"})
+    monkeypatch.setattr(plan_auth, "login", login)
+    p = ChatGPTProvider(
+        {
+            "auth_mode": "chatgpt_plan",
+            "app_name": "Example Host",
+            "token_file_path": str(tmp_path / "plan.json"),
+        }
+    )
+    await p.login()
+    assert login.call_args.kwargs["app_name"] == "Example Host"
+
+
+@pytest.mark.parametrize("mode", ["chatgpt_codex", "chatgpt_plan"])
+@pytest.mark.parametrize("path", ["", "   ", 17, False])
+def test_explicit_invalid_path_never_selects_default_account(mode, path):
+    with pytest.raises(ValueError, match="non-empty path"):
+        ChatGPTProvider({"auth_mode": mode, "token_file_path": path})
+
+
+@pytest.mark.asyncio
+async def test_codex_login_never_overwrites_plan_profile(monkeypatch, tmp_path):
+    import amplifier_module_provider_openai_chatgpt.provider as mod
+
+    path = tmp_path / "profile.json"
+    original = json.dumps({"auth_mode": "chatgpt_plan", "access_token": "kept"})
+    path.write_text(original)
+    login = AsyncMock()
+    monkeypatch.setattr(mod, "oauth_login", login)
+    p = ChatGPTProvider({"auth_mode": "chatgpt_codex", "token_file_path": str(path)})
+    with pytest.raises(
+        llm_errors.AuthenticationError, match="separate credential file"
+    ):
+        await p.login()
+    login.assert_not_called()
+    assert path.read_text() == original
+
+
+@pytest.mark.asyncio
+async def test_invalid_mode_and_path_fail_before_mount_login(monkeypatch):
+    import amplifier_module_provider_openai_chatgpt as mod
+
+    login = AsyncMock()
+    monkeypatch.setattr(mod, "login", login)
+    for config in (
+        {"auth_mode": "typo"},
+        {"auth_mode": "chatgpt_plan", "token_file_path": ""},
+    ):
+        with pytest.raises(ValueError):
+            await mount(MagicMock(), config)
+    login.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_plan_function_tool_round_trip_preserves_name_arguments_and_call_id(
+    monkeypatch,
+):
+    p = provider()
+    p._ensure_valid_tokens = AsyncMock()
+    sent = []
+    tool = ToolSpec(
+        name="read_file",
+        description="Read a local file",
+        parameters={
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    )
+
+    def handle(request):
+        body = json.loads(request.content)
+        sent.append(body)
+        assert "tools" not in body  # No unsupported flat top-level functions.
+        assert body["input"][0] == {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read_file",
+                    "description": "Read a local file",
+                    "parameters": tool.parameters,
+                }
+            ],
+        }
+        if len(sent) == 1:
+            assert body["tool_choice"] == {"type": "function", "name": "read_file"}
+            item = {
+                "type": "function_call",
+                "call_id": "call-stable",
+                "name": "read_file",
+                "arguments": '{"path":"README.md"}',
+            }
+        else:
+            assert body["input"][-2:] == [
+                {
+                    "type": "function_call",
+                    "call_id": "call-stable",
+                    "name": "read_file",
+                    "arguments": '{"path": "README.md"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-stable",
+                    "output": "file contents",
+                },
+            ]
+            item = {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Read complete"}],
+            }
+        return httpx.Response(
+            200,
+            text=stream_events(
+                {"type": "response.output_item.done", "item": item},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp",
+                        "usage": {"input_tokens": 8, "output_tokens": 3},
+                    },
+                },
+            ),
+        )
+
+    install_transport(monkeypatch, handle)
+    messages = [
+        Message(role="system", content="Be helpful"),
+        Message(role="user", content="Read README.md"),
+    ]
+    first = await p.complete(
+        ChatRequest(
+            messages=messages,
+            tools=[tool],
+            tool_choice={"type": "function", "name": "read_file"},
+        )
+    )
+    assert p.parse_tool_calls(first)[0].name == "read_file"
+    assert p.parse_tool_calls(first)[0].arguments == {"path": "README.md"}
+    second = await p.complete(
+        ChatRequest(
+            messages=[
+                *messages,
+                Message(role="assistant", content=first.content),
+                Message(
+                    role="tool",
+                    content=[
+                        ToolResultBlock(
+                            tool_call_id="call-stable", output="file contents"
+                        )
+                    ],
+                ),
+            ],
+            tools=[tool],
+        )
+    )
+    assert second.content[0].text == "Read complete"
+    assert len(sent) == 2
+
+
+@pytest.mark.parametrize(
+    "param,value",
+    [
+        ("temperature", 0),
+        ("top_p", 0.8),
+        ("max_output_tokens", 100),
+        ("metadata", {}),
+        ("background", False),
+        ("previous_response_id", "resp-prior"),
+        ("truncation", "auto"),
+        ("conversation", "conv"),
+    ],
+)
+def test_plan_unsupported_fields_fail_clearly_in_requests_and_extra_params(
+    param, value
+):
+    p = provider()
+    with pytest.raises(llm_errors.InvalidRequestError) as error:
+        p._build_payload(ChatRequest(messages=[], **{param: value}))
+    assert error.value.error_code == "unsupported_plan_parameter"
+    assert error.value.error_param == param
+    assert error.value.retryable is False
+    p.extra_request_params[param] = value
+    with pytest.raises(llm_errors.InvalidRequestError):
+        p._build_payload(ChatRequest(messages=[]))
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "computer",
+        "image_generation",
+        "tool_search",
+        "file_search",
+        "code_interpreter",
+        "mcp",
+        "programmatic_tool_calling",
+        "custom",
+        "namespace",
+    ],
+)
+def test_plan_unsupported_tools_never_silently_disappear(kind):
+    p = provider()
+    p.extra_request_params["tools"] = [{"type": kind, "name": "test"}]
+    with pytest.raises(llm_errors.InvalidRequestError, match="additional_tools"):
+        p._build_payload(ChatRequest(messages=[]))
+
+
+def test_plan_later_system_messages_and_hosted_web_search():
+    p = provider()
+    p.extra_request_params["tools"] = [{"type": "web_search"}]
+    payload = p._build_payload(
+        ChatRequest(
+            messages=[
+                Message(role="system", content="Instructions"),
+                Message(role="user", content="hi"),
+                Message(role="system", content="Additional guidance"),
+            ]
+        )
+    )
+    assert payload["instructions"] == "Instructions"
+    assert payload["input"][-1] == {
+        "role": "developer",
+        "content": [{"type": "input_text", "text": "Additional guidance"}],
+    }
+    assert payload["tools"] == [{"type": "web_search"}]
+
+
+def test_codex_tools_and_request_parameter_behavior_are_unchanged():
+    p = ChatGPTProvider(
+        {
+            "auth_mode": "chatgpt_codex",
+            "extra_request_params": {"metadata": {"test": "kept"}},
+        }
+    )
+    payload = p._build_payload(
+        ChatRequest(
+            messages=[Message(role="user", content="Hi")],
+            temperature=0,
+            tools=[ToolSpec(name="read_file", parameters={"type": "object"})],
+        )
+    )
+    assert payload["tools"][0]["type"] == "function"
+    assert payload["input"][0]["role"] == "user"
+    assert payload["metadata"] == {"test": "kept"}
+    assert "temperature" not in payload
+
+
+def test_plan_image_input_is_not_silently_lost():
+    from amplifier_core.message_models import ImageBlock
+
+    p = provider()
+    request = ChatRequest(
+        messages=[
+            Message(
+                role="user",
+                content=[
+                    ImageBlock(
+                        source={"type": "url", "url": "https://example.com/image.png"}
+                    )
+                ],
+            )
+        ]
+    )
+    with pytest.raises(llm_errors.InvalidRequestError) as error:
+        p._build_payload(request)
+    assert error.value.error_param == "messages.content.image"
+
+
+def test_plan_tool_lists_are_not_replaced_and_config_input_is_not_mutated():
+    p = provider()
+    p.extra_request_params["tools"] = [
+        {"type": "function", "name": "configured", "parameters": {}}
+    ]
+    with pytest.raises(llm_errors.InvalidRequestError, match="supplied twice"):
+        p._build_payload(
+            ChatRequest(messages=[], tools=[ToolSpec(name="typed", parameters={})])
+        )
+    p.extra_request_params["input"] = [
+        {"role": "system", "content": "Keep configuration unchanged"}
+    ]
+    payload = p._build_payload(ChatRequest(messages=[]))
+    assert payload["input"][1]["role"] == "developer"
+    assert p.extra_request_params["input"][0]["role"] == "system"
 
 
 @pytest.mark.asyncio

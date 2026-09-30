@@ -48,16 +48,21 @@ async def mount(
     if config is None:
         config = {}
 
-    from .provider import _coerce_bool, _warn_unknown_config_keys
+    from .provider import (
+        _coerce_bool, _warn_unknown_config_keys, normalize_auth_mode, validate_auth_paths,
+    )
 
     _warn_unknown_config_keys(config)
+    mode = normalize_auth_mode(config.get("auth_mode"))
+    validate_auth_paths(config)
     token_file_path: str | None = config.get("token_file_path")
     login_on_mount: bool = _coerce_bool(
         config.get("login_on_mount"), key="login_on_mount", default=True
     )
 
-    if config.get("auth_mode") == plan_auth.MODE:
-        token_file_path = token_file_path or plan_auth.DEFAULT_TOKEN_FILE
+    if mode == plan_auth.MODE:
+        if token_file_path is None:
+            token_file_path = plan_auth.DEFAULT_TOKEN_FILE
         try:
             tokens = await plan_auth.ensure_tokens(token_file_path)
         except plan_auth.PlanAuthError as exc:

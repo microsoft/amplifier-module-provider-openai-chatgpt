@@ -17,7 +17,7 @@ from typing import Any, Callable
 
 import httpx
 
-from amplifier_core import ModelInfo, ProviderInfo
+from amplifier_core import ConfigField, ModelInfo, ProviderInfo
 from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import (
     ChatRequest,
@@ -32,6 +32,7 @@ from amplifier_core.message_models import (
 from amplifier_core.utils import redact_secrets
 
 from ._sse import ParsedResponse, SSEError, parse_sse_events
+from ._plan_request import prepare_plan_payload
 from .models import (
     DEFAULT_CACHE_TTL_SECONDS,
     FALLBACK_MODELS,
@@ -61,6 +62,7 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "token_file_path",
         "auth_mode",
         "host_file_path",
+        "app_name",
         "login_on_mount",
         "raw",
         "default_model",
@@ -74,6 +76,25 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "reasoning_effort",
     }
 )
+
+CODEX_MODE = "chatgpt_codex"
+
+
+def normalize_auth_mode(value: Any = None) -> str:
+    """Canonical connection choice; the previous name remains an input alias."""
+    if value is None or value == "legacy_codex":
+        return CODEX_MODE
+    if not isinstance(value, str) or value not in {CODEX_MODE, plan_auth.MODE}:
+        raise ValueError("auth_mode must be chatgpt_codex or chatgpt_plan")
+    return value
+
+
+def validate_auth_paths(config: dict[str, Any]) -> None:
+    """A blank explicit path must never select a default account implicitly."""
+    for key in ("token_file_path", "host_file_path"):
+        value = config.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"{key} must be a non-empty path or omitted")
 
 
 def _warn_unknown_config_keys(config: dict[str, Any]) -> None:
@@ -273,9 +294,8 @@ class ChatGPTProvider:
         self.config: dict[str, Any] = self._config
         self._coordinator = coordinator
         self._tokens = tokens
-        self.auth_mode = self._config.get("auth_mode", "legacy_codex")
-        if self.auth_mode not in {"legacy_codex", plan_auth.MODE}:
-            raise ValueError("auth_mode must be legacy_codex or chatgpt_plan")
+        self.auth_mode = normalize_auth_mode(self._config.get("auth_mode"))
+        validate_auth_paths(self._config)
         if tokens and (tokens.get("auth_mode") == plan_auth.MODE) != (
             self.auth_mode == plan_auth.MODE
         ):
@@ -301,7 +321,7 @@ class ChatGPTProvider:
             self._config.get("timeout"), key="timeout", default=300.0
         )
         self._token_file_path: str | None = self._config.get("token_file_path")
-        if self.auth_mode == plan_auth.MODE and not self._token_file_path:
+        if self.auth_mode == plan_auth.MODE and self._token_file_path is None:
             self._token_file_path = plan_auth.DEFAULT_TOKEN_FILE
 
         # Canonical effort knob from mount config -- validated here so a bad
@@ -408,25 +428,20 @@ class ChatGPTProvider:
     def get_info(self) -> ProviderInfo:
         """Return provider metadata.
 
-        ``capabilities`` includes ``"auth:oauth_device_code"`` -- the
-        extensible-capabilities route app-cli uses to detect that this
-        provider needs an OAuth login step (via :meth:`auth_status` /
-        :meth:`login`) rather than a static API key. No kernel change
-        needed: capabilities is already a free-form ``list[str]``.
+        The selected mode advertises its OAuth flow through ``capabilities``.
+        Applications can invoke :meth:`auth_status` / :meth:`login` rather than
+        asking for a static API key.
 
         ``credential_env_vars`` is deliberately empty: this provider
         authenticates via OAuth device-code login, not an environment
         variable API key.
 
-        ``config_fields`` is deliberately empty too: login is a *flow*
-        (device-code OAuth), not a config *field* a wizard can prompt for.
-        app-cli's model-picker phase is responsible for the one field this
-        provider does expose meaningfully (``default_model``); it is set
-        via ``settings.yaml``, not a wizard prompt.
+        ``config_fields`` exposes the connection mode through the kernel's
+        generic choice contract. Login remains a separate explicit flow.
 
         ``defaults["model"]`` and reported planning limits never trigger a
         network call (this method must stay synchronous and side-effect-free
-        -- app-cli's wizard calls it eagerly). ``context_window`` and
+        -- configuration UIs call it eagerly). ``context_window`` and
         ``max_output_tokens`` are included together only when both positive,
         non-boolean values are known for the selected model from the
         in-memory catalog cache or built-in catalog. They are advisory
@@ -470,7 +485,7 @@ class ChatGPTProvider:
             id="openai-chatgpt",
             display_name="ChatGPT plan"
             if self.auth_mode == plan_auth.MODE
-            else "OpenAI ChatGPT",
+            else "ChatGPT Codex",
             capabilities=[
                 "streaming",
                 "tools",
@@ -481,7 +496,44 @@ class ChatGPTProvider:
             ],
             credential_env_vars=[],
             defaults=defaults,
-            config_fields=[],  # deliberately empty: see docstring above
+            config_fields=[
+                ConfigField(
+                    id="auth_mode",
+                    display_name="ChatGPT connection",
+                    field_type="choice",
+                    prompt=(
+                        "Choose chatgpt_codex for Codex device sign-in, or "
+                        "chatgpt_plan for ChatGPT plan browser sign-in"
+                    ),
+                    choices=[CODEX_MODE, plan_auth.MODE],
+                    default=CODEX_MODE,
+                    required=False,
+                ),
+                ConfigField(
+                    id="token_file_path",
+                    display_name="Credential file",
+                    field_type="text",
+                    prompt="Credential file (leave blank for the selected mode's separate default)",
+                    required=False,
+                ),
+                ConfigField(
+                    id="host_file_path",
+                    display_name="Host identity file",
+                    field_type="text",
+                    prompt="Host identity file (leave blank for host.json beside the plan credential file)",
+                    required=False,
+                    show_when={"auth_mode": plan_auth.MODE},
+                ),
+                ConfigField(
+                    id="app_name",
+                    display_name="Application name",
+                    field_type="text",
+                    prompt="Actual application name to show during ChatGPT plan sign-in",
+                    default=plan_auth.DEFAULT_APP_NAME,
+                    required=False,
+                    show_when={"auth_mode": plan_auth.MODE},
+                ),
+            ],
         )
 
     async def list_models(self) -> list[ModelInfo]:
@@ -671,6 +723,8 @@ class ChatGPTProvider:
             return "authenticated"
 
         disk_tokens = load_tokens(path=self._token_file_path)
+        if disk_tokens and disk_tokens.get("auth_mode") == plan_auth.MODE:
+            return "unauthenticated"
         if is_token_valid(disk_tokens):
             return "authenticated"
 
@@ -704,9 +758,17 @@ class ChatGPTProvider:
             tokens = await plan_auth.login(
                 token_file_path=self._token_file_path,
                 host_file_path=self._config.get("host_file_path"),
+                app_name=self._config.get("app_name", plan_auth.DEFAULT_APP_NAME),
                 print_fn=print_fn,
             )
         else:
+            existing = load_tokens(path=self._token_file_path)
+            if existing and existing.get("auth_mode") == plan_auth.MODE:
+                raise kernel_errors.AuthenticationError(
+                    "This file contains ChatGPT plan credentials. Choose a separate credential file for chatgpt_codex.",
+                    provider=self.name,
+                    retryable=False,
+                )
             tokens = await oauth_login(
                 token_file_path=self._token_file_path, print_fn=print_fn
             )
@@ -911,6 +973,8 @@ class ChatGPTProvider:
                 for tool in request.tools
             ]
             payload["tool_choice"] = "auto"
+        if self.auth_mode == plan_auth.MODE and request.tool_choice is not None:
+            payload["tool_choice"] = request.tool_choice
 
         # Reasoning effort (resolved above: request > mount config > none)
         if effort:
@@ -925,14 +989,16 @@ class ChatGPTProvider:
         # known-rejected-params warning: this backend enforces a strict
         # payload schema.
         if self.extra_request_params:
+            if self.auth_mode == plan_auth.MODE and request.tools and "tools" in self.extra_request_params:
+                raise kernel_errors.InvalidRequestError(
+                    "ChatGPT plan tools were supplied twice. Use request.tools or extra_request_params.tools; neither list will be silently replaced.",
+                    provider=self.name,
+                    retryable=False,
+                )
             payload.update(self.extra_request_params)
 
         if self.auth_mode == plan_auth.MODE:
-            # These are mandatory for every plan request, even when callers
-            # supply extra_request_params. No background/stored response mode.
-            payload["store"] = False
-            payload["stream"] = True
-            payload.pop("background", None)
+            return prepare_plan_payload(payload, request)
         return payload
 
     # ------------------------------------------------------------------

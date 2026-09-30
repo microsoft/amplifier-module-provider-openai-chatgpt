@@ -1,7 +1,7 @@
 [project]
 name = "amplifier-module-provider-openai-chatgpt"
 version = "0.1.0"
-description = "ChatGPT plan sign-in and legacy Codex OAuth provider for Amplifier"
+description = "ChatGPT Codex and ChatGPT plan OAuth provider for Amplifier"
 license = "MIT"
 readme = "README.md"
 requires-python = ">=3.11"

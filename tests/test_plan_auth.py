@@ -89,7 +89,7 @@ async def test_registration_persisted_before_exchange_and_sensitive_fields_stay_
     await auth.login(token_file_path=str(path), print_fn=notify)
     query = (await asyncio.gather(*callbacks))[0]
     assert query["client_id"] == [auth.DYNAMIC_CLIENT]
-    assert query["agent_name_hint"] == ["Amplifier Unified"]
+    assert query["agent_name_hint"] == [auth.DEFAULT_APP_NAME]
     assert query["code_challenge_method"] == ["S256"]
     assert set(query["scope"][0].split()) == set(auth.SCOPES.split())
     assert verify.call_args.args == ("new-id", "oaiapp_test", query["nonce"][0])
