@@ -465,3 +465,51 @@ async def test_staged_login_preserves_source_and_reuses_registration_across_cand
     await asyncio.gather(*tasks)
     assert parse_qs(urlsplit(urls[-1]).query)["client_id"] == ["oaiapp_test"]
     assert source.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_cancelled_staged_login_leaves_cleanup_to_host_without_revocation(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "active.json"
+    candidate = tmp_path / "candidate.json"
+    registration = tmp_path / "connection.registration"
+    host = tmp_path / "host.json"
+    auth._write(source, record())
+    auth._write(
+        registration,
+        {
+            "auth_mode": auth.MODE,
+            "client_id": "oaiapp_test",
+            "ext_agent_host_id": "urn:uuid:test",
+        },
+    )
+    before = source.read_bytes(), registration.read_bytes()
+    ready = asyncio.Event()
+    exchange = AsyncMock(side_effect=AssertionError("No exchange before consent"))
+    revoke = AsyncMock(side_effect=AssertionError("Never revoke copied credentials"))
+    monkeypatch.setattr(auth, "_token_request", exchange)
+    monkeypatch.setattr(auth, "logout", revoke)
+    task = asyncio.create_task(
+        auth.login(
+            token_file_path=str(candidate),
+            source_token_file_path=str(source),
+            registration_file_path=str(registration),
+            host_file_path=str(host),
+            print_fn=lambda _: ready.set(),
+        )
+    )
+    await asyncio.wait_for(ready.wait(), 2)
+    assert candidate.read_bytes() == before[0]
+    assert os.stat(candidate).st_mode & 0o777 == 0o600
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    exchange.assert_not_awaited()
+    revoke.assert_not_awaited()
+    # The host can now remove this inactive candidate. Identity records and
+    # the source's existing renewable session remain intact.
+    candidate.unlink()
+    assert source.read_bytes() == before[0]
+    assert registration.read_bytes() == before[1]
+    assert host.exists()

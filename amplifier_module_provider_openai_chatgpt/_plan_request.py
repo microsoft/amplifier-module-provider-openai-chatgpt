@@ -82,7 +82,12 @@ def prepare_plan_payload(
                         "This provider's plan adapter currently supports text and function-call history; this content cannot be silently omitted.",
                     )
     for param in sorted(UNSUPPORTED_FIELDS):
-        if param in payload or getattr(request, param, None) is not None:
+        # ChatRequest.metadata is local provider/event control (for example,
+        # stream=False suppresses UI events). It is never wire metadata.
+        # An actual metadata field in the built payload remains unsupported.
+        if param in payload or (
+            param != "metadata" and getattr(request, param, None) is not None
+        ):
             _unsupported(param)
     for param in ("conversation_id", "stop", "response_format"):
         if getattr(request, param, None) is not None:

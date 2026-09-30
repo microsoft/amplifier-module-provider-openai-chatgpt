@@ -123,6 +123,12 @@ From `amplifier_module_provider_openai_chatgpt.plan_auth`:
   file retains only the issued client/host mapping across failed attempts.
   Commit the candidate path in host settings only after the attempt succeeds
   and the connection configuration still matches the initiating user action.
+  The host owns this fresh candidate's lifecycle: after stopping the login
+  worker, delete an abandoned candidate only after confirming it is not active.
+  Preserve the source, issued registration and stable host identity. A copied
+  candidate can share the source's renewable session; deleting its local file
+  is cleanup, not sign-out, and must not revoke the source session. Different
+  token bytes alone do not prove an independently revocable session.
   A separate consent lock keeps inference/refresh available during browser wait.
 - `auth_status(path)` returns only `auth_mode`, `authenticated`, `plan_enabled`,
   `plan_permission_granted`,
@@ -178,6 +184,10 @@ Responses parameters. Explicit unsupported parameters, including `temperature`,
 `top_p`, `max_output_tokens`, `metadata`, and `previous_response_id`, raise a
 nonretryable `InvalidRequestError` with `error_code` and `error_param`. This
 applies to non-null request values and `extra_request_params` wire fields.
+`ChatRequest.metadata` is local event control and is not serialized as Responses
+metadata; `metadata={"stream": false}` can suppress local stream events while
+the Plan HTTP request still streams. Wire metadata in `extra_request_params`
+remains unsupported.
 Default unset kernel fields are not treated as requests for those capabilities.
 Callers that depend on enforced output caps, including some internal naming,
 judging, and reduced-output recovery calls, cannot use this preview adapter with

@@ -383,6 +383,10 @@ async def login(
 
     Apps running remotely should use the local CLI and protected import instead.
     A cancelled/failed attempt leaves the active credential record untouched.
+    Hosts staging a fresh candidate own its cleanup after this coroutine/worker
+    stops and after confirming it is not active. Preserve the source, issued
+    registration and host identity; a copied candidate must not be logged out
+    because it can share the source's renewable session.
     """
     path = _path(token_file_path)
     source_path = (

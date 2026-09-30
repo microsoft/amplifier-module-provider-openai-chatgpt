@@ -508,7 +508,6 @@ async def test_plan_function_tool_round_trip_preserves_name_arguments_and_call_i
         ("temperature", 0),
         ("top_p", 0.8),
         ("max_output_tokens", 100),
-        ("metadata", {}),
         ("background", False),
         ("previous_response_id", "resp-prior"),
         ("truncation", "auto"),
@@ -527,6 +526,65 @@ def test_plan_unsupported_fields_fail_clearly_in_requests_and_extra_params(
     p.extra_request_params[param] = value
     with pytest.raises(llm_errors.InvalidRequestError):
         p._build_payload(ChatRequest(messages=[]))
+
+
+@pytest.mark.asyncio
+async def test_plan_local_metadata_controls_events_but_never_reaches_wire(monkeypatch):
+    p = provider()
+    p._ensure_valid_tokens = AsyncMock()
+    p._coordinator = MagicMock()
+    p._coordinator.hooks.emit = AsyncMock()
+
+    def handle(request):
+        payload = json.loads(request.content)
+        assert "metadata" not in payload
+        assert payload["stream"] is True
+        return httpx.Response(
+            200,
+            text=stream_events(
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "OK",
+                },
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "OK"}],
+                    },
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "model": "account-model",
+                        "usage": {"input_tokens": 2, "output_tokens": 1},
+                    },
+                },
+            ),
+        )
+
+    install_transport(monkeypatch, handle)
+    request = ChatRequest(
+        messages=[Message(role="user", content="hello")],
+        metadata={"stream": False, "local_trace": "kept"},
+    )
+    reply = await p.complete(request)
+    assert reply.content[0].text == "OK"
+    assert request.metadata == {"stream": False, "local_trace": "kept"}
+    events = [call.args[0] for call in p._coordinator.hooks.emit.await_args_list]
+    assert "llm:request" in events and "llm:response" in events
+    assert not any(event.startswith("llm:stream_") for event in events)
+
+
+@pytest.mark.parametrize("value", [{}, {"stream": False}])
+def test_plan_wire_metadata_is_still_rejected(value):
+    p = provider()
+    p.extra_request_params["metadata"] = value
+    with pytest.raises(llm_errors.InvalidRequestError) as error:
+        p._build_payload(ChatRequest(messages=[], metadata={"stream": False}))
+    assert error.value.error_param == "metadata"
+    assert error.value.error_code == "unsupported_plan_parameter"
 
 
 @pytest.mark.parametrize(
