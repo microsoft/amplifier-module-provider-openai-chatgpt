@@ -734,7 +734,7 @@ class ChatGPTProvider:
         return "unauthenticated"
 
     async def login(self, print_fn: Callable[[str], None] | None = None) -> bool:
-        """Run the OAuth device-code login flow and adopt the resulting tokens.
+        """Run explicit login for the selected mode and adopt resulting tokens.
 
         Thin instance wrapper over :func:`~.oauth.login`. This is the
         out-of-band entrypoint app-cli's `amplifier provider login` command
@@ -748,17 +748,24 @@ class ChatGPTProvider:
                 stderr -- the same behavior `mount()` has always used.
 
         Returns:
-            True on success.
+            True when the connection is ready for inference. Plan identity-only
+            consent is saved but returns False until plan permission is granted.
 
         Raises:
             RuntimeError: If the device-code flow fails (see
                 :func:`~.oauth.login`).
         """
         if self.auth_mode == plan_auth.MODE:
+            status = plan_auth.auth_status(self._token_file_path)
             tokens = await plan_auth.login(
                 token_file_path=self._token_file_path,
                 host_file_path=self._config.get("host_file_path"),
                 app_name=self._config.get("app_name", plan_auth.DEFAULT_APP_NAME),
+                request_plan_permission=bool(
+                    status["subject"]
+                    and status["client_id"]
+                    and not status["plan_permission_granted"]
+                ),
                 print_fn=print_fn,
             )
         else:
@@ -775,7 +782,13 @@ class ChatGPTProvider:
         self._tokens = tokens
         self._models_cache = None
         self._resolved_default_model = None
-        return True
+        # Identity-only consent is a saved login, but not an inference-ready
+        # provider. Generic hosts must not announce it as a usable connection.
+        return (
+            self.auth_status() == "authenticated"
+            if self.auth_mode == plan_auth.MODE
+            else True
+        )
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         """Parse tool calls from a ChatResponse.

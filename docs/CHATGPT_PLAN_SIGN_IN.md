@@ -125,9 +125,17 @@ From `amplifier_module_provider_openai_chatgpt.plan_auth`:
   and the connection configuration still matches the initiating user action.
   A separate consent lock keeps inference/refresh available during browser wait.
 - `auth_status(path)` returns only `auth_mode`, `authenticated`, `plan_enabled`,
+  `plan_permission_granted`,
   `email`, `client_id`, and `subject`. The identity/profile selection remains a
   host decision. An expired renewable session can still report connected;
   `ensure_tokens` checks/refreshes the actual credentials before requests.
+  Expired nonrenewable profiles report unauthenticated so explicit login can
+  repair them. Explicit `provider.login()` requests plan consent again for a
+  saved identity without that grant; it does not force consent for routine
+  reconnects with a previously granted scope. No background operation asks for
+  new consent.
+  `provider.login()` returns true only when plan inference is ready, so generic
+  login UIs do not announce identity-only consent as a usable connection.
 - `await ensure_tokens(path)` checks permission and refreshes near expiry under
   a cross-process profile lock. Access token, rotating refresh token, scope, and
   expiry are saved together with an atomic owner-only file replacement.

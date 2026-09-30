@@ -165,13 +165,26 @@ def _assert_mode(record: dict[str, Any]) -> None:
 def auth_status(token_file_path: str) -> dict[str, Any]:
     record = _read(_path(token_file_path))
     _assert_mode(record)
+    expiry = record.get("expires_at")
+    usable = (
+        isinstance(expiry, (int, float))
+        and not isinstance(expiry, bool)
+        and expiry > time.time() + 60
+    ) or bool(record.get("refresh_token"))
     connected = bool(
-        record.get("access_token") and record.get("subject") and record.get("client_id")
+        record.get("access_token")
+        and record.get("subject")
+        and record.get("client_id") not in (None, "", DYNAMIC_CLIENT)
+        and usable
+    )
+    permission_granted = (
+        isinstance(record.get("scopes"), list) and PLAN_SCOPE in record["scopes"]
     )
     return {
         "auth_mode": MODE,
         "authenticated": connected,
-        "plan_enabled": connected and PLAN_SCOPE in record.get("scopes", []),
+        "plan_enabled": connected and permission_granted,
+        "plan_permission_granted": permission_granted,
         "email": record.get("email"),
         "client_id": record.get("client_id"),
         "subject": record.get("subject"),

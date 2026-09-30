@@ -299,6 +299,59 @@ async def test_plan_provider_login_passes_actual_application_name(
     )
     await p.login()
     assert login.call_args.kwargs["app_name"] == "Example Host"
+    assert login.call_args.kwargs["request_plan_permission"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("granted", [False, True])
+async def test_explicit_provider_login_reasks_only_missing_plan_permission(
+    monkeypatch, tmp_path, granted
+):
+    path = tmp_path / "profile.json"
+    record = {
+        "auth_mode": "chatgpt_plan",
+        "access_token": "expired",
+        "subject": "account",
+        "client_id": "registered",
+        "scopes": ["openid", *([plan_auth.PLAN_SCOPE] if granted else [])],
+        "expires_at": 0,
+    }
+    path.write_text(json.dumps(record))
+    login = AsyncMock(return_value=record)
+    monkeypatch.setattr(plan_auth, "login", login)
+    p = ChatGPTProvider({"auth_mode": "chatgpt_plan", "token_file_path": str(path)})
+    assert await p.login() is False
+    assert login.call_args.kwargs["request_plan_permission"] is not granted
+    # Declining the requested plan grant never enables inference or switches mode.
+    assert p.auth_mode == "chatgpt_plan"
+    assert p.auth_status() == "unauthenticated"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("granted", [False, True])
+async def test_plan_login_returns_inference_readiness_not_identity_success(
+    monkeypatch, tmp_path, granted
+):
+    import time
+
+    path = tmp_path / "profile.json"
+    record = {
+        "auth_mode": "chatgpt_plan",
+        "access_token": "fresh",
+        "subject": "account",
+        "client_id": "registered",
+        "scopes": ["openid", *([plan_auth.PLAN_SCOPE] if granted else [])],
+        "expires_at": time.time() + 3600,
+    }
+
+    async def login(**kwargs):
+        path.write_text(json.dumps(record))
+        return record
+
+    monkeypatch.setattr(plan_auth, "login", login)
+    p = ChatGPTProvider({"auth_mode": "chatgpt_plan", "token_file_path": str(path)})
+    assert await p.login() is granted
+    assert p.auth_mode == "chatgpt_plan"
 
 
 @pytest.mark.parametrize("mode", ["chatgpt_codex", "chatgpt_plan"])
@@ -556,6 +609,31 @@ def test_plan_image_input_is_not_silently_lost():
     with pytest.raises(llm_errors.InvalidRequestError) as error:
         p._build_payload(request)
     assert error.value.error_param == "messages.content.image"
+
+
+@pytest.mark.parametrize("expiry", [None, 0, 10])
+def test_plan_expired_unrenewable_profile_does_not_block_explicit_login(
+    tmp_path, expiry
+):
+    import time
+
+    path = tmp_path / "plan.json"
+    record = {
+        "auth_mode": "chatgpt_plan",
+        "access_token": "expired",
+        "subject": "account",
+        "client_id": "registered",
+        "scopes": [plan_auth.PLAN_SCOPE],
+    }
+    if expiry is not None:
+        record["expires_at"] = time.time() + expiry if expiry else 0
+    path.write_text(json.dumps(record))
+    p = ChatGPTProvider({"auth_mode": "chatgpt_plan", "token_file_path": str(path)})
+    assert p.auth_status() == "unauthenticated"
+    assert plan_auth.auth_status(str(path))["authenticated"] is False
+    record["refresh_token"] = "renewable"
+    path.write_text(json.dumps(record))
+    assert p.auth_status() == "authenticated"
 
 
 def test_plan_tool_lists_are_not_replaced_and_config_input_is_not_mutated():
