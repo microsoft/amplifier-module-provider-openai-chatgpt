@@ -1,7 +1,7 @@
 """Amplifier ChatGPT subscription auth provider module.
 
-Uses raw httpx + manual SSE against the ChatGPT backend API
-(chatgpt.com/backend-api/codex/responses) with OAuth device code authentication.
+Uses the public Responses API for explicit ChatGPT plan sign-in, preserving
+the legacy Codex-compatible OAuth/device transport for existing configurations.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from .oauth import is_token_valid, load_tokens, login
 from .provider import ChatGPTProvider
+from . import plan_auth
 
 if TYPE_CHECKING:
     from amplifier_core import Coordinator
@@ -47,16 +48,36 @@ async def mount(
     if config is None:
         config = {}
 
-    from .provider import _coerce_bool, _warn_unknown_config_keys
+    from .provider import (
+        _coerce_bool, _warn_unknown_config_keys, normalize_auth_mode, validate_auth_paths,
+    )
 
     _warn_unknown_config_keys(config)
+    mode = normalize_auth_mode(config.get("auth_mode"))
+    validate_auth_paths(config)
     token_file_path: str | None = config.get("token_file_path")
     login_on_mount: bool = _coerce_bool(
         config.get("login_on_mount"), key="login_on_mount", default=True
     )
 
-    # Load tokens from disk.
+    if mode == plan_auth.MODE:
+        if token_file_path is None:
+            token_file_path = plan_auth.DEFAULT_TOKEN_FILE
+        try:
+            tokens = await plan_auth.ensure_tokens(token_file_path)
+        except plan_auth.PlanAuthError as exc:
+            # Interactive consent belongs to explicit account setup, never to a
+            # worker mounting providers in the background.
+            logger.warning("ChatGPT plan connection unavailable: %s", exc)
+            return None
+        provider = ChatGPTProvider(config, coordinator, tokens)
+        await coordinator.mount("providers", provider, name="openai-chatgpt")
+        return provider.close
+
+    # Load legacy tokens only; never send plan credentials to Codex endpoints.
     tokens = load_tokens(token_file_path)
+    if tokens and tokens.get("auth_mode") == plan_auth.MODE:
+        raise ValueError("ChatGPT plan credentials require auth_mode=chatgpt_plan")
 
     # If tokens are not valid, try login when permitted.
     if not is_token_valid(tokens):

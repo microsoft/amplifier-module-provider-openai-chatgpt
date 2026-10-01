@@ -1,6 +1,14 @@
 # Amplifier ChatGPT Subscription Provider Module
 
-ChatGPT subscription auth provider for [Amplifier](https://github.com/microsoft/amplifier) -- uses raw HTTP + manual SSE against the ChatGPT backend API (`chatgpt.com/backend-api/codex/responses`).
+Choose **ChatGPT Codex** (`chatgpt_codex`, default) for the existing device sign-in
+and Codex-compatible backend, or **ChatGPT plan** (`chatgpt_plan`) for the public
+Sign in with ChatGPT browser flow. Both modes are implemented by this provider
+with separate credentials and endpoints, with no automatic mode or account
+fallback. See [connection modes and plan sign-in](docs/CHATGPT_PLAN_SIGN_IN.md).
+
+ChatGPT subscription auth provider for [Amplifier](https://github.com/microsoft/amplifier)
+using raw HTTP and SSE. The configuration and behavior below describe the default
+Codex mode unless a section explicitly says otherwise.
 
 ## Prerequisites
 
@@ -10,7 +18,10 @@ ChatGPT subscription auth provider for [Amplifier](https://github.com/microsoft/
 
 ## Purpose
 
-Connects Amplifier to the ChatGPT backend API using OAuth device code authentication. This is a separate module from `provider-openai` because the ChatGPT backend is a distinct, undocumented API surface that rejects many standard OpenAI API parameters and requires raw HTTP + manual SSE parsing (the OpenAI Python SDK's streaming accumulator does not work against it).
+Connects Amplifier to ChatGPT-backed inference using the explicitly selected
+authentication and transport. Codex mode uses device authorization and
+`chatgpt.com/backend-api/codex/responses`; plan mode uses browser authorization and
+`api.openai.com/v1/responses`. The two routes have different request contracts.
 
 ## Contract
 
@@ -24,32 +35,33 @@ Connects Amplifier to the ChatGPT backend API using OAuth device code authentica
 
 ```toml
 [providers.provider-openai-chatgpt]
+auth_mode = "chatgpt_codex"
 default_model = "latest"
 ```
 
 ### All Config Options
 
-This provider has no `ConfigField`-based setup wizard -- `config_fields` is
-deliberately empty (see `get_info()`), because login is a *flow* (OAuth
-device-code), not a config *field* a wizard prompts for. The one field
-this provider meaningfully exposes, `default_model`, is set by app-cli's
-model-picker phase. See "Onboarding" below for the login step itself.
-Every key below is a fully supported config key -- set it directly in
-`settings.yaml`.
+`get_info().config_fields` exposes the connection mode, an optional credential
+path, and plan-only host identity/application-name fields through the kernel's
+generic configuration contract. Login is a separate explicit flow. Model
+selection and additional tuning can be supplied by the host or configuration.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `auth_mode` | str | `chatgpt_codex` | `chatgpt_codex` device sign-in or `chatgpt_plan` public browser sign-in. `legacy_codex` is a compatibility alias. |
+| `host_file_path` | str | `host.json` beside plan credential file | Persistent plan host identity. Reuse the path on reconnect/import. |
+| `app_name` | str | `Amplifier ChatGPT provider` | Actual host application name for plan sign-in; not an account or routing key. |
 | `default_model` | str | `"latest"` | Model to use for inference. `"latest"` is a sentinel meaning "resolve dynamically" -- see "Default Model Resolution" below. Set an explicit model id (e.g. `"gpt-5.4"`) to pin one. |
 | `raw` | bool | `false` | Include full request/response payloads in `llm:request`/`llm:response` hook events (for debugging) |
 | `login_on_mount` | bool | `true` | Trigger interactive device code login if tokens are absent or expired. Set `false` for non-interactive environments. |
-| `token_file_path` | str | `~/.amplifier/openai-chatgpt-oauth.json` | Path to the OAuth token JSON file |
-| `timeout` | float | `300.0` | HTTP timeout in seconds for streaming requests |
+| `token_file_path` | str | Mode-specific | Codex: `~/.amplifier/openai-chatgpt-oauth.json`; plan: `~/.amplifier/chatgpt-plan/default.json`. Explicit blank paths are rejected. |
+| `timeout` | float or null | `null` | No default generation read deadline; a number opts in. Connection/pool acquisition remains bounded to 5 seconds. |
 | `models_cache_ttl` | float | `3600` | How long (seconds) to cache the live model catalog before re-fetching |
 | `models_client_version` | str | `"99.99.99"` | Settings-only override for the model-catalog version-gating constant (see `models.py`'s `MODELS_CLIENT_VERSION` -- FRAGILE, relies on the ChatGPT backend treating any unknown high version as "give me everything") |
 | `use_streaming` | bool | `true` | Set `false` to force non-streaming completions |
-| `reasoning_effort` | str | *(unset)* | Canonical effort knob, same vocabulary as `provider-openai`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Lands as `reasoning.effort` in the Responses-API payload; an explicit per-request `reasoning_effort` still wins. `none` (the provisioning default) or unset means "don't inject -- let the model decide". Invalid values fail at **mount**, not as an HTTP 400 mid-session. This is the key the routing-matrix hook sets per role, so it must resolve here. |
+| `reasoning_effort` | str | *(unset)* | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Lands as `reasoning.effort`; an explicit request value wins. `none` or unset means "don't inject -- let the model decide". Invalid values fail at mount. |
 | `priority` | int | `100` | Read by the orchestrator's provider-selection logic |
-| `extra_request_params` | dict | `{}` | Merged last into the Responses-API payload -- an escape hatch for any field not listed above. **Warning:** this backend enforces a strict payload schema and is known to reject unrecognized top-level fields (e.g. Chat-Completions-style params like `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `logprobs` are NOT accepted here) -- verify any new key against the live backend first. |
+| `extra_request_params` | dict | `{}` | Additional wire parameters. Codex retains its existing pass-through behavior. Plan mode validates documented restrictions and rejects unsupported fields/tools instead of dropping them; see [plan limits](docs/CHATGPT_PLAN_SIGN_IN.md#plan-request-limits). |
 
 Boolean and numeric keys accept native types or the string forms a config
 wizard writes (`"true"`/`"false"`); invalid numeric strings warn and fall

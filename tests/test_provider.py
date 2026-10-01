@@ -88,7 +88,7 @@ class TestGetInfo:
     def test_get_info_display_name(self) -> None:
         provider = self._make_provider()
         info = provider.get_info()  # type: ignore[union-attr]
-        assert info.display_name == "OpenAI ChatGPT"
+        assert info.display_name == "ChatGPT Codex"
 
     def test_get_info_capabilities_include_streaming(self) -> None:
         provider = self._make_provider()
