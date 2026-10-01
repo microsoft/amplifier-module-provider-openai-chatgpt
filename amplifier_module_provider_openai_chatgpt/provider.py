@@ -317,8 +317,14 @@ class ChatGPTProvider:
         self.default_model: str = self._config.get(
             "default_model", LATEST_MODEL_SENTINEL
         )
-        self.timeout: float = _coerce_float(
-            self._config.get("timeout"), key="timeout", default=300.0
+        # Healthy generation may be quiet for minutes. Never reinstate an
+        # implicit read/elapsed deadline: use cancellation or an actual transport
+        # error to stop work. Authentication and connection acquisition retain
+        # their separate bounds; an explicit numeric timeout still opts in.
+        self.timeout: float | None = (
+            _coerce_float(self._config["timeout"], key="timeout", default=300.0)
+            if self._config.get("timeout") is not None
+            else None
         )
         self._token_file_path: str | None = self._config.get("token_file_path")
         if self.auth_mode == plan_auth.MODE and self._token_file_path is None:
@@ -1378,7 +1384,9 @@ class ChatGPTProvider:
                 seq = {}
                 block_types = {}
                 try:
-                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(self.timeout, connect=5.0, pool=5.0)
+                    ) as client:
                         async with client.stream(
                             "POST",
                             plan_auth.RESOURCE + "/responses"

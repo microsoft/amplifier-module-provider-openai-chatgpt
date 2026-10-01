@@ -55,7 +55,7 @@ selection and additional tuning can be supplied by the host or configuration.
 | `raw` | bool | `false` | Include full request/response payloads in `llm:request`/`llm:response` hook events (for debugging) |
 | `login_on_mount` | bool | `true` | Trigger interactive device code login if tokens are absent or expired. Set `false` for non-interactive environments. |
 | `token_file_path` | str | Mode-specific | Codex: `~/.amplifier/openai-chatgpt-oauth.json`; plan: `~/.amplifier/chatgpt-plan/default.json`. Explicit blank paths are rejected. |
-| `timeout` | float | `300.0` | HTTP timeout in seconds for streaming requests |
+| `timeout` | float or null | `null` | No default generation read deadline; a number opts in. Connection/pool acquisition remains bounded to 5 seconds. |
 | `models_cache_ttl` | float | `3600` | How long (seconds) to cache the live model catalog before re-fetching |
 | `models_client_version` | str | `"99.99.99"` | Settings-only override for the model-catalog version-gating constant (see `models.py`'s `MODELS_CLIENT_VERSION` -- FRAGILE, relies on the ChatGPT backend treating any unknown high version as "give me everything") |
 | `use_streaming` | bool | `true` | Set `false` to force non-streaming completions |
