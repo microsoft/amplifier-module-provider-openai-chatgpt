@@ -136,7 +136,7 @@ class TestProviderConfigCoercionIntegration:
 
         provider = ChatGPTProvider(config={})
         assert provider.default_model == LATEST_MODEL_SENTINEL == "latest"
-        assert FALLBACK_MODELS[0]["slug"] == "gpt-5.6-sol"
+        assert FALLBACK_MODELS[0]["slug"] == "gpt-6.1-sol"
 
 
 class TestPublicConfigAttribute:

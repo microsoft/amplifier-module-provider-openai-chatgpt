@@ -210,8 +210,8 @@ class TestToModelInfos:
         assert len(result) == 1
         assert result[0].id == "gpt-4o"
 
-    def test_fallback_first_entry_is_gpt_56_sol(self) -> None:
-        """FALLBACK_MODELS first entry must be gpt-5.6-sol (current flagship).
+    def test_fallback_first_entry_is_gpt_61_sol(self) -> None:
+        """FALLBACK_MODELS first entry must be gpt-6.1-sol (current flagship).
 
         Load-bearing beyond "which model is listed first": it is also the
         value ChatGPTProvider's "latest" sentinel resolves to when the live
@@ -221,8 +221,8 @@ class TestToModelInfos:
         from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
 
         assert len(FALLBACK_MODELS) > 0, "FALLBACK_MODELS must not be empty"
-        assert FALLBACK_MODELS[0]["slug"] == "gpt-5.6-sol", (
-            f"Expected gpt-5.6-sol as first fallback entry, got {FALLBACK_MODELS[0]['slug']!r}"
+        assert FALLBACK_MODELS[0]["slug"] == "gpt-6.1-sol", (
+            f"Expected gpt-6.1-sol as first fallback entry, got {FALLBACK_MODELS[0]['slug']!r}"
         )
 
     def test_fallback_models_round_trip(self) -> None:
