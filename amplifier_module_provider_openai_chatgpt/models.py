@@ -39,6 +39,26 @@ DEFAULT_MAX_OUTPUT_TOKENS = 128_000
 # reached AND the value "latest" resolves to when unauthenticated.
 FALLBACK_MODELS: list[dict[str, Any]] = [
     {
+        "slug": "gpt-6.1-sol",
+        "display_name": "GPT 6.1 Sol",
+        "context_window": 272_000,
+        "max_context_window": 272_000,
+        "max_output_tokens": 128_000,
+        "additional_speed_tiers": ["fast"],
+        "visibility": "list",
+        "supported_in_api": True,
+    },
+    {
+        "slug": "gpt-6-luna",
+        "display_name": "GPT 6 Luna",
+        "context_window": 272_000,
+        "max_context_window": 272_000,
+        "max_output_tokens": 128_000,
+        "additional_speed_tiers": ["fast"],
+        "visibility": "list",
+        "supported_in_api": True,
+    },
+    {
         "slug": "gpt-5.6-sol",
         "display_name": "GPT 5.6 Sol",
         "context_window": 1_000_000,

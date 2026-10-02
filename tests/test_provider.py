@@ -28,12 +28,12 @@ class TestFallbackCatalog:
         for entry in FALLBACK_MODELS:
             assert "slug" in entry, f"Missing 'slug' in {entry}"
 
-    def test_fallback_first_entry_is_gpt_56_sol(self) -> None:
+    def test_fallback_first_entry_is_gpt_61_sol(self) -> None:
         from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
 
         assert len(FALLBACK_MODELS) > 0, "FALLBACK_MODELS must not be empty"
-        assert FALLBACK_MODELS[0]["slug"] == "gpt-5.6-sol", (
-            f"Expected gpt-5.6-sol as first fallback entry, got {FALLBACK_MODELS[0]['slug']!r}"
+        assert FALLBACK_MODELS[0]["slug"] == "gpt-6.1-sol", (
+            f"Expected gpt-6.1-sol as first fallback entry, got {FALLBACK_MODELS[0]['slug']!r}"
         )
 
     def test_fallback_does_not_contain_stale_models(self) -> None:
@@ -51,6 +51,8 @@ class TestFallbackCatalog:
 
         slugs = [m["slug"] for m in FALLBACK_MODELS]
         assert slugs == [
+            "gpt-6.1-sol",
+            "gpt-6-luna",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
@@ -108,7 +110,7 @@ class TestGetInfo:
         provider = self._make_provider()
         info = provider.get_info()  # type: ignore[union-attr]
         assert "latest" in info.defaults["model"]
-        assert "gpt-5.6-sol" in info.defaults["model"]
+        assert "gpt-6.1-sol" in info.defaults["model"]
         assert "context_window" not in info.defaults
         assert "max_output_tokens" not in info.defaults
 
@@ -2012,7 +2014,7 @@ class TestResolveDefaultModel:
         # refresh_token anywhere). Resolution must not raise.
         resolved = await provider._resolve_default_model()  # type: ignore[union-attr]
 
-        assert resolved == FALLBACK_MODELS[0]["slug"] == "gpt-5.6-sol"
+        assert resolved == FALLBACK_MODELS[0]["slug"] == "gpt-6.1-sol"
 
     # ------------------------------------------------------------------
     # Cache: catalog fetched (and resolved) once per provider instance

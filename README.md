@@ -82,8 +82,8 @@ generations ship. Resolution precedence:
    flagship-first (confirmed by the payload's own per-entry numeric
    `priority` field). "latest" resolves to the first catalog entry whose id
    is not a speed/size variant (i.e. does not end in `-fast` or `-mini`) --
-   today that's `gpt-5.6-sol`.
-3. **Static fallback** -- `FALLBACK_MODELS[0]` (also `gpt-5.6-sol` today),
+   the concrete result depends on the live account catalog.
+3. **Static fallback** -- `FALLBACK_MODELS[0]` (`gpt-6.1-sol` in this refresh),
    used when unauthenticated or when the live catalog can't be reached. No
    authentication error is raised for this fallback -- auth errors surface
    from actual requests (`complete()`/`list_models()`), never from resolving
@@ -93,12 +93,12 @@ Resolution happens **lazily**, at the first moment a concrete model name is
 actually needed (the first `complete()` call), and is **cached** for the
 provider instance's lifetime -- it does not re-fetch on every request. A
 single `INFO`-level log line records what `"latest"` resolved to and why
-(e.g. `default_model 'latest' resolved to 'gpt-5.6-sol' (live catalog)`).
+(e.g. `default_model 'latest' resolved to 'gpt-6.1-sol' (live catalog)`).
 
 `get_info()` never triggers a network call to answer this (app-cli's wizard
 calls it eagerly, possibly before login): before resolution has happened it
 reports something honest like `"latest (resolves lazily; falls back to
-gpt-5.6-sol)"` rather than a bare `"latest"` that could be mistaken for a
+gpt-6.1-sol)"` rather than a bare `"latest"` that could be mistaken for a
 real, pinned model id; after resolution it reports the concrete resolved id.
 
 **Wizard interplay:** app-cli's model-picker prompts with the provider's
@@ -228,30 +228,31 @@ amplifier run --bundle ./test-chatgpt.md "Hello, can you hear me?"
 
 ## Routing Matrix
 
-This module ships with a production routing matrix at `routing/openai-chatgpt.yaml` that maps all 13 Amplifier agent roles to the correct models. This is **required** for agent delegation to work -- without it, agents like `web-research`, `explorer`, and `zen-architect` will fail to resolve a provider.
+Prefer the routing-matrix bundle's canonical **`openai`** matrix. It routes both
+OpenAI API and ChatGPT subscription backends with caller-consistent delegation.
+This provider's `routing/openai-chatgpt.yaml` remains a compatibility matrix for
+existing explicit selections, refreshed to Sol 6.1 / Luna 6. It is not required
+when canonical routing is installed.
 
-To use it:
+For new setups:
 
 ```bash
-# Copy to your user routing directory
-cp routing/openai-chatgpt.yaml ~/.amplifier/routing/
-
-# Activate it
-amplifier routing use openai-chatgpt
+amplifier routing use openai
 
 # Verify
 amplifier routing show
 ```
 
-The matrix uses two-tier fallback chains (gpt-5.5 -> gpt-5.4) so it works across subscription tiers. Role highlights:
+The compatibility matrix pins Sol 6.1 for most roles and Luna 6 for fast/UI.
+Runtime exact pins do not check entitlement, and a second exact pin would not
+provide model-not-found fallback. Check the account's live catalog before use.
+New model choices are an interim refresh, not a comparative quality evaluation.
 
 | Role | Primary Model | Config |
 |------|--------------|--------|
-| `general`, `creative`, `writing`, `vision` | gpt-5.5 | -- |
-| `fast` | gpt-?.?-mini* (glob) | -- |
-| `coding` | gpt-?.?-codex* (glob) | -- |
-| `reasoning`, `research`, `security-audit`, `critical-ops` | gpt-5.5 | `reasoning_effort: high` |
-| `critique` | gpt-5.5 | `reasoning_effort: xhigh` |
+| Most roles | gpt-6.1-sol | Existing role effort retained |
+| `fast` | gpt-6-luna | -- |
+| `ui-coding` | gpt-6-luna | `reasoning_effort: max` |
 
 See the matrix YAML header for full documentation on glob strategy, fallback philosophy, and differences from the standard `openai` routing matrix.
 
@@ -264,6 +265,8 @@ If the live API is unreachable (or `auth_status()` would say `"unauthenticated"`
 
 | Model | Context Window | Max Context Window | Speed Tiers | Reasoning Levels |
 |-------|----------------|---------------------|-------------|------------------|
+| gpt-6.1-sol | 272K | 272K conservative fallback | fast | Consult live catalog |
+| gpt-6-luna | 272K | 272K conservative fallback | fast | Consult live catalog |
 | gpt-5.6-sol | 1M | 1M | fast | none/low/medium/high |
 | gpt-5.6-terra | 1M | 1M | fast | none/low/medium/high |
 | gpt-5.6-luna | 1M | 1M | fast | none/low/medium/high |
@@ -274,6 +277,12 @@ If the live API is unreachable (or `auth_status()` would say `"unauthenticated"`
 (`context_window` is the effective limit; `max_context_window` is the
 full capacity available on higher-tier plans -- your live catalog may
 differ; check `list_models()` for what your subscription actually exposes.)
+
+The current fallback starts with Sol 6.1 and includes Luna 6. Its 272K GPT-6
+input limits are conservative fallback values, not an entitlement claim. Older
+entries remain for explicit legacy pins; they are not the default selection.
+Catalog metadata does not invent vision capability tags. Plan mode continues
+to require its account-specific live catalog and never borrows this Codex list.
 
 Models with a "fast" speed tier support a `-fast` suffix (e.g. `gpt-5.5-fast`) which maps to `service_tier: "priority"` in the request. This consumes priority quota faster.
 
