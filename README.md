@@ -53,7 +53,7 @@ selection and additional tuning can be supplied by the host or configuration.
 | `app_name` | str | `Amplifier ChatGPT provider` | Actual host application name for plan sign-in; not an account or routing key. |
 | `default_model` | str | `"latest"` | Model to use for inference. `"latest"` is a sentinel meaning "resolve dynamically" -- see "Default Model Resolution" below. Set an explicit model id (e.g. `"gpt-5.4"`) to pin one. |
 | `raw` | bool | `false` | Include full request/response payloads in `llm:request`/`llm:response` hook events (for debugging) |
-| `login_on_mount` | bool | `true` | Trigger interactive device code login if tokens are absent or expired. Set `false` for non-interactive environments. |
+| `login_on_mount` | bool | `true` | Trigger interactive device code login if tokens are absent or expired. Set `false` to mount the real provider without credential reads, login or refresh in either auth mode; authentication is observed through `auth_status()` and resolved on request. |
 | `token_file_path` | str | Mode-specific | Codex: `~/.amplifier/openai-chatgpt-oauth.json`; plan: `~/.amplifier/chatgpt-plan/default.json`. Explicit blank paths are rejected. |
 | `timeout` | float or null | `null` | No default generation read deadline; a number opts in. Connection/pool acquisition remains bounded to 5 seconds. |
 | `models_cache_ttl` | float | `3600` | How long (seconds) to cache the live model catalog before re-fetching |
@@ -362,3 +362,14 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+
+### Passive provider preparation
+
+With `login_on_mount: false`, both Codex and ChatGPT plan modes register the
+actual provider even when credentials are missing or expired. Core can validate
+the configured provider protocol independently of account availability. Invalid
+provider configuration still raises its normal validation error. Existing
+`auth_status()` remains an observation, not a refusal to use renewable credentials;
+requests retain refresh and typed authentication errors. No login or refresh is
+performed by this disabled mount path. The default/enabled mount behavior remains
+unchanged.

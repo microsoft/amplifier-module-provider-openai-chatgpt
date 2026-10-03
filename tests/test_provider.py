@@ -1594,12 +1594,12 @@ class TestMount:
         assert callable(cleanup)
 
     @pytest.mark.asyncio
-    async def test_mount_returns_none_no_tokens_login_disabled(self) -> None:
-        """mount() returns None when no valid tokens and login_on_mount=False.
-        coordinator.mount must not be called."""
+    async def test_mount_retains_provider_no_tokens_login_disabled(self) -> None:
+        """Disabled login mounts a real provider without reading credentials."""
         from amplifier_module_provider_openai_chatgpt import mount
 
         coordinator = MagicMock()
+        coordinator.mount = AsyncMock()
         config = {"token_file_path": "/tmp/fake_tokens.json", "login_on_mount": False}
 
         with patch(
@@ -1612,8 +1612,14 @@ class TestMount:
             ):
                 result = await mount(coordinator, config)
 
-        assert result is None
-        coordinator.mount.assert_not_called()
+        assert callable(result)
+        coordinator.mount.assert_awaited_once_with(
+            "providers", ANY, name="openai-chatgpt"
+        )
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        assert isinstance(coordinator.mount.call_args.args[1], ChatGPTProvider)
+        await result()
 
 
 # ---------------------------------------------------------------------------
