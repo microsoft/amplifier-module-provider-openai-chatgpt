@@ -28,7 +28,9 @@ async def mount(
 ) -> Callable[[], Coroutine[Any, Any, None]] | None:
     """Mount the ChatGPT subscription provider.
 
-    Loads OAuth tokens from disk, optionally initiating login when missing.
+    With login disabled, registers the provider without loading or refreshing
+    credentials. Authentication remains observable and is resolved on use.
+    Otherwise loads OAuth tokens, optionally initiating login when missing.
     On success, registers the provider with the coordinator and returns an
     async cleanup callable that closes the provider.
 
@@ -59,6 +61,14 @@ async def mount(
     login_on_mount: bool = _coerce_bool(
         config.get("login_on_mount"), key="login_on_mount", default=True
     )
+
+    if not login_on_mount:
+        # Availability is separate from the provider protocol. Neither OAuth
+        # mode may read/refresh credentials or open consent during passive
+        # preparation; auth_status and request-time authentication own that work.
+        provider = ChatGPTProvider(config, coordinator)
+        await coordinator.mount("providers", provider, name="openai-chatgpt")
+        return provider.close
 
     if mode == plan_auth.MODE:
         if token_file_path is None:
