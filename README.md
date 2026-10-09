@@ -53,7 +53,7 @@ selection and additional tuning can be supplied by the host or configuration.
 | `app_name` | str | `Amplifier ChatGPT provider` | Actual host application name for plan sign-in; not an account or routing key. |
 | `default_model` | str | `"latest"` | Model to use for inference. `"latest"` is a sentinel meaning "resolve dynamically" -- see "Default Model Resolution" below. Set an explicit model id (e.g. `"gpt-5.4"`) to pin one. |
 | `raw` | bool | `false` | Include full request/response payloads in `llm:request`/`llm:response` hook events (for debugging) |
-| `login_on_mount` | bool | `true` | Trigger interactive device code login if tokens are absent or expired. Set `false` for non-interactive environments. |
+| `login_on_mount` | bool | deprecated | Accepted for compatibility; mounting never starts sign-in. Use explicit account setup to sign in. |
 | `token_file_path` | str | Mode-specific | Codex: `~/.amplifier/openai-chatgpt-oauth.json`; plan: `~/.amplifier/chatgpt-plan/default.json`. Explicit blank paths are rejected. |
 | `timeout` | float or null | `null` | No default generation read deadline; a number opts in. Connection/pool acquisition remains bounded to 5 seconds. |
 | `models_cache_ttl` | float | `3600` | How long (seconds) to cache the live model catalog before re-fetching |
@@ -195,11 +195,11 @@ amplifier provider login openai-chatgpt
 amplifier provider manage
 ```
 
-`login_on_mount` (default `true`) remains a runtime safety net: if a
-session starts and this provider's tokens are missing or expired,
-`mount()` triggers the same device-code flow automatically. Set it
-`false` in non-interactive environments where a stuck login prompt
-would hang session startup.
+Module loading and software update validation work without account credentials.
+Before listing models or making a request, the provider automatically reuses or
+refreshes saved credentials. If that fails, an authentication error asks the host
+to offer explicit sign-in. Mounting never opens a browser, refreshes credentials
+or tests subscription access; `login_on_mount` is accepted but no longer used.
 
 You can also wire it into a bundle directly with an inline `source:` field:
 

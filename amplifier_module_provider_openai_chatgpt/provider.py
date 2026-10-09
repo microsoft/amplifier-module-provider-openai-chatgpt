@@ -702,8 +702,8 @@ class ChatGPTProvider:
     #
     # These two members are the onboarding contract app-cli's wizard/login
     # step duck-types onto: auth_status() to know whether login is needed,
-    # login() to actually run it. mount() (the only entrypoint before this
-    # change) remains the runtime safety net for `login_on_mount`.
+    # login() to actually run it. Mounting stays offline; authenticated operations
+    # use _ensure_valid_tokens() before contacting the model service.
 
     def auth_status(self) -> str:
         """Return this provider's current OAuth authentication state.
@@ -1296,7 +1296,7 @@ class ChatGPTProvider:
 
         raise kernel_errors.AuthenticationError(
             "No valid OAuth tokens — run `amplifier provider login "
-            "openai-chatgpt` (or start a session to trigger login)",
+            "openai-chatgpt` or reconnect this account in your app.",
             provider=self.name,
             retryable=False,
         )
