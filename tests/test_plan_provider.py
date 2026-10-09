@@ -384,7 +384,7 @@ async def test_invalid_mode_and_path_fail_before_mount_login(monkeypatch):
     import amplifier_module_provider_openai_chatgpt as mod
 
     login = AsyncMock()
-    monkeypatch.setattr(mod, "login", login)
+    monkeypatch.setattr("amplifier_module_provider_openai_chatgpt.oauth.login", login)
     for config in (
         {"auth_mode": "typo"},
         {"auth_mode": "chatgpt_plan", "token_file_path": ""},
@@ -720,10 +720,12 @@ async def test_background_mount_never_opens_consent(monkeypatch):
     )
     login = AsyncMock()
     monkeypatch.setattr(plan_auth, "login", login)
-    assert (
-        await mount(MagicMock(), {"auth_mode": "chatgpt_plan", "login_on_mount": True})
-        is None
-    )
+    coordinator = MagicMock()
+    coordinator.mount = AsyncMock()
+    cleanup = await mount(coordinator, {"auth_mode": "chatgpt_plan", "login_on_mount": True})
+    assert callable(cleanup)
+    plan_auth.ensure_tokens.assert_not_awaited()
+    await cleanup()
     assert not login.called
 
 
