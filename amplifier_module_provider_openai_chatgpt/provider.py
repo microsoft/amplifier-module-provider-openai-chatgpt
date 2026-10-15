@@ -8,15 +8,19 @@ or the legacy ChatGPT backend with Codex-compatible OAuth credentials.
 from __future__ import annotations
 
 import asyncio
+import copy
 import difflib
 import json
 import logging
+import math
 import time
 import uuid
-from typing import Any, Callable
+from collections.abc import Callable
+from datetime import UTC
+from email.utils import parsedate_to_datetime
+from typing import Any
 
 import httpx
-
 from amplifier_core import ConfigField, ModelInfo, ProviderInfo
 from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import (
@@ -30,9 +34,11 @@ from amplifier_core.message_models import (
     Usage,
 )
 from amplifier_core.utils import redact_secrets
+from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 
-from ._sse import ParsedResponse, SSEError, parse_sse_events
+from . import plan_auth
 from ._plan_request import prepare_plan_payload
+from ._sse import ParsedResponse, SSEError, parse_sse_events
 from .models import (
     DEFAULT_CACHE_TTL_SECONDS,
     FALLBACK_MODELS,
@@ -49,7 +55,6 @@ from .oauth import (
     refresh_tokens,
 )
 from .oauth import login as oauth_login
-from . import plan_auth
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +79,69 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "instance_id",
         "extra_request_params",
         "reasoning_effort",
+        "max_retries",
+        "min_retry_delay",
+        "max_retry_delay",
+        "retry_jitter",
     }
 )
 
 CODEX_MODE = "chatgpt_codex"
+
+
+def _retry_after(value: Any) -> float | None:
+    """Return a finite server wait in seconds, including HTTP-date headers."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        if not isinstance(value, str):
+            return None
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=UTC)
+            delay = max(0.0, date.timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return delay if math.isfinite(delay) and delay >= 0 else None
+
+
+def _coded_error(
+    code: str, message: str, provider: str, status: int | None = None
+) -> kernel_errors.LLMError | None:
+    """Specific service codes take precedence over generic HTTP status."""
+    cls = None
+    if code in {"insufficient_quota", "quota_exceeded", "billing_hard_limit_reached",
+                "usage_limit_reached", "usage_limit_exceeded"}:
+        cls = kernel_errors.QuotaExceededError
+    elif code in {"invalid_api_key", "authentication_error", "unauthorized"}:
+        cls = kernel_errors.AuthenticationError
+    elif code in {"context_length_exceeded", "max_tokens_exceeded"}:
+        cls = kernel_errors.ContextLengthError
+    elif code in {"content_filter", "content_policy_violation", "safety_violation"}:
+        cls = kernel_errors.ContentFilterError
+    elif code in {"invalid_request", "invalid_request_error", "unsupported_parameter"}:
+        cls = kernel_errors.InvalidRequestError
+    elif code in {"server_error", "internal_server_error", "overloaded",
+                  "overloaded_error", "service_unavailable"}:
+        cls = kernel_errors.ProviderUnavailableError
+    elif code in {"rate_limit", "rate_limit_error", "rate_limit_exceeded"}:
+        cls = kernel_errors.RateLimitError
+    if cls is None:
+        return None
+    return cls(message, provider=provider, status_code=status)
+
+
+def _body_code(body: bytes) -> str:
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    error = data.get("error") if isinstance(data, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else ""
 
 
 def normalize_auth_mode(value: Any = None) -> str:
@@ -325,6 +389,17 @@ class ChatGPTProvider:
             _coerce_float(self._config["timeout"], key="timeout", default=300.0)
             if self._config.get("timeout") is not None
             else None
+        )
+        retries = _coerce_int(self._config.get("max_retries"), key="max_retries", default=5)
+        minimum = _coerce_float(self._config.get("min_retry_delay"), key="min_retry_delay", default=1.0)
+        maximum = _coerce_float(self._config.get("max_retry_delay"), key="max_retry_delay", default=60.0)
+        if retries < 0 or retries > 2**32 - 1:
+            raise ValueError("max_retries must be a non-negative 32-bit integer")
+        if not all(math.isfinite(v) and v >= 0 for v in (minimum, maximum)) or minimum > maximum:
+            raise ValueError("retry delays must be finite, non-negative, and min <= max")
+        self._retry_config = RetryConfig(
+            max_retries=retries, initial_delay=minimum, max_delay=maximum,
+            jitter=_coerce_bool(self._config.get("retry_jitter"), key="retry_jitter", default=True),
         )
         self._token_file_path: str | None = self._config.get("token_file_path")
         if self.auth_mode == plan_auth.MODE and self._token_file_path is None:
@@ -1130,15 +1205,18 @@ class ChatGPTProvider:
             kernel_errors.LLMError: Any other unexpected status code.
         """
         body_text = body.decode(errors="replace")
+        code = _body_code(body)
+        coded = _coded_error(code, body_text, provider_name, status)
+        if coded is not None and (not coded.retryable or status == 429 or status >= 500):
+            coded.retry_after = _retry_after(headers.get("retry-after"))
+            raise coded
+        if code and (status == 429 or status >= 500):
+            raise kernel_errors.LLMError(
+                body_text, provider=provider_name, status_code=status, retryable=False
+            )
 
         if status == 429:
-            retry_after: float | None = None
-            ra_header = headers.get("retry-after")
-            if ra_header is not None:
-                try:
-                    retry_after = float(ra_header)
-                except ValueError:
-                    pass
+            retry_after = _retry_after(headers.get("retry-after"))
             raise kernel_errors.RateLimitError(
                 f"ChatGPT API rate limit exceeded ({status}): {body_text}",
                 provider=provider_name,
@@ -1224,6 +1302,7 @@ class ChatGPTProvider:
                 provider=provider_name,
                 status_code=status,
                 retryable=True,
+                retry_after=_retry_after(headers.get("retry-after")),
             )
         else:
             raise kernel_errors.LLMError(
@@ -1315,9 +1394,10 @@ class ChatGPTProvider:
         7. Emit ``llm:response`` event with usage and timing.
         8. Return ChatResponse via ``_to_chat_response()``.
 
-        On any exception an ``llm:response`` event with ``status='error'`` is
-        emitted before re-raising.  All exceptions that escape this method are
-        :class:`~amplifier_core.llm_errors.LLMError` subtypes.
+        Retry known transient failures before output, using Core's shared loop.
+        Emit one terminal response, never intermediate failed-attempt responses.
+        Cancellation propagates without retry. Preparation keeps its existing
+        behavior, before request telemetry and the transient retry campaign.
         """
         # 1. Ensure valid OAuth tokens.
         await self._ensure_valid_tokens()
@@ -1330,14 +1410,12 @@ class ChatGPTProvider:
         effective_default_model = await self._resolve_default_model()
 
         # 2. Build request payload.
-        payload = self._build_payload(request, default_model=effective_default_model)
+        payload = copy.deepcopy(self._build_payload(request, default_model=effective_default_model))
 
         # Resolve effective model name (mirrors _build_payload logic) for events.
         model: str = request.model or effective_default_model
         if self.auth_mode != plan_auth.MODE and model.endswith("-fast"):
             model = model.removesuffix("-fast")
-
-        headers = self._build_headers()
 
         # 3. Emit llm:request event (NOT re-emitted on retry).
         _has_hooks = self._coordinator and hasattr(self._coordinator, "hooks")
@@ -1352,6 +1430,67 @@ class ChatGPTProvider:
             await self._coordinator.hooks.emit("llm:request", req_event)
 
         start_time = time.monotonic()
+        state = {"exposed": False, "auth_refreshed": False}
+        request_id = str(uuid.uuid4())
+        retry_config = self._retry_config
+
+        async def attempt():
+            try:
+                return await self._complete_attempt(request, payload, model, request_id, state)
+            except kernel_errors.LLMError as error:
+                # Retryability here means safe replay of this invocation, not
+                # merely a transient service cause. Do not invite outer replay
+                # after output or an excessive server hint.
+                hint = error.retry_after
+                if error.retryable and (
+                    state["exposed"] or (hint is not None and hint > retry_config.max_delay)
+                ):
+                    error.retryable = False
+                raise
+
+        async def on_retry(attempt_number, delay, error):
+            # Core jitters after applying Retry-After. Top up only the shortfall;
+            # Core still owns the loop and its normal sleep, not a second loop.
+            extra = max(0.0, (error.retry_after or 0.0) - delay)
+            if _has_hooks:
+                try:
+                    await self._coordinator.hooks.emit("provider:retry", {
+                        "provider": self.name, "model": model, "request_id": request_id,
+                        "attempt": attempt_number, "max_retries": retry_config.max_retries,
+                        "delay": delay + extra, "error_type": type(error).__name__,
+                    })
+                except Exception as diagnostic_error:  # noqa: BLE001 - observer isolation
+                    logger.debug("Retry diagnostic failed (%s)", type(diagnostic_error).__name__)
+            if extra:
+                await asyncio.sleep(extra)
+
+        try:
+            result, parsed = await retry_with_backoff(attempt, retry_config, on_retry=on_retry)
+        except kernel_errors.LLMError as error:
+            if _has_hooks:
+                await self._coordinator.hooks.emit("llm:response", {
+                    "provider": self.name, "model": model, "status": "error",
+                    "error": str(error), "duration_ms": (time.monotonic() - start_time) * 1000,
+                })
+            raise
+        if _has_hooks:
+            resp_event: dict[str, Any] = {
+                "provider": self.name, "model": model, "status": "ok",
+                "usage": {"input_tokens": parsed.input_tokens, "output_tokens": parsed.output_tokens},
+                "duration_ms": (time.monotonic() - start_time) * 1000,
+            }
+            if self.raw:
+                resp_event["raw"] = redact_secrets({"events": parsed.raw_events})
+            await self._coordinator.hooks.emit("llm:response", resp_event)
+        return result
+
+    async def _complete_attempt(
+        self, request: ChatRequest, payload: dict[str, Any], model: str,
+        request_id: str, state: dict[str, bool],
+    ) -> tuple[ChatResponse, ParsedResponse]:
+        """One transport attempt; no terminal error hooks before retry exhaustion."""
+        headers = self._build_headers()
+        _has_hooks = self._coordinator and hasattr(self._coordinator, "hooks")
 
         # Per-request streaming override (does NOT mutate config-level setting).
         # Callers pass metadata={"stream": False} to suppress llm:stream_* events.
@@ -1365,14 +1504,12 @@ class ChatGPTProvider:
 
         # Streaming state — stable across the 401-retry loop.
         # request_id is generated once; seq/block_types reset per attempt (fresh stream).
-        request_id: str = str(uuid.uuid4())
         seq: dict[int, int] = {}
         block_types: dict[int, str] = {}
-        any_emitted: bool = False  # True once any delta/thinking event is emitted
+        any_emitted: bool = False  # Set BEFORE any block hook can expose output.
         stream_aborted_emitted: bool = False
 
         # Local guard variable — concurrency-safe (no instance-level mutation).
-        retry_attempted = False
         service_request_id: str | None = None
 
         try:
@@ -1411,11 +1548,11 @@ class ChatGPTProvider:
                                         if self._tokens
                                         else None,
                                     )
-                                if status == 401 and not retry_attempted:
+                                if status == 401 and not state["auth_refreshed"]:
                                     # Mid-session expiry: refresh once, rebuild
                                     # headers, and retry.  The llm:request hook
                                     # is NOT re-emitted.
-                                    retry_attempted = True
+                                    state["auth_refreshed"] = True
                                     await self._ensure_valid_tokens()
                                     headers = self._build_headers()
                                     continue  # re-enter the for loop
@@ -1499,6 +1636,7 @@ class ChatGPTProvider:
                                         tc_name = item.get("name")
                                         if tc_name:
                                             bs_payload["name"] = tc_name
+                                    state["exposed"] = any_emitted = True
                                     await self._coordinator.hooks.emit(
                                         "llm:stream_block_start", bs_payload
                                     )
@@ -1507,6 +1645,7 @@ class ChatGPTProvider:
                                     delta_text = event.get("delta", "")
                                     if delta_text:
                                         idx = event.get("output_index", 0)
+                                        state["exposed"] = any_emitted = True
                                         await self._coordinator.hooks.emit(
                                             "llm:stream_block_delta",
                                             {
@@ -1527,6 +1666,7 @@ class ChatGPTProvider:
                                     delta_text = event.get("delta", "")
                                     if delta_text:
                                         idx = event.get("output_index", 0)
+                                        state["exposed"] = any_emitted = True
                                         await self._coordinator.hooks.emit(
                                             "llm:stream_block_delta",
                                             {
@@ -1543,6 +1683,7 @@ class ChatGPTProvider:
                                 elif et == "response.output_item.done":
                                     idx = event.get("output_index", 0)
                                     if idx in block_types:
+                                        state["exposed"] = any_emitted = True
                                         await self._coordinator.hooks.emit(
                                             "llm:stream_block_end",
                                             {
@@ -1601,8 +1742,8 @@ class ChatGPTProvider:
                     # Belt-and-suspenders: catch any AuthenticationError that
                     # escaped the status-code block (e.g. _build_headers()
                     # raising during the mid-loop 401 recovery path). By the
-                    # time we reach this handler retry_attempted is always
-                    # True, so we simply propagate.
+                    # time we reach this handler we simply propagate; the
+                    # envelope owns the one-refresh budget.
                     raise
 
             # 6. Parse SSE events.
@@ -1612,41 +1753,10 @@ class ChatGPTProvider:
                 require_completed=self.auth_mode == plan_auth.MODE,
             )
 
-            duration_ms = (time.monotonic() - start_time) * 1000
+            return self._to_chat_response(parsed, model), parsed
 
-            # 7. Emit llm:response event (success).
-            if _has_hooks:
-                resp_event: dict[str, Any] = {
-                    "provider": self.name,
-                    "model": model,
-                    "usage": {
-                        "input_tokens": parsed.input_tokens,
-                        "output_tokens": parsed.output_tokens,
-                    },
-                    "status": "ok",
-                    "duration_ms": duration_ms,
-                }
-                if self.raw:
-                    resp_event["raw"] = redact_secrets({"events": parsed.raw_events})
-                await self._coordinator.hooks.emit("llm:response", resp_event)
-
-            # 8. Return ChatResponse.
-            return self._to_chat_response(parsed, model)
-
-        except kernel_errors.LLMError as exc:
-            # Already a typed kernel error — emit hook and re-raise unchanged.
-            duration_ms = (time.monotonic() - start_time) * 1000
-            if _has_hooks:
-                await self._coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": self.name,
-                        "model": model,
-                        "status": "error",
-                        "error": str(exc),
-                        "duration_ms": duration_ms,
-                    },
-                )
+        except kernel_errors.LLMError:
+            # The logical request owns its one terminal response diagnostic.
             raise
 
         except SSEError as exc:
@@ -1663,7 +1773,6 @@ class ChatGPTProvider:
                         },
                     },
                 )
-            duration_ms = (time.monotonic() - start_time) * 1000
             code = exc.code or ""
             msg = str(exc).lower()
 
@@ -1671,10 +1780,8 @@ class ChatGPTProvider:
                 code.startswith(("subscription_sharing_", "chatpass_v2_"))
             ):
                 mapped_exc = _plan_error(code, str(exc), provider=self.name)
-            elif "rate_limit" in code:
-                mapped_exc: kernel_errors.LLMError = kernel_errors.RateLimitError(
-                    str(exc), provider=self.name, retryable=True
-                )
+            elif (coded := _coded_error(code, str(exc), self.name)) is not None:
+                mapped_exc = coded
             elif code == "context_length_exceeded" or (
                 not code
                 and any(kw in msg for kw in ("context length", "too many tokens"))
@@ -1696,17 +1803,13 @@ class ChatGPTProvider:
                 mapped_exc.error_param = getattr(exc, "param", None)
                 mapped_exc.request_id = service_request_id
                 mapped_exc.response_body = redact_secrets(getattr(exc, "details", {}))
-            if _has_hooks:
-                await self._coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": self.name,
-                        "model": model,
-                        "status": "error",
-                        "error": str(exc),
-                        "duration_ms": duration_ms,
-                    },
-                )
+            details = getattr(exc, "details", {})
+            response = details.get("response", {}) if isinstance(details, dict) else {}
+            error_data = details.get("error", details if exc.event_type == "error" else None) if isinstance(details, dict) else None
+            if error_data is None and isinstance(response, dict):
+                error_data = response.get("error")
+            if isinstance(error_data, dict):
+                mapped_exc.retry_after = _retry_after(error_data.get("retry_after"))
             raise mapped_exc from exc
 
         except httpx.TimeoutException as exc:
@@ -1723,23 +1826,11 @@ class ChatGPTProvider:
                         },
                     },
                 )
-            duration_ms = (time.monotonic() - start_time) * 1000
             mapped_timeout = kernel_errors.LLMTimeoutError(
                 f"ChatGPT API request timed out: {exc}",
                 provider=self.name,
                 retryable=True,
             )
-            if _has_hooks:
-                await self._coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": self.name,
-                        "model": model,
-                        "status": "error",
-                        "error": str(exc),
-                        "duration_ms": duration_ms,
-                    },
-                )
             raise mapped_timeout from exc
 
         except httpx.TransportError as exc:
@@ -1758,23 +1849,11 @@ class ChatGPTProvider:
                         },
                     },
                 )
-            duration_ms = (time.monotonic() - start_time) * 1000
             mapped_unavail = kernel_errors.ProviderUnavailableError(
                 f"ChatGPT API connection error: {exc}",
                 provider=self.name,
                 retryable=True,
             )
-            if _has_hooks:
-                await self._coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": self.name,
-                        "model": model,
-                        "status": "error",
-                        "error": str(exc),
-                        "duration_ms": duration_ms,
-                    },
-                )
             raise mapped_unavail from exc
 
         except Exception as exc:
@@ -1789,18 +1868,6 @@ class ChatGPTProvider:
                             "type": type(exc).__name__,
                             "msg": str(exc),
                         },
-                    },
-                )
-            duration_ms = (time.monotonic() - start_time) * 1000
-            if _has_hooks:
-                await self._coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": self.name,
-                        "model": model,
-                        "status": "error",
-                        "error": str(exc),
-                        "duration_ms": duration_ms,
                     },
                 )
             raise kernel_errors.LLMError(
@@ -1868,24 +1935,13 @@ def _plan_error(
             status_code=status or 429,
             retryable=False,
         )
-    if code in {
-        "subscription_sharing_usage_unavailable",
-        "subscription_sharing_user_unavailable",
-    } or (status is not None and status >= 500):
-        return kernel_errors.ProviderUnavailableError(
-            message, provider=provider, status_code=status or 503, retryable=True
-        )
-    if code == "subscription_sharing_invalid_user" or status == 401:
+    if code == "subscription_sharing_invalid_user":
         return kernel_errors.AuthenticationError(
             message, provider=provider, status_code=status or 401, retryable=False
         )
-    if code == "subscription_sharing_unsupported_capability" or status == 400:
+    if code == "subscription_sharing_unsupported_capability":
         return kernel_errors.InvalidRequestError(
             message, provider=provider, status_code=status or 400, retryable=False
-        )
-    if status == 429:
-        return kernel_errors.RateLimitError(
-            message, provider=provider, status_code=status, retryable=True
         )
     if (
         status == 403
@@ -1899,6 +1955,23 @@ def _plan_error(
         return kernel_errors.AccessDeniedError(
             message, provider=provider, status_code=status or 403, retryable=False
         )
+    coded = _coded_error(code, message, provider, status)
+    if coded is not None and (not coded.retryable or status is None or status == 429 or status >= 500):
+        return coded
+    if code in {"subscription_sharing_usage_unavailable", "subscription_sharing_user_unavailable"} or (
+        status is not None and status >= 500 and not code
+    ):
+        return kernel_errors.ProviderUnavailableError(
+            message, provider=provider, status_code=status or 503, retryable=True
+        )
+    if status == 401:
+        return kernel_errors.AuthenticationError(message, provider=provider, status_code=status)
+    if status == 400:
+        return kernel_errors.InvalidRequestError(message, provider=provider, status_code=status)
+    if status == 404:
+        return kernel_errors.NotFoundError(message, provider=provider, status_code=status)
+    if status == 429 and not code:
+        return kernel_errors.RateLimitError(message, provider=provider, status_code=status)
     return kernel_errors.LLMError(
         message, provider=provider, status_code=status, retryable=False
     )
@@ -1927,6 +2000,7 @@ def _raise_plan_error(
     if request_id:
         message += f" Request ID: {request_id[:200]}"
     exc = _plan_error(code, message, provider=provider, status=status)
+    exc.retry_after = _retry_after(headers.get("retry-after"))
     # Preserve the structured response shape and exact service code/parameter for
     # host diagnostics, including direct admission responses with only 'detail'.
     exc.error_code = code or None

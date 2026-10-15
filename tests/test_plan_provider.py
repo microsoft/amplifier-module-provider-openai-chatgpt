@@ -23,6 +23,7 @@ def provider():
             "auth_mode": "chatgpt_plan",
             "token_file_path": "/unused/plan.json",
             "default_model": "account-model",
+            "max_retries": 0,  # Classification fixtures; campaigns tested separately.
             "extra_request_params": {
                 "store": True,
                 "stream": False,

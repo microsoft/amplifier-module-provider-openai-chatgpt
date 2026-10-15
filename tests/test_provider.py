@@ -2025,7 +2025,8 @@ class TestCompleteErrorMapping:
         }
         coordinator = MagicMock()
         coordinator.hooks.emit = AsyncMock()
-        return ChatGPTProvider({"default_model": "gpt-4o"}, coordinator, tokens)
+        # Classification tests do not run a retry campaign; test_retry covers it.
+        return ChatGPTProvider({"default_model": "gpt-4o", "max_retries": 0}, coordinator, tokens)
 
     def _make_request(self) -> object:  # type: ignore[return]
         from amplifier_core.message_models import ChatRequest, Message
@@ -2346,7 +2347,7 @@ class TestCompleteErrorMapping:
 
     @pytest.mark.asyncio
     async def test_sse_error_mapped(self) -> None:
-        """SSEError (generic server_error code) → LLMError(retryable=False)."""
+        """SSE server_error is a typed transient service failure."""
         from amplifier_core import llm_errors as kernel_errors
         from amplifier_module_provider_openai_chatgpt._sse import SSEError
 
@@ -2371,12 +2372,12 @@ class TestCompleteErrorMapping:
             "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
         ) as MockClient:
             MockClient.return_value = _make_sse_response(error_lines)
-            with pytest.raises(kernel_errors.LLMError) as exc_info:
+            with pytest.raises(kernel_errors.ProviderUnavailableError) as exc_info:
                 await provider.complete(request)  # type: ignore[union-attr]
 
         # SSEError must never escape complete() unmapped
         assert not isinstance(exc_info.value, SSEError)
-        assert exc_info.value.retryable is False
+        assert exc_info.value.retryable is True
 
     @pytest.mark.asyncio
     async def test_sse_rate_limit_error_mapped(self) -> None:
@@ -2653,7 +2654,7 @@ class TestComplete401Retry:
 
     Design: first 401 triggers a token refresh + header rebuild + retry;
     a second 401 (or refresh failure) propagates AuthenticationError.
-    Only 401s trigger this path — other error codes are not retried.
+    Only 401s trigger this auth path; transient retries are disabled here.
     """
 
     def _make_provider(self) -> object:
@@ -2667,7 +2668,7 @@ class TestComplete401Retry:
             "account_id": "acct-123",
             "expires_at": expires_at,
         }
-        config = {"default_model": "gpt-4o"}
+        config = {"default_model": "gpt-4o", "max_retries": 0}
         coordinator = MagicMock()
         coordinator.hooks.emit = AsyncMock()
         return ChatGPTProvider(config, coordinator, tokens)
@@ -2832,12 +2833,12 @@ class TestComplete401Retry:
         )
 
     # ------------------------------------------------------------------
-    # 4. Non-401 errors are NOT retried
+    # 4. Non-401 errors are not auth-retried when transient retries are off
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
     async def test_non_401_not_retried(self) -> None:
-        """A 500 error is raised immediately — only one HTTP attempt is made."""
+        """With max_retries=0, a 500 must not enter the auth-refresh path."""
         from amplifier_core import llm_errors as kernel_errors
 
         provider = self._make_provider()
@@ -2854,7 +2855,7 @@ class TestComplete401Retry:
             with pytest.raises(kernel_errors.ProviderUnavailableError):
                 await provider.complete(request)  # type: ignore[union-attr]
 
-        # Only one HTTP call — 500 must not trigger a retry.
+        # One HTTP call: no transient campaign, and no credential refresh.
         assert MockClient.call_count == 1, (
             f"Expected 1 HTTP call for 500 error, got {MockClient.call_count}"
         )
