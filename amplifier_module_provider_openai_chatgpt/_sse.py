@@ -165,7 +165,8 @@ def parse_sse_events(
 def _raise_sse_error(event: dict, event_type: str) -> None:
     """Extract error details from *event* and raise an :exc:`SSEError`."""
     if event_type == "error":
-        error_obj = event.get("error")
+        # Responses API errors may be flat; Codex also sends nested errors.
+        error_obj = event.get("error", event)
     else:
         # response.failed / response.incomplete — error nested under "response"
         response = event.get("response")

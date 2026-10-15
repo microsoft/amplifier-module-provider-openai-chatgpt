@@ -56,6 +56,10 @@ selection and additional tuning can be supplied by the host or configuration.
 | `login_on_mount` | bool | deprecated | Accepted for compatibility; mounting never starts sign-in. Use explicit account setup to sign in. |
 | `token_file_path` | str | Mode-specific | Codex: `~/.amplifier/openai-chatgpt-oauth.json`; plan: `~/.amplifier/chatgpt-plan/default.json`. Explicit blank paths are rejected. |
 | `timeout` | float or null | `null` | No default generation read deadline; a number opts in. Connection/pool acquisition remains bounded to 5 seconds. |
+| `max_retries` | int | `5` | Additional transient completion attempts; `0` disables them, not the existing one-time Codex 401 refresh. |
+| `min_retry_delay` | float | `1` | Initial/base exponential backoff in seconds, not a jittered minimum. |
+| `max_retry_delay` | float | `60` | Base backoff cap and maximum accepted server wait hint. |
+| `retry_jitter` | bool | `true` | Apply Core's jitter to backoff. |
 | `models_cache_ttl` | float | `3600` | How long (seconds) to cache the live model catalog before re-fetching |
 | `models_client_version` | str | `"99.99.99"` | Settings-only override for the model-catalog version-gating constant (see `models.py`'s `MODELS_CLIENT_VERSION` -- FRAGILE, relies on the ChatGPT backend treating any unknown high version as "give me everything") |
 | `use_streaming` | bool | `true` | Set `false` to force non-streaming completions |
@@ -67,6 +71,34 @@ Boolean and numeric keys accept native types or the string forms a config
 wizard writes (`"true"`/`"false"`); invalid numeric strings warn and fall
 back to the default rather than crashing at mount. Unrecognized config
 keys produce a mount-time warning (with a did-you-mean suggestion).
+
+### Completion retries
+
+Both sign-in modes use Core's shared `RetryConfig` / `retry_with_backoff`
+mechanism, like the OpenAI and Anthropic providers. Known overload/server errors,
+temporary rate limits, and transport failures retry the **same prepared request**,
+not a conversation turn or its tools. There is no account, model or mode fallback.
+Authentication, hard quota/plan usage limits, invalid requests, context/policy
+errors and unknown service codes do not retry automatically.
+
+Retries stop as soon as any text, thinking or tool-use block hook is emitted,
+including a block start. Buffered requests that emit no blocks may retry.
+Cancellation interrupts requests and backoff. Healthy generation still has no
+implicit read deadline. A lost response can have been generated and billed
+remotely; retries do not promise exactly-once inference.
+
+Numeric and HTTP-date `Retry-After` hints are honored as minimum waits; hints
+above `max_retry_delay` decline retry rather than retry early. Invalid hints are
+ignored. Core's jitter may increase a wait above the **base** backoff cap (up to
+1.5 times it); this setting is not a total elapsed-time or spend budget.
+`llm:request` and terminal `llm:response` each occur once per logical request;
+`provider:retry` reports attempt, delay and error class without request bodies.
+The four option names match the OpenAI provider. Retry delays must be finite,
+non-negative and ordered (`min_retry_delay <= max_retry_delay`); invalid ranges
+fail during provider construction rather than creating an unbounded wait.
+With defaults, six attempts can incur up to 46.5 seconds of ordinary backoff
+(or up to 450 seconds if every server hint is 60 seconds), plus time spent on
+the requests. Explicit read timeouts apply per attempt, not to the campaign.
 
 ### Default Model Resolution
 
