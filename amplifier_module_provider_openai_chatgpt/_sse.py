@@ -43,6 +43,7 @@ class ParsedResponse:
     input_tokens: int = 0
     output_tokens: int = 0
     raw_events: list[dict] = field(default_factory=list)
+    cache_read_tokens: int | None = None
 
 
 def parse_sse_events(
@@ -123,6 +124,11 @@ def parse_sse_events(
             if usage:
                 result.input_tokens = usage.get("input_tokens", 0)
                 result.output_tokens = usage.get("output_tokens", 0)
+                details = usage.get("input_tokens_details")
+                cached = details.get("cached_tokens") if isinstance(details, dict) else None
+                result.cache_read_tokens = (
+                    cached if type(cached) is int and cached >= 0 else None
+                )
 
         # ------------------------------------------------------------------
         # Content accumulation from response.output_item.done (canonical).
