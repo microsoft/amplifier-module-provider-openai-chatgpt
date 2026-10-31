@@ -1114,11 +1114,21 @@ class TestComplete:
         assert result.usage.total_tokens == 15
 
     @pytest.mark.asyncio
-    async def test_completion_and_response_hook_report_the_same_usage_once(self) -> None:
+    @pytest.mark.parametrize("cached", [None, 0, 7])
+    async def test_completion_and_response_hook_report_the_same_usage_once(self, cached) -> None:
         """The completed response and success hook share parsed SSE usage."""
         provider = self._make_provider()
         request = self._make_request()
         sse_lines = _make_sse_lines(text="Hello!", input_tokens=10, output_tokens=5)
+
+        if cached is not None:
+            for index, line in enumerate(sse_lines):
+                if not line.startswith("data: {"):
+                    continue
+                event = json.loads(line[6:])
+                if event.get("type") in {"response.done", "response.completed"}:
+                    event["response"]["usage"]["input_tokens_details"] = {"cached_tokens": cached}
+                    sse_lines[index] = "data: " + json.dumps(event)
 
         with patch(
             "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
@@ -1133,8 +1143,12 @@ class TestComplete:
         ]
         assert len(response_calls) == 1
         hook_usage = response_calls[0].args[1]["usage"]
-        assert hook_usage == {"input_tokens": 10, "output_tokens": 5}
+        expected = {"input_tokens": 10, "output_tokens": 5}
+        if cached is not None:
+            expected["cache_read_tokens"] = cached
+        assert hook_usage == expected
         assert result.usage is not None
+        assert result.usage.cache_read_tokens == cached
         assert result.usage.input_tokens == hook_usage["input_tokens"]
         assert result.usage.output_tokens == hook_usage["output_tokens"]
         assert result.usage.total_tokens == (

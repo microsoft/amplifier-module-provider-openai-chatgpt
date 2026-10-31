@@ -1479,6 +1479,8 @@ class ChatGPTProvider:
                 "usage": {"input_tokens": parsed.input_tokens, "output_tokens": parsed.output_tokens},
                 "duration_ms": (time.monotonic() - start_time) * 1000,
             }
+            if parsed.cache_read_tokens is not None:
+                resp_event["usage"]["cache_read_tokens"] = parsed.cache_read_tokens
             if self.raw:
                 resp_event["raw"] = redact_secrets({"events": parsed.raw_events})
             await self._coordinator.hooks.emit("llm:response", resp_event)
@@ -1913,6 +1915,7 @@ class ChatGPTProvider:
             input_tokens=parsed.input_tokens,
             output_tokens=parsed.output_tokens,
             total_tokens=parsed.input_tokens + parsed.output_tokens,
+            cache_read_tokens=parsed.cache_read_tokens,
         )
 
         return ChatResponse(

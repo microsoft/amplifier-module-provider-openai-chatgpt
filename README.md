@@ -394,3 +394,11 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+
+### Cache usage reporting
+
+When the backend reports `usage.input_tokens_details.cached_tokens`, both the
+completed response and `llm:response` event retain that count. A reported zero is
+a cache miss; omitted or invalid counts remain unknown. This reporting does not
+enable public OpenAI cache controls on the Codex or ChatGPT plan endpoints, and
+does not imply per-token subscription pricing.

@@ -12,6 +12,20 @@ from amplifier_module_provider_openai_chatgpt._sse import (
 )
 
 
+@pytest.mark.parametrize("event_type", ["response.done", "response.completed"])
+@pytest.mark.parametrize("details,expected", [
+    (None, None), ({}, None), ({"cached_tokens": 0}, 0),
+    ({"cached_tokens": 32}, 32), ({"cached_tokens": -1}, None),
+    ({"cached_tokens": "32"}, None), ({"cached_tokens": True}, None),
+])
+def test_cache_observation_preserves_zero_and_unknown(event_type, details, expected):
+    event = {"type": event_type, "response": {"usage": {
+        "input_tokens": 42, "output_tokens": 17, "input_tokens_details": details}}}
+    parsed = parse_sse_events(["data: " + json.dumps(event)])
+    assert parsed.cache_read_tokens == expected
+    assert parsed.input_tokens == 42
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
