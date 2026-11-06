@@ -53,6 +53,7 @@ from .oauth import (
     is_token_valid,
     load_tokens,
     refresh_tokens,
+    refresh_tokens_strict,
 )
 from .oauth import login as oauth_login
 
@@ -659,24 +660,24 @@ class ChatGPTProvider:
             models = to_model_infos(entries, include_speed_variants=False)
         except kernel_errors.LLMError:
             raise
-        except httpx.TimeoutException as exc:
+        except httpx.TimeoutException:
             raise kernel_errors.LLMTimeoutError(
                 "ChatGPT model discovery timed out",
                 provider=self.name,
                 retryable=True,
-            ) from exc
-        except httpx.TransportError as exc:
+            ) from None
+        except httpx.TransportError:
             raise kernel_errors.ProviderUnavailableError(
                 "ChatGPT model discovery connection failed",
                 provider=self.name,
                 retryable=True,
-            ) from exc
-        except Exception as exc:
+            ) from None
+        except Exception:
             raise kernel_errors.LLMError(
                 "ChatGPT model discovery failed: invalid catalog or credentials",
                 provider=self.name,
                 retryable=False,
-            ) from exc
+            ) from None
         return {"version": 1, "source": "provider-api", "models": models}
 
     async def _get_catalog(self) -> list[ModelInfo]:
@@ -1398,26 +1399,33 @@ class ChatGPTProvider:
                     str(exc), provider=self.name, retryable=False
                 ) from exc
             return
-        disk_mode = load_tokens(path=self._token_file_path)
+        # Explicit strict credentials are an account pin, independent of any
+        # unrelated file. Keep the legacy disk-mode gate for ordinary callers.
+        disk_mode = (
+            None
+            if fresh_from_file and self._tokens_injected
+            else load_tokens(path=self._token_file_path)
+        )
         if disk_mode and disk_mode.get("auth_mode") == plan_auth.MODE:
             raise kernel_errors.AuthenticationError(
                 "ChatGPT plan credentials require auth_mode=chatgpt_plan.",
                 provider=self.name,
                 retryable=False,
             )
-        if fresh_from_file and not self._tokens_injected:
+        if fresh_from_file:
             # One authoritative file snapshot per discovery. In particular,
             # never refresh the previous account when this record is absent.
-            self._tokens = disk_mode
-            if is_token_valid(self._tokens):
+            snapshot = self._tokens if self._tokens_injected else disk_mode
+            if is_token_valid(snapshot):
+                self._tokens = snapshot
                 return
-            if self._tokens and self._tokens.get("refresh_token"):
-                refreshed = await refresh_tokens(
-                    self._tokens["refresh_token"], path=self._token_file_path
+            if snapshot and snapshot.get("refresh_token"):
+                self._tokens = await refresh_tokens_strict(
+                    snapshot,
+                    path=self._token_file_path,
+                    persist=not self._tokens_injected,
                 )
-                if refreshed:
-                    self._tokens = refreshed
-                    return
+                return
             raise kernel_errors.AuthenticationError(
                 "No valid OAuth tokens in the configured credential file — "
                 "reconnect this account in your app.",

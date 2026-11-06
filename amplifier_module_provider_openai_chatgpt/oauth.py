@@ -6,17 +6,23 @@ OAuth/device flow endpoints for OpenAI authentication.
 
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import secrets
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Callable
 from urllib.parse import urlencode
 
 import httpx
+from filelock import FileLock, Timeout as FileLockTimeout
 
 logger = logging.getLogger(__name__)
 
@@ -84,11 +90,25 @@ def save_tokens(tokens: dict, path: str | None = None) -> None:
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(tokens, f)
-
-    os.chmod(path, 0o600)
+    destination = Path(path).resolve()
+    with FileLock(str(destination) + ".lock", timeout=5, mode=0o600):
+        _write_tokens_atomic(tokens, destination)
     logger.debug("Tokens saved to %s", path)
+
+
+def _write_tokens_atomic(tokens: dict, path: Path) -> None:
+    """Replace a complete 0600 record; caller holds the credential-path lock."""
+    fd, temporary = tempfile.mkstemp(prefix=".chatgpt-", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(tokens, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def load_tokens(path: str | None = None) -> dict | None:
@@ -164,20 +184,8 @@ def is_token_valid(tokens: dict | None) -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def refresh_tokens(refresh_token: str, path: str | None = None) -> dict | None:
-    """Exchange a refresh token for new credentials.
-
-    POSTs to OAUTH_TOKEN_URL with the grant_type=refresh_token flow.
-    On success, persists the new token dict to disk and returns it.
-    On failure, logs a warning and returns None.
-
-    Args:
-        refresh_token: The refresh token to exchange.
-        path: Destination file path for token storage. Defaults to TOKEN_FILE_PATH.
-
-    Returns:
-        Token dict on success, None on failure.
-    """
+async def _post_refresh_token(refresh_token: str) -> httpx.Response:
+    """Shared transport; callers own strict versus legacy error policy."""
     data = urlencode(
         {
             "grant_type": "refresh_token",
@@ -191,11 +199,16 @@ async def refresh_tokens(refresh_token: str, path: str | None = None) -> dict | 
         "Content-Type": "application/x-www-form-urlencoded",
     }
 
+    async with httpx.AsyncClient() as client:
+        return await client.post(OAUTH_TOKEN_URL, content=data, headers=headers)
+
+
+async def refresh_tokens(refresh_token: str, path: str | None = None) -> dict | None:
+    """Exchange and persist tokens, retaining the legacy soft-failure contract."""
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(OAUTH_TOKEN_URL, content=data, headers=headers)
-            resp.raise_for_status()
-            token_data = resp.json()
+        resp = await _post_refresh_token(refresh_token)
+        resp.raise_for_status()
+        token_data = resp.json()
     except httpx.HTTPStatusError as exc:
         # Server responded with an error status -- carry the status/body so
         # callers can distinguish "refresh token revoked" (e.g. 400
@@ -242,6 +255,160 @@ async def refresh_tokens(refresh_token: str, path: str | None = None) -> dict | 
     }
 
     save_tokens(result, path)
+    return result
+
+
+async def refresh_tokens_strict(
+    tokens: dict, path: str | None = None, *, persist: bool = True
+) -> dict:
+    """Refresh one credential snapshot for discovery without soft failures.
+
+    Identity fallback comes only from the supplied record, never a later disk
+    read. File-backed refreshes compare and atomically save under the same lock
+    used by all Codex credential writers. A replacement during the request is
+    refused, not overwritten. Explicitly injected tokens use ``persist=False``.
+    Arbitrary external writers must honor the path's .lock protocol; advisory
+    locking cannot fence applications that deliberately ignore it.
+    """
+    from amplifier_core import llm_errors
+
+    from .provider import ChatGPTProvider
+
+    provider = "openai-chatgpt"
+    original = copy.deepcopy(tokens)
+    credential_path = Path(path or os.path.expanduser(TOKEN_FILE_PATH)).resolve()
+
+    def changed():
+        return llm_errors.ProviderUnavailableError(
+            "ChatGPT credentials changed during discovery; retry with the current account.",
+            provider=provider,
+            retryable=True,
+        )
+
+    def invalid():
+        return llm_errors.LLMError(
+            "ChatGPT token refresh returned an invalid response.",
+            provider=provider,
+            retryable=False,
+        )
+
+    if not isinstance(original, dict) or any(
+        not isinstance(original.get(key), str) or not original[key].strip()
+        for key in ("refresh_token", "account_id")
+    ):
+        raise llm_errors.AuthenticationError(
+            "ChatGPT discovery requires valid account credentials.",
+            provider=provider,
+            retryable=False,
+        )
+
+    before = None
+    if persist:
+        try:
+            before = credential_path.read_bytes()
+            if json.loads(before) != original:
+                raise changed()
+        except (OSError, ValueError):
+            raise changed() from None
+
+    try:
+        response = await _post_refresh_token(original["refresh_token"])
+    except httpx.TimeoutException:
+        raise llm_errors.LLMTimeoutError(
+            "ChatGPT token refresh timed out.", provider=provider, retryable=True
+        ) from None
+    except httpx.TransportError:
+        raise llm_errors.ProviderUnavailableError(
+            "ChatGPT token refresh connection failed.", provider=provider, retryable=True
+        ) from None
+    except Exception:
+        raise llm_errors.LLMError(
+            "ChatGPT token refresh failed.", provider=provider, retryable=False
+        ) from None
+
+    # Inspect only the OAuth code for classification; never render server text.
+    status = response.status_code
+    if status != 200:
+        try:
+            payload = response.json()
+            code = payload.get("error") if isinstance(payload, dict) else None
+            if isinstance(code, dict):
+                code = code.get("code")
+        except ValueError:
+            code = None
+        if status == 401 or (
+            status == 400
+            and code in ("invalid_grant", "invalid_token", "invalid_refresh_token")
+        ):
+            raise llm_errors.AuthenticationError(
+                "ChatGPT token refresh authentication failed.",
+                provider=provider,
+                status_code=status,
+                retryable=False,
+            )
+        ChatGPTProvider._raise_for_status(status, response.headers, b"", provider)
+
+    try:
+        data = response.json()
+        if not isinstance(data, dict):
+            raise invalid()
+        access_token = data.get("access_token")
+        refresh_token = data.get("refresh_token", original["refresh_token"])
+        expires_in = data.get("expires_in", 3600)
+        if (
+            not isinstance(access_token, str)
+            or re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", access_token) is None
+            or not isinstance(refresh_token, str)
+            or not refresh_token.strip()
+            or isinstance(expires_in, bool)
+            or not isinstance(expires_in, (int, float))
+            or not math.isfinite(expires_in)
+            or expires_in <= 0
+        ):
+            raise invalid()
+        account_id = original["account_id"]
+        plan_type = original.get("plan_type", "")
+        id_token = data.get("id_token")
+        if id_token is not None:
+            if not isinstance(id_token, str) or not extract_account_id(id_token):
+                raise invalid()
+            if extract_account_id(id_token) != account_id:
+                raise llm_errors.AuthenticationError(
+                    "ChatGPT refreshed identity does not match the discovery account.",
+                    provider=provider,
+                    retryable=False,
+                )
+            plan_type = extract_plan_type(id_token) or plan_type
+        result = {
+            **original,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "id_token": id_token,
+            "account_id": account_id,
+            "plan_type": plan_type,
+            "expires_at": (
+                datetime.now(tz=timezone.utc) + timedelta(seconds=expires_in)
+            ).isoformat(),
+        }
+    except llm_errors.LLMError:
+        raise
+    except Exception:
+        raise invalid() from None
+
+    if persist:
+        try:
+            with FileLock(
+                str(credential_path.resolve()) + ".lock", timeout=0, mode=0o600
+            ):
+                if credential_path.read_bytes() != before:
+                    raise changed()
+                _write_tokens_atomic(result, credential_path)
+        except (OSError, FileLockTimeout):
+            raise llm_errors.ProviderUnavailableError(
+                "ChatGPT credentials could not be saved; discovery was not completed.",
+                provider=provider,
+                retryable=True,
+            ) from None
     return result
 
 

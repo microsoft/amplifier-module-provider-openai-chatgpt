@@ -36,6 +36,11 @@ def forbid_external_io(monkeypatch):
         AsyncMock(side_effect=AssertionError("Credential refresh must be stubbed")),
     )
     monkeypatch.setattr(
+        provider_module,
+        "refresh_tokens_strict",
+        AsyncMock(side_effect=AssertionError("Strict refresh must be stubbed")),
+    )
+    monkeypatch.setattr(
         plan_auth,
         "ensure_tokens",
         AsyncMock(side_effect=AssertionError("Plan authentication must be stubbed")),
@@ -314,9 +319,12 @@ async def test_fresh_discovery_refreshes_only_current_file_account(
     storage = Mock(side_effect=[_valid_codex_tokens("first"), expired_second])
     monkeypatch.setattr(provider_module, "load_tokens", storage)
     refresh = AsyncMock(
-        return_value=_valid_codex_tokens("second") if refresh_succeeds else None
+        return_value=_valid_codex_tokens("second"),
+        side_effect=None if refresh_succeeds else llm_errors.AuthenticationError(
+            "Synthetic revoked refresh", provider="openai-chatgpt", retryable=False
+        ),
     )
-    monkeypatch.setattr(provider_module, "refresh_tokens", refresh)
+    monkeypatch.setattr(provider_module, "refresh_tokens_strict", refresh)
     cached = provider._models_cache
     resolved = provider._resolved_default_model
     requests = []
@@ -337,7 +345,7 @@ async def test_fresh_discovery_refreshes_only_current_file_account(
             await provider.discover_models()
         assert len(requests) == 1
     refresh.assert_awaited_once_with(
-        "second-refresh", path="/unused/discovery-credentials.json"
+        expired_second, path="/unused/discovery-credentials.json", persist=True
     )
     assert storage.call_count == 2
     assert provider._models_cache is cached
@@ -365,7 +373,7 @@ async def test_explicit_codex_token_injection_keeps_precedence(monkeypatch, disk
     for request in requests:
         assert request.headers["authorization"] == "Bearer fixture-access-token"
         assert request.headers["chatgpt-account-id"] == "fixture-account"
-    assert storage.call_count == 2
+    storage.assert_not_called()
     assert provider._models_cache is cached
     provider_module.refresh_tokens.assert_not_awaited()
 
@@ -422,7 +430,7 @@ async def test_configured_auth_path_is_preserved(provider, monkeypatch):
     if provider.auth_mode == plan_auth.MODE:
         ensure.assert_awaited_once_with("/unused/discovery-credentials.json")
     else:
-        load.assert_called_once_with(path="/unused/discovery-credentials.json")
+        load.assert_not_called()  # Explicit credentials do not consult the file.
 
 
 @pytest.mark.asyncio
@@ -508,7 +516,8 @@ async def test_malformed_catalog_is_not_success(provider, monkeypatch, payload):
     with pytest.raises(llm_errors.LLMError) as error:
         await provider.discover_models()
     assert error.value.retryable is False
-    assert isinstance(error.value.__cause__, (ValueError, TypeError))
+    assert error.value.__cause__ is None
+    assert error.value.__suppress_context__  # Malformed content can contain secrets.
     assert len(calls) == 1
     assert provider._models_cache is cached
 
@@ -525,7 +534,8 @@ async def test_codex_malformed_support_flag_is_not_empty(monkeypatch, support):
     )
     with pytest.raises(llm_errors.LLMError) as error:
         await provider.discover_models()
-    assert isinstance(error.value.__cause__, ValueError)
+    assert error.value.__cause__ is None
+    assert error.value.__suppress_context__
 
 
 @pytest.mark.asyncio
