@@ -20,8 +20,8 @@ MODELS_ENDPOINT = f"{CHATGPT_CODEX_BASE_URL}/models"
 
 # FRAGILE: This relies on the ChatGPT backend treating any unknown high version
 # as "give me everything". If version gating logic changes, catalog fetches will
-# start returning 0 or filtered entries. Symptom: list_models() always returns
-# FALLBACK_MODELS. Check this constant first when debugging catalog issues.
+# start returning 0 or filtered entries. Canonical list_models() keeps that
+# successful empty response distinct from an error; it never uses FALLBACK_MODELS.
 MODELS_CLIENT_VERSION = "99.99.99"
 
 DEFAULT_CACHE_TTL_SECONDS = 3600
@@ -234,6 +234,12 @@ def _validated_catalog_entries(
     """Reject malformed discovery responses rather than turn them into emptiness."""
     if not isinstance(data, dict) or not isinstance(data.get("models"), list):
         raise ValueError("ChatGPT model catalog must contain a models array")
+    # These routes have no supported pagination request contract in this
+    # adapter. Never report an explicitly partial response as a full catalog.
+    if "has_more" in data and data["has_more"] is not False:
+        raise ValueError("ChatGPT model catalog must be complete")
+    if data.get("next_cursor") or data.get("next_page"):
+        raise ValueError("ChatGPT model catalog pagination is unsupported")
     entries = data["models"]
     for entry in entries:
         if (
@@ -255,7 +261,8 @@ def _validated_catalog_entries(
 
 
 def to_model_infos(
-    entries: list[dict[str, Any]], *, include_speed_variants: bool = True
+    entries: list[dict[str, Any]], *,
+    include_speed_variants: bool = True, strict: bool = False
 ) -> list[ModelInfo]:
     """Convert raw model catalog entries to :class:`~amplifier_core.ModelInfo` objects.
 
@@ -271,6 +278,9 @@ def to_model_infos(
             or taken from :data:`FALLBACK_MODELS`).
         include_speed_variants: Emit legacy synthetic speed-tier IDs. Strict
             discovery disables this so only literal API slugs are returned.
+        strict: Preserve unknown limits as zero (Core's numeric unknown value),
+            rather than supplying the legacy inference fallback output limit.
+            Reject malformed limits instead of accepting coerced values.
 
     Returns:
         Flat list of :class:`~amplifier_core.ModelInfo` objects.
@@ -289,6 +299,17 @@ def to_model_infos(
             and raw_max_output_tokens > 0
             else DEFAULT_MAX_OUTPUT_TOKENS
         )
+        if strict:
+            def limit(key: str) -> int:
+                value = entry.get(key)
+                if value is None:
+                    return 0
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError("ChatGPT model catalog limit must be a nonnegative integer")
+                return value
+
+            context_window = limit("context_window")
+            max_output_tokens = limit("max_output_tokens")
 
         result.append(
             ModelInfo(

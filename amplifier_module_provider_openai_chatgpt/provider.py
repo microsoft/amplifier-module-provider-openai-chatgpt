@@ -15,7 +15,7 @@ import logging
 import math
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -37,6 +37,7 @@ from amplifier_core.utils import redact_secrets
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 
 from . import plan_auth
+from ._model_listing import ModelFilters, selector_schema
 from ._plan_request import prepare_plan_payload
 from ._sse import ParsedResponse, SSEError, parse_sse_events
 from .models import (
@@ -76,6 +77,7 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "priority",
         "models_cache_ttl",
         "models_client_version",
+        "model_filters",
         "use_streaming",
         "instance_id",
         "extra_request_params",
@@ -371,6 +373,9 @@ class ChatGPTProvider:
                 "ChatGPT credentials do not match the selected authentication mode"
             )
         _warn_unknown_config_keys(self._config)
+        self._model_filters = ModelFilters.parse(
+            self._config.get("model_filters", {"include": ["gpt-6*"]})
+        )
 
         self.priority: int = _coerce_int(
             self._config.get("priority"), key="priority", default=100
@@ -536,8 +541,8 @@ class ChatGPTProvider:
         inheriting a provider-wide 1M claim.
 
         When ``default_model`` is the ``"latest"`` sentinel and resolution
-        hasn't happened yet on this instance (no `complete()` or
-        `list_models()` call has occurred), it presents the sentinel plus
+        hasn't happened yet on this instance (no `complete()` call has
+        needed it), it presents the sentinel plus
         the fallback that would apply if resolution can't reach the live
         catalog -- e.g. ``"latest (resolves lazily; falls back to
         gpt-5.6-sol)"`` -- rather than silently showing a placeholder as if
@@ -621,19 +626,25 @@ class ChatGPTProvider:
             ],
         )
 
-    async def list_models(self) -> list[ModelInfo]:
-        """Return ModelInfo objects for all available ChatGPT models.
+    def get_model_list_info(self) -> dict[str, Any]:
+        """Describe the selector extension locally, without authentication or I/O."""
+        return {
+            "version": 1,
+            "source": "provider-api",
+            "filters_keyword": "filters",
+            "filters_schema": selector_schema(),
+            "default_filters": self._model_filters.as_dict(),
+            "unfiltered": {},
+            "override": "replace",
+        }
 
-        Delegates to :meth:`_get_catalog`, which fetches the live model
-        catalog from the API and caches it for :attr:`_models_cache_ttl`
-        seconds.  Falls back to a built-in list on any error.
-        """
-        return await self._get_catalog()
+    async def list_models(
+        self, *, filters: Mapping[str, object] | None = None
+    ) -> list[ModelInfo]:
+        """Fetch current account models without fallback, synthetic IDs, or caching.
 
-    async def discover_models(self) -> dict[str, Any]:
-        """Fetch current account inventory without fallback, aliases, or caching.
-
-        This optional host-facing contract is separate from ``list_models()``.
+        None uses the immutable configured defaults (gpt-6* when unconfigured).
+        An explicit mapping replaces those defaults; {} disables all selectors.
         Both authentication modes have real catalogs. Empty successful catalogs
         stay empty; failures raise the existing kernel error types. Selection
         settings (model, default_model, reasoning_effort, priority) do not select,
@@ -642,6 +653,7 @@ class ChatGPTProvider:
         injection keeps its existing precedence. Plan authentication already
         resolves the configured file on every call.
         """
+        policy = self._model_filters if filters is None else ModelFilters.parse(filters)
         try:
             await self._ensure_valid_tokens(fresh_from_file=True)
             if self.auth_mode == plan_auth.MODE:
@@ -657,7 +669,7 @@ class ChatGPTProvider:
                     client_version=self.models_client_version,
                     strict=True,
                 )
-            models = to_model_infos(entries, include_speed_variants=False)
+            models = to_model_infos(entries, include_speed_variants=False, strict=True)
         except kernel_errors.LLMError:
             raise
         except httpx.TimeoutException:
@@ -678,7 +690,10 @@ class ChatGPTProvider:
                 provider=self.name,
                 retryable=False,
             ) from None
-        return {"version": 1, "source": "provider-api", "models": models}
+        selected = set(policy.select([model.id for model in models]))
+        # Keep endpoint order (used by existing callers), byte-exact IDs and
+        # metadata. Selectors never change inference configuration or caches.
+        return [model for model in models if model.id in selected]
 
     async def _get_catalog(self) -> list[ModelInfo]:
         """Fetch and cache the live model catalog.
@@ -777,8 +792,8 @@ class ChatGPTProvider:
            requests, not to resolving what model name to use) or when the
            live catalog is reachable but returns no non-variant entry.
 
-        Resolved LAZILY on first call (from :meth:`complete` or
-        :meth:`list_models`), then cached on ``self._resolved_default_model``
+        Resolved LAZILY on first need from :meth:`complete`, then cached
+        on ``self._resolved_default_model``
         for the provider instance's lifetime. Emits exactly one INFO log
         line recording what "latest" resolved to and why.
         """

@@ -9,7 +9,8 @@ from unittest.mock import AsyncMock, Mock, call
 
 import httpx
 import pytest
-from amplifier_core import llm_errors
+from amplifier_core import ModelInfo, llm_errors
+from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_openai_chatgpt import models, plan_auth
 from amplifier_module_provider_openai_chatgpt import provider as provider_module
@@ -104,15 +105,17 @@ def _install_transport(monkeypatch, handler):
 
 
 def _ids(result):
-    assert set(result) == {"version", "source", "models"}
-    assert result["version"] == 1
-    assert result["source"] == "provider-api"
-    return [model.id for model in result["models"]]
+    assert isinstance(result, list)
+    return [model.id for model in result]
 
 
-def test_optional_contract_has_no_required_arguments():
-    assert inspect.iscoroutinefunction(ChatGPTProvider.discover_models)
-    assert list(inspect.signature(ChatGPTProvider.discover_models).parameters) == ["self"]
+def test_canonical_contract_has_no_required_arguments():
+    assert not hasattr(ChatGPTProvider, "discover_models")
+    assert inspect.iscoroutinefunction(ChatGPTProvider.list_models)
+    parameters = inspect.signature(ChatGPTProvider.list_models).parameters
+    assert list(parameters) == ["self", "filters"]
+    assert parameters["filters"].kind == inspect.Parameter.KEYWORD_ONLY
+    assert parameters["filters"].default is None
 
 
 @pytest.mark.asyncio
@@ -137,13 +140,13 @@ async def test_exact_ids_empty_and_repeated_calls_are_fresh(provider, monkeypatc
     constructions = _install_transport(monkeypatch, handle)
     cached = provider._models_cache
     resolved = provider._resolved_default_model
-    first = await provider.discover_models()
+    first = await provider.list_models(filters={})
     assert _ids(first) == ["account-zeta", "literal-fast"]
-    assert first["models"][0].display_name == "Display account-zeta"
-    assert first["models"][0].context_window == 64_000
-    assert first["models"][0].max_output_tokens == 8_000
-    assert _ids(await provider.discover_models()) == []
-    assert _ids(await provider.discover_models()) == ["new-account-model"]
+    assert first[0].display_name == "Display account-zeta"
+    assert first[0].context_window == 64_000
+    assert first[0].max_output_tokens == 8_000
+    assert _ids(await provider.list_models(filters={})) == []
+    assert _ids(await provider.list_models(filters={})) == ["new-account-model"]
     assert len(requests) == len(constructions) == 3
     assert provider._ensure_valid_tokens.await_count == 3
     assert provider._models_cache is cached
@@ -192,7 +195,7 @@ async def test_discovery_never_reads_or_writes_legacy_caches(provider, monkeypat
     _install_transport(
         monkeypatch, lambda request: httpx.Response(200, json={"models": []})
     )
-    assert _ids(await provider.discover_models()) == []
+    assert _ids(await provider.list_models(filters={})) == []
 
 
 @pytest.mark.asyncio
@@ -204,7 +207,7 @@ async def test_selection_fields_do_not_change_inventory_or_request(provider, mon
         return httpx.Response(200, json={"models": [_entry("live-account-model")]})
 
     _install_transport(monkeypatch, handle)
-    before = await provider.discover_models()
+    before = await provider.list_models(filters={})
     provider.config.update(
         model="different-selection",
         default_model="latest",
@@ -214,7 +217,7 @@ async def test_selection_fields_do_not_change_inventory_or_request(provider, mon
     provider.default_model = "latest"
     provider.reasoning_effort = "low"
     provider.priority = -20
-    after = await provider.discover_models()
+    after = await provider.list_models(filters={})
     assert before == after
     assert requests[0].url == requests[1].url
     assert requests[0].headers == requests[1].headers
@@ -243,8 +246,8 @@ async def test_auth_refresh_scope_is_used_on_each_call(provider, monkeypatch):
         return httpx.Response(200, json={"models": []})
 
     _install_transport(monkeypatch, handle)
-    await provider.discover_models()
-    await provider.discover_models()
+    await provider.list_models(filters={})
+    await provider.list_models(filters={})
     assert len(requests) == 2
     assert [r.headers["authorization"] for r in requests] == [
         "Bearer first-token",
@@ -296,9 +299,9 @@ async def test_removed_or_invalid_file_cannot_reuse_previous_account(
         return httpx.Response(200, json={"models": []})
 
     _install_transport(monkeypatch, handle)
-    assert _ids(await provider.discover_models()) == []
+    assert _ids(await provider.list_models(filters={})) == []
     with pytest.raises(llm_errors.AuthenticationError, match="configured credential file"):
-        await provider.discover_models()
+        await provider.list_models(filters={})
     assert len(requests) == 1
     assert storage.call_count == 2
     provider_module.refresh_tokens.assert_not_awaited()
@@ -334,15 +337,15 @@ async def test_fresh_discovery_refreshes_only_current_file_account(
         return httpx.Response(200, json={"models": []})
 
     _install_transport(monkeypatch, handle)
-    await provider.discover_models()
+    await provider.list_models(filters={})
     if refresh_succeeds:
-        await provider.discover_models()
+        await provider.list_models(filters={})
         assert len(requests) == 2
         assert requests[1].headers["authorization"] == "Bearer second-token"
         assert requests[1].headers["chatgpt-account-id"] == "second-account"
     else:
         with pytest.raises(llm_errors.AuthenticationError):
-            await provider.discover_models()
+            await provider.list_models(filters={})
         assert len(requests) == 1
     refresh.assert_awaited_once_with(
         expired_second, path="/unused/discovery-credentials.json", persist=True
@@ -367,8 +370,8 @@ async def test_explicit_codex_token_injection_keeps_precedence(monkeypatch, disk
         return httpx.Response(200, json={"models": []})
 
     _install_transport(monkeypatch, handle)
-    await provider.discover_models()
-    await provider.discover_models()
+    await provider.list_models(filters={})
+    await provider.list_models(filters={})
     assert len(requests) == 2
     for request in requests:
         assert request.headers["authorization"] == "Bearer fixture-access-token"
@@ -389,7 +392,7 @@ async def test_discovery_does_not_switch_auth_mode_for_replaced_file(monkeypatch
     )
     cached = provider._models_cache
     with pytest.raises(llm_errors.AuthenticationError, match="auth_mode=chatgpt_plan"):
-        await provider.discover_models()
+        await provider.list_models(filters={})
     assert provider.auth_mode == CODEX_MODE
     assert provider._models_cache is cached
     httpx.AsyncClient.assert_not_called()
@@ -426,7 +429,7 @@ async def test_configured_auth_path_is_preserved(provider, monkeypatch):
     _install_transport(
         monkeypatch, lambda request: httpx.Response(200, json={"models": []})
     )
-    assert _ids(await provider.discover_models()) == []
+    assert _ids(await provider.list_models(filters={})) == []
     if provider.auth_mode == plan_auth.MODE:
         ensure.assert_awaited_once_with("/unused/discovery-credentials.json")
     else:
@@ -455,7 +458,7 @@ async def test_http_failure_is_typed_not_empty_or_fallback(
     )
     cached = provider._models_cache
     with pytest.raises(expected) as error:
-        await provider.discover_models()
+        await provider.list_models(filters={})
     assert error.value.status_code == status
     assert error.value.provider == provider.name
     assert provider._models_cache is cached
@@ -479,7 +482,7 @@ async def test_transport_failure_is_typed_without_fallback(
     _install_transport(monkeypatch, handle)
     cached = provider._models_cache
     with pytest.raises(expected) as error:
-        await provider.discover_models()
+        await provider.list_models(filters={})
     assert error.value.retryable is True
     assert provider._models_cache is cached
 
@@ -501,6 +504,11 @@ async def test_transport_failure_is_typed_without_fallback(
         {"models": [_entry("valid"), None]},
         {"models": [_entry("invalid-metadata", context_window={})]},
         {"models": [_entry("invalid-visibility", visibility=[])]},
+        {"models": [_entry("gpt-6-partial")], "has_more": True},
+        {"models": [], "has_more": "false"},
+        {"models": [], "has_more": None},
+        {"models": [_entry("gpt-6-partial")], "next_cursor": "another-page"},
+        {"models": [_entry("gpt-6-partial")], "next_page": "another-page"},
     ],
 )
 async def test_malformed_catalog_is_not_success(provider, monkeypatch, payload):
@@ -514,7 +522,7 @@ async def test_malformed_catalog_is_not_success(provider, monkeypatch, payload):
     _install_transport(monkeypatch, handle)
     cached = provider._models_cache
     with pytest.raises(llm_errors.LLMError) as error:
-        await provider.discover_models()
+        await provider.list_models(filters={})
     assert error.value.retryable is False
     assert error.value.__cause__ is None
     assert error.value.__suppress_context__  # Malformed content can contain secrets.
@@ -533,7 +541,7 @@ async def test_codex_malformed_support_flag_is_not_empty(monkeypatch, support):
         monkeypatch, lambda request: httpx.Response(200, json={"models": [entry]})
     )
     with pytest.raises(llm_errors.LLMError) as error:
-        await provider.discover_models()
+        await provider.list_models(filters={})
     assert error.value.__cause__ is None
     assert error.value.__suppress_context__
 
@@ -548,7 +556,7 @@ async def test_filtered_empty_catalog_remains_empty(provider, monkeypatch):
     _install_transport(
         monkeypatch, lambda request: httpx.Response(200, json={"models": entries})
     )
-    assert _ids(await provider.discover_models()) == []
+    assert _ids(await provider.list_models(filters={})) == []
 
 
 @pytest.mark.asyncio
@@ -564,8 +572,8 @@ async def test_failure_does_not_prevent_fresh_discovery(provider, monkeypatch):
     _install_transport(monkeypatch, handle)
     cached = provider._models_cache
     with pytest.raises(llm_errors.ProviderUnavailableError):
-        await provider.discover_models()
-    assert _ids(await provider.discover_models()) == ["recovered-model"]
+        await provider.list_models(filters={})
+    assert _ids(await provider.list_models(filters={})) == ["recovered-model"]
     assert len(calls) == 2
     assert provider._models_cache is cached
 
@@ -576,7 +584,7 @@ async def test_invalid_json_is_typed(provider, monkeypatch):
         monkeypatch, lambda request: httpx.Response(200, text="not-json")
     )
     with pytest.raises(llm_errors.LLMError):
-        await provider.discover_models()
+        await provider.list_models(filters={})
 
 
 @pytest.mark.asyncio
@@ -584,7 +592,7 @@ async def test_auth_failure_propagates_unchanged_before_http(provider):
     failure = llm_errors.AuthenticationError("Login required", provider=provider.name)
     provider._ensure_valid_tokens = AsyncMock(side_effect=failure)
     with pytest.raises(llm_errors.AuthenticationError) as error:
-        await provider.discover_models()
+        await provider.list_models(filters={})
     assert error.value is failure
     httpx.AsyncClient.assert_not_called()
 
@@ -596,13 +604,13 @@ async def test_cancellation_is_not_relabelled(provider, monkeypatch):
 
     _install_transport(monkeypatch, handle)
     with pytest.raises(asyncio.CancelledError):
-        await provider.discover_models()
+        await provider.list_models(filters={})
 
 
 @pytest.mark.asyncio
-async def test_legacy_list_cache_and_aliases_are_unchanged(provider, monkeypatch):
+async def test_inference_catalog_cache_and_aliases_are_unchanged(provider, monkeypatch):
     cached = provider._models_cache
-    assert await provider.list_models() is cached[1]
+    assert await provider._get_catalog() is cached[1]
     httpx.AsyncClient.assert_not_called()
     provider._models_cache = None
     calls = []
@@ -614,17 +622,17 @@ async def test_legacy_list_cache_and_aliases_are_unchanged(provider, monkeypatch
         )
 
     _install_transport(monkeypatch, handle)
-    listed = await provider.list_models()
+    listed = await provider._get_catalog()
     assert [m.id for m in listed] == (
         ["live", "live-fast"] if provider.auth_mode == CODEX_MODE else ["live"]
     )
-    assert await provider.list_models() is listed
+    assert await provider._get_catalog() is listed
     assert len(calls) == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("empty", [False, True])
-async def test_legacy_empty_and_failure_contract_is_unchanged(provider, monkeypatch, empty):
+async def test_inference_empty_and_failure_contract_is_unchanged(provider, monkeypatch, empty):
     provider._models_cache = None
     _install_transport(
         monkeypatch,
@@ -634,10 +642,10 @@ async def test_legacy_empty_and_failure_contract_is_unchanged(provider, monkeypa
         ),
     )
     if provider.auth_mode == CODEX_MODE:
-        assert await provider.list_models() == models.to_model_infos(models.FALLBACK_MODELS)
+        assert await provider._get_catalog() == models.to_model_infos(models.FALLBACK_MODELS)
     else:
         with pytest.raises(ValueError if empty else llm_errors.ProviderUnavailableError):
-            await provider.list_models()
+            await provider._get_catalog()
     assert provider._models_cache is None
 
 
@@ -648,3 +656,192 @@ async def test_legacy_codex_fetch_still_raises_value_error(monkeypatch):
     )
     with pytest.raises(ValueError, match="401"):
         await models.fetch_models(access_token="fixture-token", account_id="fixture")
+
+
+@pytest.mark.asyncio
+async def test_default_gpt6_exact_account_ids_and_unknown_limits(provider, monkeypatch):
+    returned = [
+        "gpt-6-astra", "gpt-6.1-sol", "gpt-6-preview", "GpT-6-new-tier",
+        "gpt-6-astra-2026-10-01", "gpt-6-literal-fast", "gpt-5.4", "unknown-future",
+    ]
+    entries = [_entry(slug, additional_speed_tiers=["fast"]) for slug in returned]
+    del entries[3]["context_window"]
+    del entries[3]["max_output_tokens"]
+    _install_transport(
+        monkeypatch, lambda _: httpx.Response(200, json={"models": entries})
+    )
+    rows = await provider.list_models()
+    assert all(isinstance(row, ModelInfo) for row in rows)
+    assert _ids(rows) == returned[:6]
+    assert rows[3].context_window == rows[3].max_output_tokens == 0
+    assert rows[3].capabilities == [] and rows[3].defaults == {}
+    assert _ids(await provider.list_models(filters=None)) == returned[:6]
+    assert _ids(await provider.list_models(filters={})) == returned
+    # Nothing fabricated from additional_speed_tiers, even for a literal -fast ID.
+    assert "gpt-6-astra-fast" not in _ids(rows)
+    assert "gpt-6-literal-fast-fast" not in _ids(rows)
+
+
+# Common conformance vectors from OpenAI PR141, commit 38b7b26.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector,expected", [
+    ({"include": ["gpt-5*", "o3-*"], "exclude": ["*-deep-research"]},
+     {"gpt-5.6", "o3-mini"}),
+    ({"include": []}, set()),
+    ({"exclude": ["gpt-*"]}, {"o3-mini", "o3-deep-research"}),
+    ({"include": ["GPT-6*"]}, {"gpt-6-solx"}),
+    ({"include": ["gpt-6-????"]}, {"gpt-6-solx"}),
+    ({"include": ["gpt-6-[st]*"], "exclude": ["GPT-6*"]}, set()),
+])
+async def test_custom_filters_replace_defaults(provider, monkeypatch, selector, expected):
+    entries = [_entry(slug) for slug in [
+        "gpt-5.6", "gpt-6-solx", "o3-mini", "o3-deep-research",
+    ]]
+    _install_transport(
+        monkeypatch, lambda _: httpx.Response(200, json={"models": entries})
+    )
+    assert set(_ids(await provider.list_models(filters=selector))) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector,expected", [
+    ({"hide_dated": True},
+     {"gpt-6-sol", "gpt-6-only-2026-10-01", "gpt-6-preview"}),
+    ({"hide_dated": True, "exclude": ["gpt-6-sol"]},
+     {"gpt-6-sol-2026-10-01", "gpt-6-only-2026-10-01", "gpt-6-preview"}),
+    ({"include": ["*-2026-10-01"], "hide_dated": True},
+     {"gpt-6-sol-2026-10-01", "gpt-6-only-2026-10-01"}),
+])
+async def test_dated_alias_conformance(provider, monkeypatch, selector, expected):
+    entries = [_entry(slug) for slug in [
+        "gpt-6-sol", "gpt-6-sol-2026-10-01", "gpt-6-only-2026-10-01", "gpt-6-preview",
+    ]]
+    _install_transport(
+        monkeypatch, lambda _: httpx.Response(200, json={"models": entries})
+    )
+    assert set(_ids(await provider.list_models(filters=selector))) == expected
+
+
+@pytest.mark.asyncio
+async def test_config_and_metadata_are_immutable_snapshots(monkeypatch, provider):
+    config = {"include": ["gpt-5*"], "exclude": [], "hide_dated": True}
+    p = ChatGPTProvider(
+        {"auth_mode": provider.auth_mode, "model_filters": config},
+        tokens=provider._tokens,
+    )
+    p._ensure_valid_tokens = AsyncMock()
+    info = p.get_model_list_info()
+    assert set(info) == {
+        "version", "source", "filters_keyword", "filters_schema",
+        "default_filters", "unfiltered", "override",
+    }
+    assert info["version"] == 1 and info["source"] == "provider-api"
+    assert info["filters_keyword"] == "filters" and info["override"] == "replace"
+    assert info["unfiltered"] == {}
+    assert provider.get_model_list_info()["default_filters"] == {
+        "include": ["gpt-6*"], "exclude": [], "hide_dated": False,
+    }
+    httpx.AsyncClient.assert_not_called()
+    config["include"].append("*")
+    p.config["model_filters"]["exclude"].append("*")
+    info["default_filters"]["include"].clear()
+    info["filters_schema"]["properties"].clear()
+    returned = ["gpt-5.4", "gpt-5.4-2026-10-01", "gpt-6-sol", "future"]
+    _install_transport(monkeypatch, lambda _: httpx.Response(
+        200, json={"models": [_entry(slug) for slug in returned]}
+    ))
+    assert _ids(await p.list_models()) == ["gpt-5.4"]
+    assert _ids(await p.list_models(filters={})) == returned
+    assert _ids(await p.list_models(filters={"include": []})) == []
+    assert p.get_model_list_info()["default_filters"]["include"] == ["gpt-5*"]
+    assert p.get_model_list_info()["filters_schema"]["properties"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filters", [
+    False, "all", [], {"include": "*"}, {"include": [None]}, {"include": [""]},
+    {"include": [" "]}, {"exclude": [1]}, {"hide_dated": "false"},
+    {"hide_dated": None}, {"typo": True},
+])
+async def test_invalid_filters_fail_before_auth_or_io(provider, filters):
+    with pytest.raises((TypeError, ValueError)):
+        ChatGPTProvider({"model_filters": filters})
+    with pytest.raises((TypeError, ValueError)):
+        await provider.list_models(filters=filters)
+    provider._ensure_valid_tokens.assert_not_awaited()
+    httpx.AsyncClient.assert_not_called()
+
+
+def test_explicit_null_config_is_invalid():
+    with pytest.raises(TypeError):
+        ChatGPTProvider({"model_filters": None})
+
+
+@pytest.mark.asyncio
+async def test_override_snapshots_before_await_and_does_not_mutate_defaults(
+    provider, monkeypatch,
+):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def handle(_):
+        entered.set()
+        await release.wait()
+        return httpx.Response(200, json={"models": [
+            _entry("gpt-5.4"), _entry("GpT-6-Preview"),
+        ]})
+
+    _install_transport(monkeypatch, handle)
+    custom = {"include": ["gpt-5*"]}
+    task = asyncio.create_task(provider.list_models(filters=custom))
+    await entered.wait()
+    custom["include"][:] = ["*"]
+    second = asyncio.create_task(provider.list_models())
+    release.set()
+    assert _ids(await task) == ["gpt-5.4"]
+    assert _ids(await second) == ["GpT-6-Preview"]
+    assert _ids(await provider.list_models(filters={
+        "include": ["gPt-6*"], "exclude": ["*PREVIEW"],
+    })) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["context_window", "max_output_tokens"])
+@pytest.mark.parametrize("value", [True, -1, "128000", {}, []])
+async def test_malformed_limits_never_become_fabricated_metadata(
+    provider, monkeypatch, key, value,
+):
+    _install_transport(monkeypatch, lambda _: httpx.Response(
+        200, json={"models": [_entry("gpt-6-sol", **{key: value})]}
+    ))
+    with pytest.raises(llm_errors.LLMError) as caught:
+        await provider.list_models()
+    assert caught.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_explicit_older_inference_survives_listing_policy(provider, monkeypatch):
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json={"models": [
+                _entry("gpt-5.4"), _entry("gpt-6-sol"),
+            ]})
+        payload = json.loads(request.content)
+        assert payload["model"] == "gpt-5.4"
+        assert payload["reasoning"]["effort"] == "high"
+        assert "service_tier" not in payload
+        return httpx.Response(200, text="data: " + json.dumps({
+            "type": "response.completed",
+            "response": {"id": "fixture-response", "model": "gpt-5.4",
+                         "output": [], "usage": {"input_tokens": 1, "output_tokens": 0}},
+        }) + "\n\n")
+
+    _install_transport(monkeypatch, handle)
+    assert _ids(await provider.list_models()) == ["gpt-6-sol"]
+    assert _ids(await provider.list_models(filters={"include": ["gpt-5*"]})) == ["gpt-5.4"]
+    await provider.complete(ChatRequest(
+        model="gpt-5.4", messages=[Message(role="user", content="fixture")],
+    ))
+    assert [request.method for request in requests] == ["GET", "GET", "POST"]

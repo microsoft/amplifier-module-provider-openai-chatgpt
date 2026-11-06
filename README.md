@@ -60,8 +60,9 @@ selection and additional tuning can be supplied by the host or configuration.
 | `min_retry_delay` | float | `1` | Initial/base exponential backoff in seconds, not a jittered minimum. |
 | `max_retry_delay` | float | `60` | Base backoff cap and maximum accepted server wait hint. |
 | `retry_jitter` | bool | `true` | Apply Core's jitter to backoff. |
-| `models_cache_ttl` | float | `3600` | How long (seconds) to cache the live model catalog before re-fetching |
+| `models_cache_ttl` | float | `3600` | Inference-only catalog cache lifetime; canonical `list_models()` always fetches fresh |
 | `models_client_version` | str | `"99.99.99"` | Settings-only override for the model-catalog version-gating constant (see `models.py`'s `MODELS_CLIENT_VERSION` -- FRAGILE, relies on the ChatGPT backend treating any unknown high version as "give me everything") |
+| `model_filters` | mapping | `{"include": ["gpt-6*"]}` | Immutable recommendation defaults for `list_models()`. Supports `include`, `exclude`, and `hide_dated`; does not restrict explicit inference. |
 | `use_streaming` | bool | `true` | Set `false` to force non-streaming completions |
 | `reasoning_effort` | str | *(unset)* | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Lands as `reasoning.effort`; an explicit request value wins. `none` or unset means "don't inject -- let the model decide". Invalid values fail at mount. |
 | `priority` | int | `100` | Read by the orchestrator's provider-selection logic |
@@ -71,6 +72,48 @@ Boolean and numeric keys accept native types or the string forms a config
 wizard writes (`"true"`/`"false"`); invalid numeric strings warn and fall
 back to the default rather than crashing at mount. Unrecognized config
 keys produce a mount-time warning (with a did-you-mean suggestion).
+
+### Fresh account model listing
+
+Both modes implement `await provider.list_models(*, filters=None)` returning
+Core `list[ModelInfo]`. Each call reads the current bound account and requests
+its catalog. There is no catalog-cache or static-list fallback. A successful
+empty catalog returns `[]`; authentication, transport, malformed or explicitly
+partial responses raise typed errors. The candidate-only `discover_models()`
+method has been removed in favor of this canonical method.
+
+```python
+await provider.list_models()                         # configured defaults: gpt-6*
+await provider.list_models(filters=None)             # same defaults
+await provider.list_models(filters={})               # all account-listed API models
+await provider.list_models(filters={"include": ["gpt-5*"]})  # replace defaults
+await provider.list_models(filters={"include": []})  # no recommendations
+```
+
+`include` and `exclude` accept lists of case-insensitive, OS-independent glob
+patterns; exclusion wins. An explicit mapping **replaces**, not merges with,
+the configured defaults. `{}` also disables configured dated suppression.
+`hide_dated: true` hides a `YYYY-MM-DD` snapshot only when its matching undated
+alias is selected. It defaults to false for this provider: all actual `gpt-6*`
+tiers, previews and snapshots remain recommended, in endpoint order. This is
+not an intelligence ranking. IDs preserve their exact endpoint bytes.
+Endpoint visibility/API eligibility still applies; overrides do not invent
+access to hidden or unsupported entries.
+
+No synthetic `-fast` models are added, including when the endpoint advertises
+speed tiers. A literal endpoint ID ending in `-fast` remains literal inventory.
+Missing limits are reported as `0` (unknown), not a guessed context or output
+budget; no capabilities are inferred. `get_model_list_info()` describes this
+extension without I/O using version 1, source `provider-api`, `filters_keyword`,
+`filters_schema`, `default_filters`, `unfiltered: {}`, and `override: replace`.
+Configuration and returned metadata are independent snapshots; invalid filter
+types or keys fail before authentication.
+
+Listing does not alter an explicit inference model, request parameters, or
+the existing inference-only `latest` resolution/cache. Older models remain
+usable by exact supported ID. The legacy Codex `-fast` inference shorthand is
+unchanged, but is not advertised as a separate account model. Plan inference
+continues to pass exact IDs without that remapping.
 
 ### Completion retries
 
@@ -170,7 +213,7 @@ Works in SSH/headless sessions -- the device code flow only requires a browser o
 - OAuth device code authentication with PKCE (no API key needed)
 - Raw httpx + manual SSE streaming (not the OpenAI SDK)
 - Automatic token refresh with 4-step fallback chain
-- Dynamic model catalog from live API (cached, with fallback)
+- Fresh account model recommendations with explicit filter overrides; inference-only cache/fallback remains separate
 - Subscription plan type detection from OAuth JWT
 - Tool calling support
 - Reasoning effort support (`low`/`medium`/`high` across all catalog models;

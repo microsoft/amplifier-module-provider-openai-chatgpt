@@ -298,10 +298,8 @@ def _catalog_response():
 
 
 def _assert_result(result):
-    assert set(result) == {"version", "source", "models"}
-    assert result["version"] == 1
-    assert result["source"] == "provider-api"
-    assert [model.id for model in result["models"]] == ["account-A-live-model"]
+    assert isinstance(result, list)
+    assert [model.id for model in result] == ["account-A-live-model"]
 
 
 def _assert_one_refresh(requests):
@@ -355,7 +353,7 @@ async def test_file_changed_during_refresh_fails_without_catalog_or_overwrite(
 
     requests = _install_transport(monkeypatch, handle)
     caplog.set_level(logging.DEBUG)
-    task = asyncio.create_task(provider.discover_models())
+    task = asyncio.create_task(provider.list_models(filters={}))
     try:
         await asyncio.wait_for(entered.wait(), timeout=5)
         assert not task.done()
@@ -432,7 +430,7 @@ async def test_strict_commit_serializes_with_subprocess_save_tokens(
         return _catalog_response()
 
     requests = _install_transport(monkeypatch, handle)
-    _assert_result(await provider.discover_models())
+    _assert_result(await provider.list_models(filters={}))
     assert [request.method for request in requests] == ["POST", "GET"]
     assert len(children) == len(committed) == 1
     child = children[0]
@@ -468,7 +466,7 @@ async def test_subprocess_save_during_refresh_post_is_preserved(
 
     requests = _install_transport(monkeypatch, handle)
     caplog.set_level(logging.DEBUG)
-    task = asyncio.create_task(provider.discover_models())
+    task = asyncio.create_task(provider.list_models(filters={}))
     try:
         await asyncio.wait_for(entered.wait(), timeout=5)
         child = credential_process(path, "save")
@@ -515,7 +513,7 @@ async def test_subprocess_lock_contention_is_retryable_without_overwrite(
     requests = _install_transport(monkeypatch, handle)
     caplog.set_level(logging.DEBUG)
     with pytest.raises(llm_errors.ProviderUnavailableError) as caught:
-        await asyncio.wait_for(provider.discover_models(), timeout=5)
+        await asyncio.wait_for(provider.list_models(filters={}), timeout=5)
     _assert_safe_error(
         caught.value, caplog, llm_errors.ProviderUnavailableError, retryable=True
     )
@@ -558,7 +556,7 @@ async def test_same_account_refresh_saves_credentials_before_catalog(
         return _catalog_response()
 
     requests = _install_transport(monkeypatch, handle)
-    _assert_result(await provider.discover_models())
+    _assert_result(await provider.list_models(filters={}))
     finished = datetime.now(tz=timezone.utc)
     assert [request.method for request in requests] == ["POST", "GET"]
     assert path.read_bytes() != before_bytes
@@ -590,7 +588,7 @@ async def test_refreshed_id_token_cannot_change_account(
     requests = _install_transport(monkeypatch, handle)
     caplog.set_level(logging.DEBUG)
     with pytest.raises(llm_errors.AuthenticationError) as caught:
-        await provider.discover_models()
+        await provider.list_models(filters={})
     _assert_safe_error(
         caught.value, caplog, llm_errors.AuthenticationError, retryable=False
     )
@@ -622,7 +620,7 @@ async def test_refresh_transport_errors_are_typed_safe_and_leave_file_unchanged(
     requests = _install_transport(monkeypatch, handle)
     caplog.set_level(logging.DEBUG)
     with pytest.raises(expected) as caught:
-        await provider.discover_models()
+        await provider.list_models(filters={})
     _assert_safe_error(caught.value, caplog, expected, retryable=True)
     _assert_one_refresh(requests)
     assert path.read_bytes() == original_bytes
@@ -661,7 +659,7 @@ async def test_refresh_http_errors_preserve_type_status_retry_hint_not_secrets(
     requests = _install_transport(monkeypatch, handle)
     caplog.set_level(logging.DEBUG)
     with pytest.raises(expected) as caught:
-        await provider.discover_models()
+        await provider.list_models(filters={})
     _assert_safe_error(
         caught.value,
         caplog,
@@ -742,7 +740,7 @@ async def test_malformed_refresh_is_not_auth_success_and_does_not_mutate_file(
     requests = _install_transport(monkeypatch, handle)
     caplog.set_level(logging.DEBUG)
     with pytest.raises(llm_errors.LLMError) as caught:
-        await provider.discover_models()
+        await provider.list_models(filters={})
     _assert_safe_error(caught.value, caplog, llm_errors.LLMError, retryable=False)
     _assert_one_refresh(requests)
     assert path.read_bytes() == original_bytes
@@ -771,7 +769,7 @@ async def test_injected_expired_tokens_refresh_own_account_without_persisting(
         return _catalog_response()
 
     requests = _install_transport(monkeypatch, handle)
-    _assert_result(await provider.discover_models())
+    _assert_result(await provider.list_models(filters={}))
     assert [request.method for request in requests] == ["POST", "GET"]
     if disk_exists:
         assert path.read_bytes() == original_bytes
@@ -798,7 +796,7 @@ async def test_cancellation_during_refresh_leaves_credentials_and_skips_catalog(
         return httpx.Response(200, json=_refreshed())
 
     requests = _install_transport(monkeypatch, handle)
-    task = asyncio.create_task(provider.discover_models())
+    task = asyncio.create_task(provider.list_models(filters={}))
     try:
         await asyncio.wait_for(entered.wait(), timeout=5)
         task.cancel()
