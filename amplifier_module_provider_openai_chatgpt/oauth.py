@@ -100,8 +100,15 @@ def _write_tokens_atomic(tokens: dict, path: Path) -> None:
     """Replace a complete 0600 record; caller holds the credential-path lock."""
     fd, temporary = tempfile.mkstemp(prefix=".chatgpt-", dir=path.parent)
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        try:
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)  # fdopen did not take ownership.
+            raise
+        with handle:
+            # chmod(path) is available on Windows as well as POSIX. Transfer
+            # fd ownership first so permission failures also close the handle.
+            os.chmod(temporary, 0o600)
             json.dump(tokens, handle)
             handle.flush()
             os.fsync(handle.fileno())
