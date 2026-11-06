@@ -150,6 +150,8 @@ async def fetch_models(
     access_token: str,
     account_id: str,
     timeout: float = 30.0,
+    client_version: str | None = None,
+    strict: bool = False,
 ) -> list[dict[str, Any]]:
     """Fetch the live model catalog from the ChatGPT API.
 
@@ -161,13 +163,17 @@ async def fetch_models(
         access_token: OAuth Bearer access token.
         account_id: ChatGPT account ID (``ChatGPT-Account-Id`` header).
         timeout: HTTP request timeout in seconds (default 30.0).
+        client_version: Catalog version-gating parameter.
+        strict: Validate the response and raise typed HTTP errors for discovery.
+            The default retains the legacy fetch/error contract.
 
     Returns:
         List of model entry dicts with ``visibility != "hide"`` and
         ``supported_in_api is True``.
 
     Raises:
-        ValueError: If the API returns a non-200 status code.
+        ValueError: For a non-200 status in legacy mode, or an invalid catalog
+            in strict mode. Strict HTTP failures use kernel LLMError subtypes.
     """
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -176,17 +182,43 @@ async def fetch_models(
         "OpenAI-Originator": "codex",
         "accept": "application/json",
     }
-    params = {"client_version": MODELS_CLIENT_VERSION}
+    params = {
+        "client_version": (
+            MODELS_CLIENT_VERSION if client_version is None else client_version
+        )
+    }
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.get(MODELS_ENDPOINT, headers=headers, params=params)
 
     if resp.status_code != 200:
+        if strict:
+            from amplifier_core import llm_errors
+
+            from .provider import ChatGPTProvider
+
+            if resp.status_code == 401:
+                raise llm_errors.AuthenticationError(
+                    "ChatGPT model discovery authentication failed (HTTP 401)",
+                    provider="openai-chatgpt",
+                    status_code=401,
+                    retryable=False,
+                )
+            ChatGPTProvider._raise_for_status(
+                resp.status_code,
+                resp.headers,
+                resp.content.replace(access_token.encode(), b"[REDACTED]"),
+                "openai-chatgpt",
+            )
         body = resp.text[:500]
         raise ValueError(f"Models API error {resp.status_code}: {body}")
 
     data = resp.json()
-    entries: list[dict[str, Any]] = data.get("models", [])
+    entries: list[dict[str, Any]] = (
+        _validated_catalog_entries(data, codex=True)
+        if strict
+        else data.get("models", [])
+    )
 
     # Filter: exclude hidden entries and those not exposed via the API.
     return [
@@ -196,23 +228,49 @@ async def fetch_models(
     ]
 
 
+def _validated_catalog_entries(
+    data: Any, *, codex: bool = False
+) -> list[dict[str, Any]]:
+    """Reject malformed discovery responses rather than turn them into emptiness."""
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        raise ValueError("ChatGPT model catalog must contain a models array")
+    entries = data["models"]
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("slug"), str)
+            or not entry["slug"].strip()
+        ):
+            raise ValueError("ChatGPT model catalog entry must contain a non-empty slug")
+        if "visibility" in entry and not isinstance(entry["visibility"], str):
+            raise ValueError("ChatGPT model catalog visibility must be a string")
+        if codex and not isinstance(entry.get("supported_in_api"), bool):
+            raise ValueError("Codex model catalog entry must declare API support")
+    return entries
+
+
 # ---------------------------------------------------------------------------
 # Conversion
 # ---------------------------------------------------------------------------
 
 
-def to_model_infos(entries: list[dict[str, Any]]) -> list[ModelInfo]:
+def to_model_infos(
+    entries: list[dict[str, Any]], *, include_speed_variants: bool = True
+) -> list[ModelInfo]:
     """Convert raw model catalog entries to :class:`~amplifier_core.ModelInfo` objects.
 
     For each entry:
 
     - Emits one ``ModelInfo`` with ``id=slug``.
-    - If ``"fast"`` is in ``additional_speed_tiers``, also emits a synthetic
-      ``{slug}-fast`` variant with ``display_name = "{display_name} (fast)"``.
+    - By default, if ``"fast"`` is in ``additional_speed_tiers``, also emits a
+      synthetic ``{slug}-fast`` variant with
+      ``display_name = "{display_name} (fast)"``.
 
     Args:
         entries: List of model entry dicts (as returned by :func:`fetch_models`
             or taken from :data:`FALLBACK_MODELS`).
+        include_speed_variants: Emit legacy synthetic speed-tier IDs. Strict
+            discovery disables this so only literal API slugs are returned.
 
     Returns:
         Flat list of :class:`~amplifier_core.ModelInfo` objects.
@@ -243,7 +301,7 @@ def to_model_infos(entries: list[dict[str, Any]]) -> list[ModelInfo]:
 
         # Emit a synthetic -fast variant when the fast speed tier is supported.
         speed_tiers: list[str] = entry.get("additional_speed_tiers") or []
-        if "fast" in speed_tiers:
+        if include_speed_variants and "fast" in speed_tiers:
             result.append(
                 ModelInfo(
                     id=f"{slug}-fast",
@@ -257,7 +315,7 @@ def to_model_infos(entries: list[dict[str, Any]]) -> list[ModelInfo]:
 
 
 async def fetch_plan_models(
-    *, access_token: str, timeout: float = 30.0
+    *, access_token: str, timeout: float = 30.0, strict: bool = False
 ) -> list[dict[str, Any]]:
     """Public account-specific catalog: no Codex headers or static fallbacks."""
     from .plan_auth import RESOURCE
@@ -282,9 +340,10 @@ async def fetch_plan_models(
     data = response.json()
     if not isinstance(data, dict) or not isinstance(data.get("models"), list):
         raise TypeError("ChatGPT plan model catalog is invalid")
+    entries = _validated_catalog_entries(data) if strict else data["models"]
     return [
         dict(entry, additional_speed_tiers=[])
-        for entry in data["models"]
+        for entry in entries
         if isinstance(entry, dict)
         and entry.get("visibility") == "list"
         and isinstance(entry.get("slug"), str)

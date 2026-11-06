@@ -358,6 +358,9 @@ class ChatGPTProvider:
         self.config: dict[str, Any] = self._config
         self._coordinator = coordinator
         self._tokens = tokens
+        # Explicit Codex token injection retains its in-memory precedence.
+        # Tokens acquired from the configured file are not an account pin.
+        self._tokens_injected = tokens is not None
         self.auth_mode = normalize_auth_mode(self._config.get("auth_mode"))
         validate_auth_paths(self._config)
         if tokens and (tokens.get("auth_mode") == plan_auth.MODE) != (
@@ -626,6 +629,56 @@ class ChatGPTProvider:
         """
         return await self._get_catalog()
 
+    async def discover_models(self) -> dict[str, Any]:
+        """Fetch current account inventory without fallback, aliases, or caching.
+
+        This optional host-facing contract is separate from ``list_models()``.
+        Both authentication modes have real catalogs. Empty successful catalogs
+        stay empty; failures raise the existing kernel error types. Selection
+        settings (model, default_model, reasoning_effort, priority) do not select,
+        filter, or reorder inventory. Catalog/default-model caches are untouched.
+        File-backed Codex credentials are re-read on every call; explicit token
+        injection keeps its existing precedence. Plan authentication already
+        resolves the configured file on every call.
+        """
+        try:
+            await self._ensure_valid_tokens(fresh_from_file=True)
+            if self.auth_mode == plan_auth.MODE:
+                from .models import fetch_plan_models
+
+                entries = await fetch_plan_models(
+                    access_token=self._tokens["access_token"], strict=True
+                )
+            else:
+                entries = await fetch_models(
+                    access_token=self._tokens["access_token"],
+                    account_id=self._tokens["account_id"],
+                    client_version=self.models_client_version,
+                    strict=True,
+                )
+            models = to_model_infos(entries, include_speed_variants=False)
+        except kernel_errors.LLMError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise kernel_errors.LLMTimeoutError(
+                "ChatGPT model discovery timed out",
+                provider=self.name,
+                retryable=True,
+            ) from exc
+        except httpx.TransportError as exc:
+            raise kernel_errors.ProviderUnavailableError(
+                "ChatGPT model discovery connection failed",
+                provider=self.name,
+                retryable=True,
+            ) from exc
+        except Exception as exc:
+            raise kernel_errors.LLMError(
+                "ChatGPT model discovery failed: invalid catalog or credentials",
+                provider=self.name,
+                retryable=False,
+            ) from exc
+        return {"version": 1, "source": "provider-api", "models": models}
+
     async def _get_catalog(self) -> list[ModelInfo]:
         """Fetch and cache the live model catalog.
 
@@ -861,6 +914,7 @@ class ChatGPTProvider:
                 token_file_path=self._token_file_path, print_fn=print_fn
             )
         self._tokens = tokens
+        self._tokens_injected = False
         self._models_cache = None
         self._resolved_default_model = None
         # Identity-only consent is a saved login, but not an inference-ready
@@ -1312,10 +1366,16 @@ class ChatGPTProvider:
                 retryable=False,
             )
 
-    async def _ensure_valid_tokens(self) -> None:
+    async def _ensure_valid_tokens(self, *, fresh_from_file: bool = False) -> None:
         """Guarantee ``self._tokens`` holds a valid, unexpired access token.
 
-        Resolution order:
+        Strict discovery requests ``fresh_from_file``: file-backed Codex
+        instances use only the current file record (or its refresh), never
+        previously loaded in-memory credentials. Missing/invalid files fail
+        closed. Explicitly injected Codex tokens and Plan resolution retain
+        their existing behavior. No authentication mode is changed.
+
+        Legacy resolution order (the default):
         1. In-memory tokens pass ``is_token_valid()`` → done.
         2. Tokens loaded from disk pass ``is_token_valid()`` → update in-memory, done.
         3. Refresh using in-memory ``refresh_token`` → update in-memory, done.
@@ -1342,6 +1402,25 @@ class ChatGPTProvider:
         if disk_mode and disk_mode.get("auth_mode") == plan_auth.MODE:
             raise kernel_errors.AuthenticationError(
                 "ChatGPT plan credentials require auth_mode=chatgpt_plan.",
+                provider=self.name,
+                retryable=False,
+            )
+        if fresh_from_file and not self._tokens_injected:
+            # One authoritative file snapshot per discovery. In particular,
+            # never refresh the previous account when this record is absent.
+            self._tokens = disk_mode
+            if is_token_valid(self._tokens):
+                return
+            if self._tokens and self._tokens.get("refresh_token"):
+                refreshed = await refresh_tokens(
+                    self._tokens["refresh_token"], path=self._token_file_path
+                )
+                if refreshed:
+                    self._tokens = refreshed
+                    return
+            raise kernel_errors.AuthenticationError(
+                "No valid OAuth tokens in the configured credential file — "
+                "reconnect this account in your app.",
                 provider=self.name,
                 retryable=False,
             )
