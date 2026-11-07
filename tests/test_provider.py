@@ -1589,11 +1589,11 @@ class TestMount:
 
 
 # ---------------------------------------------------------------------------
-# TestListModelsDynamic — caching logic in _get_catalog() / list_models()
+# TestInferenceCatalog — inference-only caching logic in _get_catalog()
 # ---------------------------------------------------------------------------
 
 
-class TestListModelsDynamic:
+class TestInferenceCatalog:
     """Tests for the cached model fetching introduced by _get_catalog().
 
     Follows the same token-mocking approach as TestComplete: valid tokens
@@ -1636,8 +1636,8 @@ class TestListModelsDynamic:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_list_models_fetches_on_first_call(self) -> None:
-        """First call to list_models() fetches from API exactly once."""
+    async def test_catalog_fetches_on_first_call(self) -> None:
+        """First inference catalog call fetches from API exactly once."""
         provider = self._make_provider()
         mock_fetch = AsyncMock(return_value=self._sample_entries())
 
@@ -1645,7 +1645,7 @@ class TestListModelsDynamic:
             "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
             mock_fetch,
         ):
-            result = await provider.list_models()  # type: ignore[union-attr]
+            result = await provider._get_catalog()  # type: ignore[union-attr]
 
         mock_fetch.assert_awaited_once()
         assert len(result) == 1
@@ -1656,7 +1656,7 @@ class TestListModelsDynamic:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_list_models_uses_cache_on_second_call(self) -> None:
+    async def test_catalog_uses_cache_on_second_call(self) -> None:
         """Second call within TTL returns cached result; fetch_models called once."""
         provider = self._make_provider()
         mock_fetch = AsyncMock(return_value=self._sample_entries())
@@ -1665,8 +1665,8 @@ class TestListModelsDynamic:
             "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
             mock_fetch,
         ):
-            await provider.list_models()  # type: ignore[union-attr]
-            await provider.list_models()  # type: ignore[union-attr]
+            await provider._get_catalog()  # type: ignore[union-attr]
+            await provider._get_catalog()  # type: ignore[union-attr]
 
         mock_fetch.assert_awaited_once()
 
@@ -1675,7 +1675,7 @@ class TestListModelsDynamic:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_list_models_falls_back_on_failure(self) -> None:
+    async def test_catalog_falls_back_on_failure(self) -> None:
         """When fetch_models raises, fallback models are returned and cache stays None."""
         from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
 
@@ -1686,7 +1686,7 @@ class TestListModelsDynamic:
             "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
             mock_fetch,
         ):
-            result = await provider.list_models()  # type: ignore[union-attr]
+            result = await provider._get_catalog()  # type: ignore[union-attr]
 
         # All fallback slugs must appear in the result (some produce -fast variants).
         fallback_slugs = {entry["slug"] for entry in FALLBACK_MODELS}
@@ -1704,7 +1704,7 @@ class TestListModelsDynamic:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_list_models_ttl_expiry_refetches(self) -> None:
+    async def test_catalog_ttl_expiry_refetches(self) -> None:
         """With models_cache_ttl=0, each call triggers a fresh fetch."""
         provider = self._make_provider(models_cache_ttl=0.0)
         mock_fetch = AsyncMock(return_value=self._sample_entries())
@@ -1713,8 +1713,8 @@ class TestListModelsDynamic:
             "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
             mock_fetch,
         ):
-            await provider.list_models()  # type: ignore[union-attr]
-            await provider.list_models()  # type: ignore[union-attr]
+            await provider._get_catalog()  # type: ignore[union-attr]
+            await provider._get_catalog()  # type: ignore[union-attr]
 
         assert mock_fetch.await_count == 2, (
             f"Expected 2 fetches with TTL=0, got {mock_fetch.await_count}"
@@ -1725,7 +1725,7 @@ class TestListModelsDynamic:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_list_models_falls_back_on_empty_catalog(self) -> None:
+    async def test_catalog_falls_back_on_empty_catalog(self) -> None:
         """When fetch_models returns [], fallback models are returned and cache stays None."""
         provider = self._make_provider()
         mock_fetch = AsyncMock(return_value=[])
@@ -1734,7 +1734,7 @@ class TestListModelsDynamic:
             "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
             mock_fetch,
         ):
-            result = await provider.list_models()  # type: ignore[union-attr]
+            result = await provider._get_catalog()  # type: ignore[union-attr]
 
         assert len(result) > 0, "Expected non-empty fallback models"
         # Cache must NOT be populated — next call should retry the live fetch.
@@ -1745,8 +1745,8 @@ class TestListModelsDynamic:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_concurrent_list_models_fetches_once(self) -> None:
-        """5 concurrent list_models() calls result in exactly one fetch_models invocation."""
+    async def test_concurrent_catalog_fetches_once(self) -> None:
+        """5 concurrent inference catalog calls result in one fetch invocation."""
         provider = self._make_provider()
         mock_fetch = AsyncMock(return_value=self._sample_entries())
 
@@ -1755,11 +1755,11 @@ class TestListModelsDynamic:
             mock_fetch,
         ):
             results = await asyncio.gather(
-                provider.list_models(),  # type: ignore[union-attr]
-                provider.list_models(),  # type: ignore[union-attr]
-                provider.list_models(),  # type: ignore[union-attr]
-                provider.list_models(),  # type: ignore[union-attr]
-                provider.list_models(),  # type: ignore[union-attr]
+                provider._get_catalog(),  # type: ignore[union-attr]
+                provider._get_catalog(),  # type: ignore[union-attr]
+                provider._get_catalog(),  # type: ignore[union-attr]
+                provider._get_catalog(),  # type: ignore[union-attr]
+                provider._get_catalog(),  # type: ignore[union-attr]
             )
 
         mock_fetch.assert_awaited_once()
@@ -2640,7 +2640,7 @@ class TestCompleteErrorMapping:
 
             async def aiter_lines(self):  # type: ignore[return]
                 raise httpx.ReadTimeout("Request timed out")
-                yield  # makes this an async generator  # noqa: unreachable
+                yield  # Unreachable, but makes this an async generator.
 
             async def aread(self) -> bytes:
                 return b""
@@ -3167,7 +3167,7 @@ class TestListModelsAuthPropagation:
 # ---------------------------------------------------------------------------
 
 
-class TestListModelsFallbackLogging:
+class TestInferenceCatalogFallbackLogging:
     """Verify the fallback path for non-auth errors logs a single WARNING
     line without exc_info, with the full traceback demoted to DEBUG
     (provider.py _get_catalog())."""
@@ -3199,7 +3199,7 @@ class TestListModelsFallbackLogging:
             ),
             caplog.at_level(logging.DEBUG),
         ):
-            models = await provider.list_models()  # type: ignore[union-attr]
+            models = await provider._get_catalog()  # type: ignore[union-attr]
 
         assert len(models) > 0  # fallback catalog returned, not an empty list
 

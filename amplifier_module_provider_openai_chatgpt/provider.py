@@ -15,7 +15,7 @@ import logging
 import math
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -37,6 +37,7 @@ from amplifier_core.utils import redact_secrets
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 
 from . import plan_auth
+from ._model_listing import ModelFilters, selector_schema
 from ._plan_request import prepare_plan_payload
 from ._sse import ParsedResponse, SSEError, parse_sse_events
 from .models import (
@@ -53,6 +54,7 @@ from .oauth import (
     is_token_valid,
     load_tokens,
     refresh_tokens,
+    refresh_tokens_strict,
 )
 from .oauth import login as oauth_login
 
@@ -75,6 +77,7 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "priority",
         "models_cache_ttl",
         "models_client_version",
+        "model_filters",
         "use_streaming",
         "instance_id",
         "extra_request_params",
@@ -358,6 +361,9 @@ class ChatGPTProvider:
         self.config: dict[str, Any] = self._config
         self._coordinator = coordinator
         self._tokens = tokens
+        # Explicit Codex token injection retains its in-memory precedence.
+        # Tokens acquired from the configured file are not an account pin.
+        self._tokens_injected = tokens is not None
         self.auth_mode = normalize_auth_mode(self._config.get("auth_mode"))
         validate_auth_paths(self._config)
         if tokens and (tokens.get("auth_mode") == plan_auth.MODE) != (
@@ -367,6 +373,9 @@ class ChatGPTProvider:
                 "ChatGPT credentials do not match the selected authentication mode"
             )
         _warn_unknown_config_keys(self._config)
+        self._model_filters = ModelFilters.parse(
+            self._config.get("model_filters", {"include": ["gpt-6*"]})
+        )
 
         self.priority: int = _coerce_int(
             self._config.get("priority"), key="priority", default=100
@@ -532,8 +541,8 @@ class ChatGPTProvider:
         inheriting a provider-wide 1M claim.
 
         When ``default_model`` is the ``"latest"`` sentinel and resolution
-        hasn't happened yet on this instance (no `complete()` or
-        `list_models()` call has occurred), it presents the sentinel plus
+        hasn't happened yet on this instance (no `complete()` call has
+        needed it), it presents the sentinel plus
         the fallback that would apply if resolution can't reach the live
         catalog -- e.g. ``"latest (resolves lazily; falls back to
         gpt-5.6-sol)"`` -- rather than silently showing a placeholder as if
@@ -617,14 +626,74 @@ class ChatGPTProvider:
             ],
         )
 
-    async def list_models(self) -> list[ModelInfo]:
-        """Return ModelInfo objects for all available ChatGPT models.
+    def get_model_list_info(self) -> dict[str, Any]:
+        """Describe the selector extension locally, without authentication or I/O."""
+        return {
+            "version": 1,
+            "source": "provider-api",
+            "filters_keyword": "filters",
+            "filters_schema": selector_schema(),
+            "default_filters": self._model_filters.as_dict(),
+            "unfiltered": {},
+            "override": "replace",
+        }
 
-        Delegates to :meth:`_get_catalog`, which fetches the live model
-        catalog from the API and caches it for :attr:`_models_cache_ttl`
-        seconds.  Falls back to a built-in list on any error.
+    async def list_models(
+        self, *, filters: Mapping[str, object] | None = None
+    ) -> list[ModelInfo]:
+        """Fetch current account models without fallback, synthetic IDs, or caching.
+
+        None uses the immutable configured defaults (gpt-6* when unconfigured).
+        An explicit mapping replaces those defaults; {} disables all selectors.
+        Both authentication modes have real catalogs. Empty successful catalogs
+        stay empty; failures raise the existing kernel error types. Selection
+        settings (model, default_model, reasoning_effort, priority) do not select,
+        filter, or reorder inventory. Catalog/default-model caches are untouched.
+        File-backed Codex credentials are re-read on every call; explicit token
+        injection keeps its existing precedence. Plan authentication already
+        resolves the configured file on every call.
         """
-        return await self._get_catalog()
+        policy = self._model_filters if filters is None else ModelFilters.parse(filters)
+        try:
+            await self._ensure_valid_tokens(fresh_from_file=True)
+            if self.auth_mode == plan_auth.MODE:
+                from .models import fetch_plan_models
+
+                entries = await fetch_plan_models(
+                    access_token=self._tokens["access_token"], strict=True
+                )
+            else:
+                entries = await fetch_models(
+                    access_token=self._tokens["access_token"],
+                    account_id=self._tokens["account_id"],
+                    client_version=self.models_client_version,
+                    strict=True,
+                )
+            models = to_model_infos(entries, include_speed_variants=False, strict=True)
+        except kernel_errors.LLMError:
+            raise
+        except httpx.TimeoutException:
+            raise kernel_errors.LLMTimeoutError(
+                "ChatGPT model discovery timed out",
+                provider=self.name,
+                retryable=True,
+            ) from None
+        except httpx.TransportError:
+            raise kernel_errors.ProviderUnavailableError(
+                "ChatGPT model discovery connection failed",
+                provider=self.name,
+                retryable=True,
+            ) from None
+        except Exception:
+            raise kernel_errors.LLMError(
+                "ChatGPT model discovery failed: invalid catalog or credentials",
+                provider=self.name,
+                retryable=False,
+            ) from None
+        selected = set(policy.select([model.id for model in models]))
+        # Keep endpoint order (used by existing callers), byte-exact IDs and
+        # metadata. Selectors never change inference configuration or caches.
+        return [model for model in models if model.id in selected]
 
     async def _get_catalog(self) -> list[ModelInfo]:
         """Fetch and cache the live model catalog.
@@ -723,8 +792,8 @@ class ChatGPTProvider:
            requests, not to resolving what model name to use) or when the
            live catalog is reachable but returns no non-variant entry.
 
-        Resolved LAZILY on first call (from :meth:`complete` or
-        :meth:`list_models`), then cached on ``self._resolved_default_model``
+        Resolved LAZILY on first need from :meth:`complete`, then cached
+        on ``self._resolved_default_model``
         for the provider instance's lifetime. Emits exactly one INFO log
         line recording what "latest" resolved to and why.
         """
@@ -861,6 +930,7 @@ class ChatGPTProvider:
                 token_file_path=self._token_file_path, print_fn=print_fn
             )
         self._tokens = tokens
+        self._tokens_injected = False
         self._models_cache = None
         self._resolved_default_model = None
         # Identity-only consent is a saved login, but not an inference-ready
@@ -1312,10 +1382,16 @@ class ChatGPTProvider:
                 retryable=False,
             )
 
-    async def _ensure_valid_tokens(self) -> None:
+    async def _ensure_valid_tokens(self, *, fresh_from_file: bool = False) -> None:
         """Guarantee ``self._tokens`` holds a valid, unexpired access token.
 
-        Resolution order:
+        Strict discovery requests ``fresh_from_file``: file-backed Codex
+        instances use only the current file record (or its refresh), never
+        previously loaded in-memory credentials. Missing/invalid files fail
+        closed. Explicitly injected Codex tokens and Plan resolution retain
+        their existing behavior. No authentication mode is changed.
+
+        Legacy resolution order (the default):
         1. In-memory tokens pass ``is_token_valid()`` → done.
         2. Tokens loaded from disk pass ``is_token_valid()`` → update in-memory, done.
         3. Refresh using in-memory ``refresh_token`` → update in-memory, done.
@@ -1338,10 +1414,36 @@ class ChatGPTProvider:
                     str(exc), provider=self.name, retryable=False
                 ) from exc
             return
-        disk_mode = load_tokens(path=self._token_file_path)
+        # Explicit strict credentials are an account pin, independent of any
+        # unrelated file. Keep the legacy disk-mode gate for ordinary callers.
+        disk_mode = (
+            None
+            if fresh_from_file and self._tokens_injected
+            else load_tokens(path=self._token_file_path)
+        )
         if disk_mode and disk_mode.get("auth_mode") == plan_auth.MODE:
             raise kernel_errors.AuthenticationError(
                 "ChatGPT plan credentials require auth_mode=chatgpt_plan.",
+                provider=self.name,
+                retryable=False,
+            )
+        if fresh_from_file:
+            # One authoritative file snapshot per discovery. In particular,
+            # never refresh the previous account when this record is absent.
+            snapshot = self._tokens if self._tokens_injected else disk_mode
+            if is_token_valid(snapshot):
+                self._tokens = snapshot
+                return
+            if snapshot and snapshot.get("refresh_token"):
+                self._tokens = await refresh_tokens_strict(
+                    snapshot,
+                    path=self._token_file_path,
+                    persist=not self._tokens_injected,
+                )
+                return
+            raise kernel_errors.AuthenticationError(
+                "No valid OAuth tokens in the configured credential file — "
+                "reconnect this account in your app.",
                 provider=self.name,
                 retryable=False,
             )

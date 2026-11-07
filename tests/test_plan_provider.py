@@ -139,7 +139,7 @@ async def test_public_catalog_filters_preserves_order_and_does_not_synthesize_mo
     install_transport(monkeypatch, handle)
     p = provider()
     p._ensure_valid_tokens = AsyncMock()
-    models = await p.list_models()
+    models = await p.list_models(filters={})
     assert [m.id for m in models] == ["second-mini", "first"]
     assert models[0].display_name == "Fast choice"
     p.default_model = "latest"
@@ -382,8 +382,6 @@ async def test_codex_login_never_overwrites_plan_profile(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_invalid_mode_and_path_fail_before_mount_login(monkeypatch):
-    import amplifier_module_provider_openai_chatgpt as mod
-
     login = AsyncMock()
     monkeypatch.setattr("amplifier_module_provider_openai_chatgpt.oauth.login", login)
     for config in (
