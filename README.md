@@ -33,6 +33,52 @@ authentication and transport. Codex mode uses device authorization and
 
 ## Configuration
 
+### Optional prepared-media input
+
+`get_media_request_support(*, model, request_options=None)` is a synchronous,
+local structural extension, not account discovery. Codex mode accepts verified
+PNG/JPEG inputs at their original user or call-bound function-result positions.
+Its exact model IDs are in `_media.VISION_MODELS`, attributed to the immutable
+[first-party Codex modality catalogue](https://github.com/openai/codex/blob/65a5410f72dac1f4b40862c34ef0a8b71b12834a/codex-rs/models-manager/models.json).
+Function results use the API's typed `input_text`/`input_image` output array,
+not a JSON string containing an image dictionary.
+
+Plan mode remains an explicitly text/function-history adapter: image positions
+receive unavailable text. Unknown Codex models and unsupported positions also
+receive explicit unavailable text; this is not a claim that their service is
+incapable. An exact selected model must be fixed before private preparation;
+media does not resolve `latest` or switch accounts/endpoints after admission.
+
+When `experimental.media.v1` is present, the provider validates the exact private
+request and effective options immediately before every HTTP attempt, including
+the Codex 401 recovery. Revocation, mutation or missing private association fails
+locally. Ambiguous transport outcomes or any received SSE event do not
+automatically replay image inference. No provider count/budget, native compaction
+or public `stream()` method is introduced.
+
+Preparation pins the already-selected credential record using an opaque
+SHA-256 selection identity inside the private support binding. It contains no
+token bytes, is not an authorization grant, and must not be treated as a public
+credential identifier or persisted into canonical history. Ordinary access/id
+token rotation **even for the same account** invalidates the prepared request:
+initial rotation sends nothing; a rotation following a known 401 sends no second
+request. The host must prepare/fit again after authentication settles.
+
+Known structured image transports are omitted from a separate diagnostic copy
+**before** hooks are called, including raw opt-in events. The marker is not a
+retrievable pixel reference. Opaque reasoning, metadata and argument strings
+are not parsed or scanned as image dictionaries; third-party exception causes
+and traceback-local capture are not certified by this projection.
+Known scalar errors scrub exact submitted URL/base64 echoes only; truncated,
+re-encoded or opaque text is not certified by this exact-value control.
+
+Offline checks use `python -I -S tests/run_offline.py --allow-loopback -q`.
+Only the existing local OAuth callback tests need `--allow-loopback`; the runner
+clears credential variables, uses its own temporary home and denies external
+Python socket access before dependency imports. This is not a native-code or
+child-process sandbox. HTTPX MockTransport fixtures verify bytes/order/privacy;
+they do not prove subscription entitlement or successful visual inference.
+
 ```toml
 [providers.provider-openai-chatgpt]
 auth_mode = "chatgpt_codex"

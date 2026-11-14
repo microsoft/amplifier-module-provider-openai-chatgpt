@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import difflib
+import hashlib
 import json
 import logging
 import math
@@ -37,6 +38,7 @@ from amplifier_core.utils import redact_secrets
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 
 from . import plan_auth
+from . import _media
 from ._model_listing import ModelFilters, selector_schema
 from ._plan_request import prepare_plan_payload
 from ._sse import ParsedResponse, SSEError, parse_sse_events
@@ -958,8 +960,42 @@ class ChatGPTProvider:
     # Payload construction
     # ------------------------------------------------------------------
 
+    def _media_selection_identity(self) -> str:
+        """Opaque local selection fact; never expose credentials in support/events."""
+        disk = None if self._tokens_injected else load_tokens(path=self._token_file_path)
+        selected = self._tokens or disk or {}
+        fields = ("account_id", "subject", "access_token", "id_token")
+        value = (
+            self.auth_mode, str(self._token_file_path),
+            {key: selected.get(key) for key in fields},
+            {key: disk.get(key) for key in fields} if disk else None,
+        )
+        return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+    def get_media_request_support(
+        self, *, model: str, request_options: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Local exact route/model facts; never resolve ``latest`` by I/O."""
+        selected = self.extra_request_params.get("model", (request_options or {}).get("model", model))
+        if self.auth_mode == CODEX_MODE and isinstance(selected, str):
+            selected = selected.removesuffix("-fast")
+        allowed = self.auth_mode == CODEX_MODE and isinstance(selected, str) and selected in _media.VISION_MODELS
+        return {
+            "v": 1, "positions": ["user", "tool"] if allowed else [],
+            "mime_types": ["image/png", "image/jpeg"],
+            "reason": None if allowed else (
+                "ChatGPT plan adapter supports text/function history only"
+                if self.auth_mode == plan_auth.MODE else
+                "selected Codex model image modality is unknown"
+            ),
+            # Foundation freezes and revalidates the entire support fact via
+            # its private binding validator. Token/account changes require a
+            # new prepared candidate, even before the first auth await.
+            "evidence": _media.EVIDENCE + "#selection-sha256=" + self._media_selection_identity(),
+        }
+
     def _convert_content(
-        self, content: str | list[Any], role: str = "user"
+        self, content: str | list[Any], role: str = "user", *, allow_images: bool = False,
     ) -> list[dict[str, Any]]:
         """Convert Amplifier message content to Responses API content format.
 
@@ -982,6 +1018,11 @@ class ChatGPTProvider:
                 result.append({"type": text_type, "text": block.text})
             elif isinstance(block, ThinkingBlock):
                 result.append({"type": text_type, "text": block.thinking})
+            elif getattr(block, "type", None) == "image":
+                part = _media.image_part(_media.mapping(block), allowed=allow_images and role == "user")
+                if text_type == "output_text" and part["type"] == "input_text":
+                    part["type"] = text_type
+                result.append(part)
             # ToolCallBlock and ToolResultBlock are handled in _build_payload
         return result
 
@@ -1016,6 +1057,7 @@ class ChatGPTProvider:
         if self.auth_mode != plan_auth.MODE and model.endswith("-fast"):
             model = model.removesuffix("-fast")
             service_tier = "priority"
+        allow_images = bool(self.get_media_request_support(model=model)["positions"])
 
         # Effort precedence: an explicit per-request value wins, then the
         # mount-config value (the routing-matrix hook's per-role knob), then
@@ -1040,6 +1082,8 @@ class ChatGPTProvider:
                         for block in message.content
                         if isinstance(block, TextBlock)
                     ]
+                    if _media.has_images(message.content):
+                        texts.append(_media.UNAVAILABLE)
                     instructions = " ".join(texts) if texts else ""
                 continue  # Do not add to input array
 
@@ -1066,6 +1110,8 @@ class ChatGPTProvider:
                             text_parts.append(
                                 {"type": "output_text", "text": block.thinking}
                             )
+                        elif getattr(block, "type", None) == "image":
+                            text_parts.append({"type": "output_text", "text": _media.UNAVAILABLE})
                     if text_parts:
                         input_items.append({"role": "assistant", "content": text_parts})
                 else:
@@ -1077,6 +1123,16 @@ class ChatGPTProvider:
                             ),
                         }
                     )
+                existing_calls = {
+                    item.get("call_id") for item in input_items
+                    if item.get("type") == "function_call"
+                }
+                for call in getattr(message, "tool_calls", None) or []:
+                    if call.id not in existing_calls:
+                        input_items.append({
+                            "type": "function_call", "call_id": call.id,
+                            "name": call.name, "arguments": json.dumps(call.arguments),
+                        })
 
             elif message.role == "tool":
                 # Tool result messages → standalone function_call_output items
@@ -1084,8 +1140,7 @@ class ChatGPTProvider:
                     for block in message.content:
                         if isinstance(block, ToolResultBlock):
                             output = block.output
-                            if not isinstance(output, str):
-                                output = json.dumps(output)
+                            output = _media.tool_output(output, allowed=allow_images)
                             input_items.append(
                                 {
                                     "type": "function_call_output",
@@ -1093,6 +1148,15 @@ class ChatGPTProvider:
                                     "output": output,
                                 }
                             )
+                    if not any(isinstance(block, ToolResultBlock) for block in message.content):
+                        input_items.append({
+                            "type": "function_call_output",
+                            "call_id": getattr(message, "tool_call_id", None) or "unknown",
+                            "output": _media.tool_output(
+                                [_media.mapping(block) for block in message.content],
+                                allowed=allow_images,
+                            ),
+                        })
                 else:
                     input_items.append(
                         {
@@ -1107,7 +1171,9 @@ class ChatGPTProvider:
                 input_items.append(
                     {
                         "role": message.role,
-                        "content": self._convert_content(message.content),
+                        "content": self._convert_content(
+                            message.content, role=message.role, allow_images=allow_images,
+                        ),
                     }
                 )
 
@@ -1162,7 +1228,22 @@ class ChatGPTProvider:
             payload.update(self.extra_request_params)
 
         if self.auth_mode == plan_auth.MODE:
-            return prepare_plan_payload(payload, request)
+            # The host freezes unsupported media before admission. Direct legacy
+            # callers also get explicit text at the same position, not an image
+            # silently skipped by _convert_content or JSON-stringified in tools.
+            projected = request
+            if any(_media.has_images(m.content) for m in request.messages):
+                projected = request.model_copy(deep=True)
+                for message in projected.messages:
+                    if isinstance(message.content, list):
+                        parts = []
+                        for block in message.content:
+                            if getattr(block, "type", None) == "image":
+                                parts.append(TextBlock(text=_media.UNAVAILABLE))
+                            else:
+                                parts.append(block)
+                        message.content = parts
+            return prepare_plan_payload(payload, projected)
         return payload
 
     # ------------------------------------------------------------------
@@ -1501,21 +1582,80 @@ class ChatGPTProvider:
         Cancellation propagates without retry. Preparation keeps its existing
         behavior, before request telemetry and the transient retry campaign.
         """
+        incoming_options = kwargs.get("request_options") or {}
+        options = {**incoming_options, **{k: v for k, v in kwargs.items() if k != "request_options"}}
+        media_protected = _media.protected(self._coordinator, request)
+        if media_protected:
+            _media.validate(self._coordinator, request, options)
+            protected_keys = {"input", "model", "stream", "store", "extra_body"}
+            if protected_keys.intersection(self.extra_request_params):
+                raise kernel_errors.InvalidRequestError(
+                    "Media requests cannot override input/model/transport through extra_request_params; select and fit the exact route first.",
+                    provider=self.name, retryable=False,
+                )
+        selected_identity = self._media_selection_identity() if media_protected else None
         # 1. Ensure valid OAuth tokens.
         await self._ensure_valid_tokens()
+        if media_protected and self._media_selection_identity() != selected_identity:
+            raise kernel_errors.InvalidRequestError(
+                "Prepared media account/token selection changed during authentication; prepare and fit a new request. Request not sent.",
+                provider=self.name, retryable=False,
+            )
 
         # 1b. Resolve "latest" (if configured) to a concrete model id. This
         # is the "first need" moment for a completion request -- resolved
         # once, cached on self._resolved_default_model for the provider
         # instance's lifetime. No-op (returns immediately) when an explicit
         # non-sentinel default_model is configured.
-        effective_default_model = await self._resolve_default_model()
+        explicit_model = options.get("model") or request.model
+        if media_protected and request.model and options.get("model") not in (None, request.model):
+            raise kernel_errors.InvalidRequestError(
+                "Selected model and prepared request disagree; prepare and fit the exact model first. Request not sent.",
+                provider=self.name, retryable=False,
+            )
+        if media_protected and not explicit_model and self.default_model == LATEST_MODEL_SENTINEL:
+            raise kernel_errors.InvalidRequestError(
+                "Media requests require an exact selected model before private preparation; latest cannot resolve after fit.",
+                provider=self.name, retryable=False,
+            )
+        effective_default_model = explicit_model or await self._resolve_default_model()
 
         # 2. Build request payload.
         payload = copy.deepcopy(self._build_payload(request, default_model=effective_default_model))
+        pixel_values = _media.transport_values(payload)
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).digest()
+        payload_digest = digest(payload)
+        option_digest = digest(options)
+        request_digest = digest(request.model_dump())
+        def binding():
+            return (
+                self.auth_mode, self.default_model, self._token_file_path,
+                id(self._coordinator), id(_media.capability(self._coordinator)),
+                digest(self.extra_request_params), digest(self._config),
+                self._media_selection_identity(),
+                CHATGPT_CODEX_ENDPOINT, plan_auth.RESOURCE,
+            )
+        original_binding = binding()
+        def guard():
+            if media_protected:
+                current_options = {**(kwargs.get("request_options") or {}), **{
+                    k: v for k, v in kwargs.items() if k != "request_options"
+                }}
+                if (
+                    binding() != original_binding or digest(payload) != payload_digest
+                    or digest(current_options) != option_digest
+                    or digest(request.model_dump()) != request_digest
+                ):
+                    raise kernel_errors.InvalidRequestError(
+                        "Media request, selected connection or options changed; prepare and fit a new request. Request not sent.",
+                        provider=self.name, retryable=False,
+                    )
+                _media.validate(self._coordinator, request, current_options)
+        guard()
 
         # Resolve effective model name (mirrors _build_payload logic) for events.
-        model: str = request.model or effective_default_model
+        model: str = payload["model"]
         if self.auth_mode != plan_auth.MODE and model.endswith("-fast"):
             model = model.removesuffix("-fast")
 
@@ -1528,24 +1668,33 @@ class ChatGPTProvider:
                 "message_count": len(request.messages),
             }
             if self.raw:
-                req_event["raw"] = redact_secrets(payload)
+                req_event["raw"] = redact_secrets(_media.diagnostic_copy(payload))
             await self._coordinator.hooks.emit("llm:request", req_event)
 
         start_time = time.monotonic()
-        state = {"exposed": False, "auth_refreshed": False}
+        state = {"exposed": False, "auth_refreshed": False, "received": False,
+                 "entered": False, "rejected": False, "media": media_protected,
+                 "guard": guard, "pixel_values": pixel_values}
         request_id = str(uuid.uuid4())
         retry_config = self._retry_config
 
         async def attempt():
+            state["entered"] = state["rejected"] = False
+            guard()
             try:
                 return await self._complete_attempt(request, payload, model, request_id, state)
             except kernel_errors.LLMError as error:
+                if pixel_values:
+                    error.args = (_media.safe_text(str(error), pixel_values),)
                 # Retryability here means safe replay of this invocation, not
                 # merely a transient service cause. Do not invite outer replay
                 # after output or an excessive server hint.
                 hint = error.retry_after
                 if error.retryable and (
                     state["exposed"] or (hint is not None and hint > retry_config.max_delay)
+                    or (media_protected and (
+                        state["received"] or (state["entered"] and not state["rejected"])
+                    ))
                 ):
                     error.retryable = False
                 raise
@@ -1570,10 +1719,16 @@ class ChatGPTProvider:
             result, parsed = await retry_with_backoff(attempt, retry_config, on_retry=on_retry)
         except kernel_errors.LLMError as error:
             if _has_hooks:
-                await self._coordinator.hooks.emit("llm:response", {
-                    "provider": self.name, "model": model, "status": "error",
-                    "error": str(error), "duration_ms": (time.monotonic() - start_time) * 1000,
-                })
+                try:
+                    await self._coordinator.hooks.emit("llm:response", {
+                        "provider": self.name, "model": model, "status": "error",
+                        "error": _media.safe_text(str(error), pixel_values), "duration_ms": (time.monotonic() - start_time) * 1000,
+                    })
+                except kernel_errors.LLMError as observer_error:
+                    if media_protected:
+                        observer_error.args = (_media.safe_text(str(observer_error), pixel_values),)
+                        observer_error.retryable = False
+                    raise
             raise
         if _has_hooks:
             resp_event: dict[str, Any] = {
@@ -1584,13 +1739,19 @@ class ChatGPTProvider:
             if parsed.cache_read_tokens is not None:
                 resp_event["usage"]["cache_read_tokens"] = parsed.cache_read_tokens
             if self.raw:
-                resp_event["raw"] = redact_secrets({"events": parsed.raw_events})
-            await self._coordinator.hooks.emit("llm:response", resp_event)
+                resp_event["raw"] = redact_secrets(_media.diagnostic_copy({"events": parsed.raw_events}))
+            try:
+                await self._coordinator.hooks.emit("llm:response", resp_event)
+            except kernel_errors.LLMError as observer_error:
+                if media_protected:
+                    observer_error.args = (_media.safe_text(str(observer_error), pixel_values),)
+                    observer_error.retryable = False
+                raise
         return result
 
     async def _complete_attempt(
         self, request: ChatRequest, payload: dict[str, Any], model: str,
-        request_id: str, state: dict[str, bool],
+        request_id: str, state: dict[str, Any],
     ) -> tuple[ChatResponse, ParsedResponse]:
         """One transport attempt; no terminal error hooks before retry exhaustion."""
         headers = self._build_headers()
@@ -1615,6 +1776,8 @@ class ChatGPTProvider:
 
         # Local guard variable — concurrency-safe (no instance-level mutation).
         service_request_id: str | None = None
+        def error_text(error: BaseException) -> str:
+            return _media.safe_text(str(error), state["pixel_values"])
 
         try:
             # 4. Two-attempt loop: first attempt + one optional retry on 401.
@@ -1628,6 +1791,8 @@ class ChatGPTProvider:
                     async with httpx.AsyncClient(
                         timeout=httpx.Timeout(self.timeout, connect=5.0, pool=5.0)
                     ) as client:
+                        state["guard"]()
+                        state["entered"] = True
                         async with client.stream(
                             "POST",
                             plan_auth.RESOURCE + "/responses"
@@ -1637,9 +1802,13 @@ class ChatGPTProvider:
                             headers=headers,
                         ) as resp:
                             service_request_id = resp.headers.get("x-request-id")
+                            state["rejected"] = resp.status_code != 200
                             # 5. Check HTTP status — map to kernel error types.
                             if resp.status_code != 200:
                                 error_body = await resp.aread()
+                                error_body = _media.safe_text(
+                                    error_body.decode(errors="replace"), state["pixel_values"],
+                                ).encode()
                                 status = resp.status_code
 
                                 if self.auth_mode == plan_auth.MODE:
@@ -1680,6 +1849,9 @@ class ChatGPTProvider:
                             # and collect all lines for parse_sse_events below (pass 2).
                             # Each data: line is JSON-parsed twice — acceptable overhead.
                             async for line in resp.aiter_lines():
+                                # Any upstream event, even one not displayed,
+                                # means inference cannot automatically replay.
+                                state["received"] = True
                                 if self.auth_mode == plan_auth.MODE and self._tokens:
                                     # A proxy/service error may echo the bearer
                                     # credential in otherwise unstructured text.
@@ -1831,7 +2003,7 @@ class ChatGPTProvider:
                                                 "request_id": request_id,
                                                 "error": {
                                                     "type": "error",
-                                                    "msg": err_msg,
+                                                    "msg": _media.safe_text(err_msg, state["pixel_values"]),
                                                 },
                                             },
                                         )
@@ -1873,40 +2045,41 @@ class ChatGPTProvider:
                         "request_id": request_id,
                         "error": {
                             "type": type(exc).__name__,
-                            "msg": str(exc),
+                                    "msg": error_text(exc),
                         },
                     },
                 )
             code = exc.code or ""
-            msg = str(exc).lower()
+            message = error_text(exc)
+            msg = message.lower()
 
             if self.auth_mode == plan_auth.MODE and (
                 code.startswith(("subscription_sharing_", "chatpass_v2_"))
             ):
-                mapped_exc = _plan_error(code, str(exc), provider=self.name)
-            elif (coded := _coded_error(code, str(exc), self.name)) is not None:
+                mapped_exc = _plan_error(code, message, provider=self.name)
+            elif (coded := _coded_error(code, message, self.name)) is not None:
                 mapped_exc = coded
             elif code == "context_length_exceeded" or (
                 not code
                 and any(kw in msg for kw in ("context length", "too many tokens"))
             ):
                 mapped_exc = kernel_errors.ContextLengthError(
-                    str(exc), provider=self.name, retryable=False
+                    message, provider=self.name, retryable=False
                 )
             elif any(kw in msg for kw in ("content filter", "safety", "blocked")):
                 mapped_exc = kernel_errors.ContentFilterError(
-                    str(exc), provider=self.name, retryable=False
+                    message, provider=self.name, retryable=False
                 )
             else:
                 mapped_exc = kernel_errors.LLMError(
-                    str(exc), provider=self.name, retryable=False
+                    message, provider=self.name, retryable=False
                 )
 
             if self.auth_mode == plan_auth.MODE:
                 mapped_exc.error_code = exc.code
                 mapped_exc.error_param = getattr(exc, "param", None)
                 mapped_exc.request_id = service_request_id
-                mapped_exc.response_body = redact_secrets(getattr(exc, "details", {}))
+                mapped_exc.response_body = redact_secrets(_media.diagnostic_copy(getattr(exc, "details", {})))
             details = getattr(exc, "details", {})
             response = details.get("response", {}) if isinstance(details, dict) else {}
             error_data = details.get("error", details if exc.event_type == "error" else None) if isinstance(details, dict) else None
@@ -1926,12 +2099,12 @@ class ChatGPTProvider:
                         "request_id": request_id,
                         "error": {
                             "type": type(exc).__name__,
-                            "msg": str(exc),
+                            "msg": error_text(exc),
                         },
                     },
                 )
             mapped_timeout = kernel_errors.LLMTimeoutError(
-                f"ChatGPT API request timed out: {exc}",
+                f"ChatGPT API request timed out: {error_text(exc)}",
                 provider=self.name,
                 retryable=True,
             )
@@ -1949,12 +2122,12 @@ class ChatGPTProvider:
                         "request_id": request_id,
                         "error": {
                             "type": type(exc).__name__,
-                            "msg": str(exc),
+                            "msg": error_text(exc),
                         },
                     },
                 )
             mapped_unavail = kernel_errors.ProviderUnavailableError(
-                f"ChatGPT API connection error: {exc}",
+                f"ChatGPT API connection error: {error_text(exc)}",
                 provider=self.name,
                 retryable=True,
             )
@@ -1970,12 +2143,12 @@ class ChatGPTProvider:
                         "request_id": request_id,
                         "error": {
                             "type": type(exc).__name__,
-                            "msg": str(exc),
+                            "msg": error_text(exc),
                         },
                     },
                 )
             raise kernel_errors.LLMError(
-                str(exc), provider=self.name, retryable=False
+                error_text(exc), provider=self.name, retryable=False
             ) from exc
 
     def _to_chat_response(self, parsed: ParsedResponse, model: str) -> ChatResponse:

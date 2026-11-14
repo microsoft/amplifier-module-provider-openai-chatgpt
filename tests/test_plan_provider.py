@@ -663,9 +663,13 @@ def test_plan_image_input_is_not_silently_lost():
             )
         ]
     )
-    with pytest.raises(llm_errors.InvalidRequestError) as error:
-        p._build_payload(request)
-    assert error.value.error_param == "messages.content.image"
+    original = request.model_dump_json()
+    payload = p._build_payload(request)
+    assert payload["input"][0]["content"][0]["type"] == "input_text"
+    assert "Image unavailable" in payload["input"][0]["content"][0]["text"]
+    assert "no pixels supplied" in payload["input"][0]["content"][0]["text"]
+    assert "https://example.com/image.png" not in json.dumps(payload)
+    assert request.model_dump_json() == original
 
 
 @pytest.mark.parametrize("expiry", [None, 0, 10])
