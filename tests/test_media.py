@@ -412,3 +412,35 @@ async def test_initial_auth_cannot_change_already_selected_account(monkeypatch):
     with pytest.raises(llm_errors.InvalidRequestError):
         await p.complete(req)
     assert not calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_401", [False, True])
+async def test_same_account_token_rotation_requires_fresh_media_candidate(
+    monkeypatch, during_401
+):
+    req = request()
+
+    async def reject(r, cap):
+        return httpx.Response(401, json={"error": {"message": "expired"}})
+
+    p, _, calls, _ = harness(monkeypatch, req, receive=reject)
+    p._tokens = {
+        "account_id": "same",
+        "subject": "same",
+        "access_token": "old",
+        "id_token": "old-id",
+    }
+    p._tokens_injected = True
+    ensures = []
+
+    async def ensure():
+        ensures.append(True)
+        if len(ensures) == (2 if during_401 else 1):
+            p._tokens = {**p._tokens, "access_token": "new", "id_token": "new-id"}
+
+    p._ensure_valid_tokens = ensure
+    with pytest.raises(llm_errors.InvalidRequestError):
+        await p.complete(req)
+    assert len(calls) == (1 if during_401 else 0)
+    assert p._tokens["account_id"] == p._tokens["subject"] == "same"

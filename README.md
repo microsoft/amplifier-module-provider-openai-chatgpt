@@ -56,11 +56,21 @@ locally. Ambiguous transport outcomes or any received SSE event do not
 automatically replay image inference. No provider count/budget, native compaction
 or public `stream()` method is introduced.
 
+Preparation pins the already-selected credential record using an opaque
+SHA-256 selection identity inside the private support binding. It contains no
+token bytes, is not an authorization grant, and must not be treated as a public
+credential identifier or persisted into canonical history. Ordinary access/id
+token rotation **even for the same account** invalidates the prepared request:
+initial rotation sends nothing; a rotation following a known 401 sends no second
+request. The host must prepare/fit again after authentication settles.
+
 Known structured image transports are omitted from a separate diagnostic copy
 **before** hooks are called, including raw opt-in events. The marker is not a
 retrievable pixel reference. Opaque reasoning, metadata and argument strings
 are not parsed or scanned as image dictionaries; third-party exception causes
 and traceback-local capture are not certified by this projection.
+Known scalar errors scrub exact submitted URL/base64 echoes only; truncated,
+re-encoded or opaque text is not certified by this exact-value control.
 
 Offline checks use `python -I -S tests/run_offline.py --allow-loopback -q`.
 Only the existing local OAuth callback tests need `--allow-loopback`; the runner
