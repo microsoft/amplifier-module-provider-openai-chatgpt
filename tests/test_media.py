@@ -288,3 +288,127 @@ async def test_model_option_mismatch_refuses_before_http(monkeypatch):
     with pytest.raises(llm_errors.InvalidRequestError):
         await p.complete(req, model="gpt-6-luna")
     assert not calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("display_stream", [True, False])
+@pytest.mark.parametrize(
+    "error_kind", ["error", "response.failed", "response.incomplete"]
+)
+async def test_first_sse_then_echoed_pixels_error_private_at_hook_entry(
+    monkeypatch, display_stream, error_kind
+):
+    req = request()
+    req.metadata = {"stream": display_stream}
+    canonical = req.model_dump_json()
+    url = "data:image/png;base64," + PNG
+
+    async def receive(r, cap):
+        error = {"message": "echo " + url, "code": "server_error"}
+        final = (
+            {"type": error_kind, "error": error}
+            if error_kind == "error"
+            else {
+                "type": error_kind,
+                "response": {"error": error},
+            }
+        )
+        wire = [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message"},
+            },
+            {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": "first text",
+            },
+            final,
+        ]
+        return httpx.Response(
+            200, text="".join("data: " + json.dumps(e) + "\n\n" for e in wire)
+        )
+
+    p, _, calls, events = harness(monkeypatch, req, receive=receive)
+    with pytest.raises(llm_errors.LLMError) as caught:
+        await p.complete(req)
+    assert not caught.value.retryable and len(calls) == 1
+    assert req.model_dump_json() == canonical
+    assert PNG not in json.dumps(events) and url not in json.dumps(events)
+    if display_stream:
+        assert any(name == "llm:stream_aborted" for name, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_account_change_during_401_refresh_blocks_second_send(monkeypatch):
+    req = request()
+
+    async def reject(r, cap):
+        return httpx.Response(401, json={"error": {"message": "expired"}})
+
+    p, _, calls, _ = harness(monkeypatch, req, receive=reject)
+    p._tokens = {
+        "account_id": "selected",
+        "access_token": "offline",
+        "subject": "selected",
+    }
+    ensures = []
+
+    async def ensure():
+        ensures.append(True)
+        if len(ensures) == 2:
+            p._tokens = {**p._tokens, "account_id": "different", "subject": "different"}
+
+    p._ensure_valid_tokens = ensure
+    with pytest.raises(llm_errors.InvalidRequestError):
+        await p.complete(req)
+    assert len(calls) == 1 and len(ensures) == 2
+
+
+@pytest.mark.asyncio
+async def test_nonzero_backoff_mutation_blocks_second_send(monkeypatch):
+    import asyncio
+
+    req = request()
+
+    async def reject(r, cap):
+        return httpx.Response(503, json={"error": {"message": "known rejection"}})
+
+    p, _, calls, _ = harness(monkeypatch, req, receive=reject)
+    p._retry_config = module.RetryConfig(
+        max_retries=1, min_delay=0.05, max_delay=0.05, jitter=False
+    )
+
+    async def mutate():
+        while not calls:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
+        req.messages[0].content[0].text = "changed during wait"
+
+    mutation = asyncio.create_task(mutate())
+    try:
+        with pytest.raises(llm_errors.InvalidRequestError):
+            await p.complete(req)
+        assert len(calls) == 1
+    finally:
+        await mutation
+
+
+@pytest.mark.asyncio
+async def test_initial_auth_cannot_change_already_selected_account(monkeypatch):
+    req = request()
+    p, _, calls, _ = harness(monkeypatch, req)
+    p._tokens = {
+        "account_id": "selected",
+        "access_token": "offline",
+        "subject": "selected",
+    }
+
+    async def ensure():
+        p._tokens = {**p._tokens, "account_id": "different", "subject": "different"}
+
+    p._ensure_valid_tokens = ensure
+    with pytest.raises(llm_errors.InvalidRequestError):
+        await p.complete(req)
+    assert not calls

@@ -5,13 +5,40 @@ boundary covers this Python process, not native code or spawned children.
 """
 
 import atexit
+import hashlib
 import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
+command = list(sys.orig_argv)
+revision = subprocess.run(
+    ["git", "-C", str(root), "rev-parse", "HEAD"],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.strip()
+inputs = sorted(
+    [
+        *root.glob("amplifier_module_provider_openai_chatgpt/**/*.py"),
+        *root.glob("tests/**/*.py"),
+        root / "pyproject.toml",
+        root / "uv.lock",
+    ]
+)
+
+
+def hashes():
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in inputs
+    }
+
+
+input_hashes = hashes()
 attempts = []
 loopback = []
 allow_loopback = "--allow-loopback" in sys.argv
@@ -34,6 +61,9 @@ owned_home = tempfile.TemporaryDirectory(prefix="chatgpt-offline-")
 for key in ("HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"):
     os.environ[key] = owned_home.name
 result = {
+    "revision": revision,
+    "command": command,
+    "input_sha256": input_hashes,
     "attempts": attempts,
     "permitted_loopback": loopback,
     "exit_code": None,
@@ -68,9 +98,22 @@ import site  # noqa: E402 -- audit hook must precede site initialization
 
 site.main()
 sys.path.insert(0, str(root))
+from importlib import metadata  # noqa: E402 -- after pre-import network guard
+
+result["packages"] = {}
+for package in ("amplifier-core", "amplifier-foundation", "httpx", "Pillow"):
+    try:
+        dist = metadata.distribution(package)
+        result["packages"][package] = {
+            "version": dist.version,
+            "direct_url": dist.read_text("direct_url.json"),
+        }
+    except metadata.PackageNotFoundError:
+        result["packages"][package] = None
 
 
 def finalize():
+    result["inputs_unchanged"] = hashes() == input_hashes
     owned_home.cleanup()
     result["shutdown_accounted"] = True
     receipt.parent.mkdir(parents=True, exist_ok=True)

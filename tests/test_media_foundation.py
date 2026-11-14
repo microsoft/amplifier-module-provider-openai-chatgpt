@@ -29,7 +29,7 @@ from tests.test_media import success
 @pytest.mark.parametrize("mode", ["chatgpt_codex", "chatgpt_plan"])
 @pytest.mark.parametrize("role", ["user", "tool"])
 @pytest.mark.parametrize("image_format", ["PNG", "JPEG"])
-@pytest.mark.parametrize("revoke", [False, True])
+@pytest.mark.parametrize("revoke", [False, True, "account-during-preparation"])
 async def test_actual_store_wrapper_to_http(
     tmp_path, monkeypatch, mode, role, image_format, revoke
 ):
@@ -93,6 +93,21 @@ async def test_actual_store_wrapper_to_http(
     )
     p._ensure_valid_tokens = AsyncMock()
     p._build_headers = lambda: {"authorization": "Bearer offline"}
+    p._tokens = {
+        "account_id": "selected",
+        "subject": "selected",
+        "access_token": "offline",
+    }
+    p._tokens_injected = True
+    if revoke == "account-during-preparation":
+        prepare = cap.prepare_request
+
+        async def switched(*args, **kwargs):
+            prepared = await prepare(*args, **kwargs)
+            p._tokens = {**p._tokens, "account_id": "different", "subject": "different"}
+            return prepared
+
+        monkeypatch.setattr(cap, "prepare_request", switched)
     real = httpx.AsyncClient
 
     def receive(r):
@@ -116,7 +131,11 @@ async def test_actual_store_wrapper_to_http(
         execution_scope={},
     )
     try:
-        if revoke:
+        if revoke == "account-during-preparation":
+            with pytest.raises((InvalidRequestError, media.MediaRefusal, ValueError)):
+                await wrapped.complete(req)
+            assert not sent
+        elif revoke:
             prepared = await cap.prepare_request(
                 req,
                 provider_identity={

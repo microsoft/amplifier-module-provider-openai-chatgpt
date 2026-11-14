@@ -960,6 +960,18 @@ class ChatGPTProvider:
     # Payload construction
     # ------------------------------------------------------------------
 
+    def _media_selection_identity(self) -> str:
+        """Opaque local selection fact; never expose credentials in support/events."""
+        disk = None if self._tokens_injected else load_tokens(path=self._token_file_path)
+        selected = self._tokens or disk or {}
+        fields = ("account_id", "subject", "access_token", "id_token")
+        value = (
+            self.auth_mode, str(self._token_file_path),
+            {key: selected.get(key) for key in fields},
+            {key: disk.get(key) for key in fields} if disk else None,
+        )
+        return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
     def get_media_request_support(
         self, *, model: str, request_options: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -976,7 +988,10 @@ class ChatGPTProvider:
                 if self.auth_mode == plan_auth.MODE else
                 "selected Codex model image modality is unknown"
             ),
-            "evidence": _media.EVIDENCE,
+            # Foundation freezes and revalidates the entire support fact via
+            # its private binding validator. Token/account changes require a
+            # new prepared candidate, even before the first auth await.
+            "evidence": _media.EVIDENCE + "#selection-sha256=" + self._media_selection_identity(),
         }
 
     def _convert_content(
@@ -1578,8 +1593,14 @@ class ChatGPTProvider:
                     "Media requests cannot override input/model/transport through extra_request_params; select and fit the exact route first.",
                     provider=self.name, retryable=False,
                 )
+        selected_identity = self._media_selection_identity() if media_protected else None
         # 1. Ensure valid OAuth tokens.
         await self._ensure_valid_tokens()
+        if media_protected and self._media_selection_identity() != selected_identity:
+            raise kernel_errors.InvalidRequestError(
+                "Prepared media account/token selection changed during authentication; prepare and fit a new request. Request not sent.",
+                provider=self.name, retryable=False,
+            )
 
         # 1b. Resolve "latest" (if configured) to a concrete model id. This
         # is the "first need" moment for a completion request -- resolved
@@ -1612,7 +1633,7 @@ class ChatGPTProvider:
                 self.auth_mode, self.default_model, self._token_file_path,
                 id(self._coordinator), id(_media.capability(self._coordinator)),
                 digest(self.extra_request_params), digest(self._config),
-                (self._tokens or {}).get("account_id"), (self._tokens or {}).get("subject"),
+                self._media_selection_identity(),
                 CHATGPT_CODEX_ENDPOINT, plan_auth.RESOURCE,
             )
         original_binding = binding()
@@ -1982,7 +2003,7 @@ class ChatGPTProvider:
                                                 "request_id": request_id,
                                                 "error": {
                                                     "type": "error",
-                                                    "msg": err_msg,
+                                                    "msg": _media.safe_text(err_msg, state["pixel_values"]),
                                                 },
                                             },
                                         )
