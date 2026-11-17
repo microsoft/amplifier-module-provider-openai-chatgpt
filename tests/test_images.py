@@ -969,3 +969,98 @@ async def test_refs_without_actual_witness_fail_before_auth_or_wire(provider):
     with pytest.raises(llm_errors.InvalidRequestError):
         await provider.complete(request)
     provider._ensure_valid_tokens.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("assistant_content", ["string", "blocks"])
+async def test_real_loop_tool_key_two_http_continuation(
+    provider, monkeypatch, assistant_content,
+):
+    """Exact basic/streaming/events serialized call key, no media capability."""
+    sent = []
+    arguments = {"path": "fixture"}
+
+    def handle(wire):
+        body = json.loads(wire.content)
+        sent.append(body)
+        if len(sent) == 1:
+            events = [
+                {"type": "response.output_item.done", "item": {
+                    "type": "function_call", "call_id": "loop-call", "name": "read_file",
+                    "arguments": json.dumps(arguments),
+                }},
+                {"type": "response.completed", "response": {
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }},
+            ]
+            return httpx.Response(200, text="".join(
+                "data: " + json.dumps(event) + "\n\n" for event in events
+            ))
+        calls = [item for item in body["input"] if item.get("type") == "function_call"]
+        assert calls == [{
+            "type": "function_call", "call_id": "loop-call", "name": "read_file",
+            "arguments": json.dumps(arguments),
+        }]
+        assert body["input"][-1] == {
+            "type": "function_call_output", "call_id": "loop-call",
+            "output": "existing tool result",
+        }
+        return httpx.Response(200, text=completed("continued"))
+
+    install_transport(monkeypatch, handle)
+    request = ChatRequest(messages=[Message(role="user", content="read fixture")])
+    first = await provider.complete(request)
+    call = first.tool_calls[0]
+    # These are the actual loop dictionary fields, not ToolCall.model_dump().
+    row = Message.model_validate({
+        "role": "assistant",
+        "content": "" if assistant_content == "string" else first.content,
+        "tool_calls": [{"id": call.id, "tool": call.name, "arguments": call.arguments}],
+    })
+    request.messages.extend([
+        row,
+        Message(role="tool", tool_call_id=call.id, content=[TextBlock(text="existing tool result")]),
+    ])
+    original = copy.deepcopy(request.model_dump())
+    facts = provider.get_media_request_support_for_request(request=request, model="gpt-6.1-sol")
+    if provider.auth_mode == "chatgpt_codex":
+        assert {"message_index": 2, "role": "tool"} in facts["positions"]
+    else:
+        assert facts["positions"] == []
+    second = await provider.complete(request)
+    assert second.content[0].text == "continued"
+    assert len(sent) == 2 and request.model_dump() == original
+    assert row.tool_calls == [{"id": "loop-call", "tool": "read_file", "arguments": arguments}]
+
+
+@pytest.mark.parametrize("fields", [
+    {"tool": 5}, {"tool": ""}, {"tool": None},
+    {"name": "", "tool": "read_file"},
+    {"name": None, "tool": "read_file"},
+    {"name": 5, "tool": "read_file"},
+])
+def test_loop_tool_alias_does_not_override_invalid_explicit_name(provider, fields):
+    request = ChatRequest(messages=[Message.model_validate({
+        "role": "assistant", "content": "",
+        "tool_calls": [{"id": "loop-call", "arguments": {}, **fields}],
+    })])
+    before = request.model_dump()
+    with pytest.raises(llm_errors.InvalidRequestError) as error:
+        provider._build_payload(request)
+    assert error.value.error_code == "invalid_tool_call" and error.value.retryable is False
+    if provider.auth_mode == "chatgpt_codex":
+        with pytest.raises(llm_errors.InvalidRequestError):
+            provider.get_media_request_support_for_request(request=request, model="gpt-6.1-sol")
+    assert request.model_dump() == before
+
+
+def test_explicit_name_wins_over_loop_tool_alias_without_extra_equality_conflict(provider):
+    request = ChatRequest(messages=[Message.model_validate({
+        "role": "assistant",
+        "content": [ToolCallBlock(id="c", name="explicit", input={})],
+        "tool_calls": [{"id": "c", "name": "explicit", "tool": "ignored", "arguments": {}}],
+    })])
+    payload = provider._build_payload(request)
+    assert [item for item in payload["input"] if item.get("type") == "function_call"] == [{
+        "type": "function_call", "call_id": "c", "name": "explicit", "arguments": "{}",
+    }]

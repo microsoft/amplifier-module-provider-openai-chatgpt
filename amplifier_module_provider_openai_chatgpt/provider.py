@@ -998,6 +998,15 @@ class ChatGPTProvider:
             for value in extra:
                 if not isinstance(value, (dict, ToolCall)):
                     invalid()
+                if isinstance(value, dict):
+                    # Real loops serialize the name as "tool". Project only
+                    # Core fields so the alias is not an equality-changing extra.
+                    # An explicit malformed name is authoritative, not fallback.
+                    value = {
+                        "id": value.get("id"),
+                        "name": value["name"] if "name" in value else value.get("tool"),
+                        "arguments": value.get("arguments"),
+                    }
                 try:
                     call = ToolCall.model_validate(value, strict=True)
                 except (ValueError, TypeError):
