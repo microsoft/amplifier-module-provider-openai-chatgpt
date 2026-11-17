@@ -112,7 +112,7 @@ def reject_override_images(items: Any) -> None:
     message content and tool-result output; never parse argument/text strings
     or walk metadata, function arguments, or other application dictionaries.
     """
-    for item in items if isinstance(items, list) else [items]:
+    for item in items if isinstance(items, (list, tuple)) else [items]:
         if not isinstance(item, dict):
             continue
         kind = item.get("type")
@@ -122,7 +122,7 @@ def reject_override_images(items: Any) -> None:
             unsupported_image(
                 "images in extra_request_params.input are unsupported; use typed message images."
             )
-        if kind in {"function_call_output", "tool_result"}:
+        if kind in {"function_call_output", "tool_result", "computer_call_output"}:
             reject_override_images(item.get("output"))
         elif kind == "message" or (
             isinstance(item.get("role"), str) and item["role"] in {

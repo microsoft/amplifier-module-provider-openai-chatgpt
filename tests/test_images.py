@@ -581,12 +581,15 @@ def test_cold_history_dictionary_tool_calls(provider):
     "SECRET", None,
 ])
 def test_invalid_dictionary_calls_raise_safe_typed_errors(provider, bad):
+    import traceback
+
     request = ChatRequest(messages=[Message.model_validate({
         "role": "assistant", "content": "", "tool_calls": [bad],
     })])
     with pytest.raises(llm_errors.InvalidRequestError) as error:
         provider._build_payload(request)
     assert error.value.retryable is False and "SECRET" not in str(error.value)
+    assert "SECRET" not in "".join(traceback.format_exception(error.value))
     if provider.auth_mode == "chatgpt_codex":
         with pytest.raises(llm_errors.InvalidRequestError):
             provider.get_media_request_support_for_request(request=request, model="gpt-6.1-sol")
@@ -723,3 +726,34 @@ async def test_cold_history_dict_calls_reach_actual_native_http_wire(provider, m
     install_transport(monkeypatch, handle)
     await provider.complete(request)
     assert len(sent) == 1 and request.model_dump() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("carrier", ["message", "function_call_output", "computer_call_output"])
+@pytest.mark.parametrize("location", ["data", "remote"])
+async def test_constructor_tuple_and_computer_override_images_never_escape(
+    provider, monkeypatch, carrier, location,
+):
+    src = source()
+    url = (f"data:image/png;base64,{src['data']}" if location == "data"
+           else "https://private.invalid/SECRET")
+    content = ({"type": "input_image", "image_url": url},)
+    row = (
+        {"role": "user", "content": content} if carrier == "message" else
+        {"type": carrier, "call_id": "c", "output": (
+            {"type": "computer_screenshot", "image_url": url}
+            if carrier == "computer_call_output" else content
+        )}
+    )
+    p = ChatGPTProvider({
+        "auth_mode": provider.auth_mode, "default_model": "offline", "raw": True,
+        "extra_request_params": {"input": (row,)},
+    })
+    p._ensure_valid_tokens = AsyncMock()
+    p._coordinator = MagicMock()
+    p._coordinator.hooks.emit = AsyncMock()
+    install_transport(monkeypatch, lambda _: pytest.fail("override image reached HTTP"))
+    with pytest.raises(llm_errors.InvalidRequestError) as error:
+        await p.complete(ChatRequest(messages=[Message(role="user", content="ordinary")]))
+    assert src["data"] not in str(error.value) and "SECRET" not in str(error.value)
+    p._coordinator.hooks.emit.assert_not_called()

@@ -983,7 +983,7 @@ class ChatGPTProvider:
             )
             error.error_code = "invalid_tool_call"
             error.error_param = "messages.tool_calls"
-            raise error
+            raise error from None
 
         blocks = message.content if isinstance(message.content, list) else []
         calls = [
