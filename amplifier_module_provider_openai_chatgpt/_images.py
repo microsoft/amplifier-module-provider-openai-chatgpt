@@ -137,6 +137,12 @@ def diagnostic_copy(value: Any, known: tuple[str, ...] = ()) -> Any:
     if isinstance(value, str):
         return safe_image_text(value, known)
     if isinstance(value, dict):
+        if known and value.get("type") == "function_call":
+            return {
+                key: ("[IMAGE ECHO NOT RETAINED]" if key == "arguments"
+                      else diagnostic_copy(child, known))
+                for key, child in value.items()
+            }
         if known and isinstance(value.get("type"), str) and value["type"].endswith(".delta"):
             # Redundant fragments can reconstruct exact image values across
             # records. Actual model/parser events remain untouched.
@@ -159,7 +165,7 @@ class ImageEchoStream:
     def __init__(self, known: tuple[str, ...]):
         self.known = known
         self.pending = ""
-        self.active: str | None = None
+        self.active: list[str] = []
         self.offset = 0
 
     def feed(self, value: str, *, final: bool = False) -> str:
@@ -169,19 +175,35 @@ class ImageEchoStream:
         self.pending = ""
         result = []
         while text:
-            if self.active is not None:
-                remaining = len(self.active) - self.offset
-                size = min(len(text), remaining)
-                expected = self.active[self.offset:self.offset + size]
-                if text[:size] == expected:
+            if self.active:
+                size = min(len(text), min(len(s) - self.offset for s in self.active))
+                matched = [s for s in self.active
+                           if text[:size] == s[self.offset:self.offset + size]]
+                if matched:
                     text = text[size:]
                     self.offset += size
-                    if self.offset == len(self.active):
-                        self.active = None
+                    self.active = [s for s in matched if self.offset < len(s)]
+                    continue
+                # A shared prefix may diverge mid-chunk. Keep every candidate
+                # until its first mismatching character, not one arbitrary image.
+                common = 0
+                for secret in self.active:
+                    length = 0
+                    for left, right in zip(text[:size], secret[self.offset:self.offset + size]):
+                        if left != right:
+                            break
+                        length += 1
+                    common = max(common, length)
+                if common:
+                    prefix = text[:common]
+                    self.active = [s for s in self.active
+                                   if s[self.offset:self.offset + common] == prefix]
+                    self.offset += common
+                    text = text[common:]
                     continue
                 # Prefix was an image-like echo but then diverged. Do not
                 # retain the matched transport prefix in diagnostics.
-                self.active = None
+                self.active = []
             matches = [(text.find(secret[:64]), secret) for secret in self.known]
             matches = [(index, secret) for index, secret in matches if index >= 0]
             if matches:
@@ -189,7 +211,9 @@ class ImageEchoStream:
                 result.extend([text[:index], "[IMAGE REDACTED]"])
                 consumed = min(64, len(secret))
                 text = text[index + consumed:]
-                self.active, self.offset = (secret, consumed) if consumed < len(secret) else (None, 0)
+                self.active = [s for _, s in matches
+                               if s[:consumed] == secret[:consumed] and len(s) > consumed]
+                self.offset = consumed
                 continue
             hold = 0
             if not final:

@@ -420,6 +420,47 @@ def test_fragment_filter_bounded_memory_and_ordinary_text():
     assert "".join(collected) == "[IMAGE REDACTED] done"
 
 
+@pytest.mark.parametrize("reverse", [True, False])
+def test_fragment_filter_shared_image_prefixes(reverse):
+    images = []
+    for color in ("red", "blue"):
+        out = io.BytesIO()
+        Image.new("RGB", (100, 100), color).save(out, format="PNG")
+        images.append(base64.b64encode(out.getvalue()).decode())
+    values = tuple("data:image/png;base64," + item for item in images)
+    assert values[0][:64] == values[1][:64]
+    for value in reversed(values) if reverse else values:
+        redactor = _images.ImageEchoStream(values + tuple(images))
+        visible = "".join(redactor.feed(value[i:i+31]) for i in range(0, len(value), 31))
+        visible += redactor.feed("", final=True)
+        assert visible == "[IMAGE REDACTED]"
+
+
+@pytest.mark.asyncio
+async def test_escaped_canonical_tool_arguments_are_not_diagnostic_pixels(provider, monkeypatch):
+    src = source()
+    arguments = json.dumps({"image": src["data"]}).replace("iVBOR", r"\u0069VBOR")
+    wire = [
+        {"type": "response.output_item.done", "item": {
+            "type": "function_call", "call_id": "call", "name": "keep", "arguments": arguments,
+        }},
+        {"type": "response.completed", "response": {"usage": {"input_tokens": 1, "output_tokens": 1}}},
+    ]
+    events = []
+    provider.raw = True
+    provider._coordinator = MagicMock()
+    provider._coordinator.hooks.emit = AsyncMock(
+        side_effect=lambda name, data: events.append((name, data))
+    )
+    install_transport(monkeypatch, lambda _: httpx.Response(
+        200, text="".join("data: " + json.dumps(e) + "\n\n" for e in wire)
+    ))
+    response = await provider.complete(request_for(src))
+    assert response.tool_calls[0].arguments == {"image": src["data"]}
+    assert src["data"] not in json.dumps(events)
+    assert r"\u0069VBOR" not in json.dumps(events)
+
+
 @pytest.mark.asyncio
 async def test_actual_tool_arguments_remain_exact_while_raw_diagnostics_hide_image(provider, monkeypatch):
     src = source()

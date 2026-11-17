@@ -276,7 +276,8 @@ requests. Host admission and original-chat recovery are separate integration wor
 Native image URL/data values are omitted from diagnostic **copies before hooks**,
 including raw request/response events and known exact echoes in HTTP/SSE errors.
 Known echoes split across streaming text/thinking deltas are filtered locally;
-redundant raw delta values are omitted on image-bearing requests. Actual wire
+redundant raw delta values and opaque function-call argument strings are omitted
+on image-bearing requests (including JSON-escaped echoes). Actual wire
 payloads, completed model output, reasoning and tool arguments are not rewritten.
 The marker `[IMAGE REDACTED]` is not a retrievable media reference. Exact-value
 redaction does not certify truncated, re-encoded or arbitrary
