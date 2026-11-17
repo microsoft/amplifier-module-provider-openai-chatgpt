@@ -36,7 +36,7 @@ def unsupported_image(explanation: str) -> None:
 
 
 def image_part(source: Any, role: str = "user") -> dict[str, str]:
-    """Check base64 and format framing, not full raster validity; never decode pixels."""
+    """Check base64 and format signatures, not raster validity; never decode pixels."""
     if role != "user" and role != "tool":
         unsupported_image("images are supported only in user or tool-result content.")
     if not isinstance(source, dict) or source.get("type") != "base64":
@@ -59,26 +59,28 @@ def image_part(source: Any, role: str = "user") -> dict[str, str]:
         decoded = base64.b64decode(data, validate=True)
     except (ValueError, binascii.Error):
         unsupported_image("invalid base64 data; attach an encoded PNG/JPEG image.")
-    valid = (
-        len(decoded) >= 45
-        and decoded.startswith(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
-        and decoded.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82")
-        if media_type == "image/png"
-        else len(decoded) >= 4
-        and decoded.startswith(b"\xff\xd8\xff")
-        and decoded.endswith(b"\xff\xd9")
+    valid = decoded.startswith(
+        b"\x89PNG\r\n\x1a\n" if media_type == "image/png" else b"\xff\xd8\xff"
     )
     if not valid:
         unsupported_image(
-            "declared media type does not match PNG/JPEG framing, or image is truncated. "
+            "declared media type does not match the PNG/JPEG signature. "
             "Re-export explicitly; the provider does not decode or repair pixels."
         )
     return {"type": "input_image", "image_url": f"data:{media_type};base64,{data}"}
 
 
 def has_tool_images(output: Any) -> bool:
+    # Recognize actual Core carriers, not business records with type="image".
     return isinstance(output, list) and any(
-        isinstance(item, dict) and item.get("type") == "image" for item in output
+        isinstance(item, dict) and item.get("type") == "image"
+        and (
+            set(item) == {"type", "source"} and isinstance(item["source"], dict)
+            and isinstance(item["source"].get("type"), str)
+            and item["source"]["type"] in {"base64", "url", "file", "path"}
+            or set(item) == {"type", "data", "mimeType"}  # Native MCP, not Core.
+        )
+        for item in output
     )
 
 
@@ -86,6 +88,16 @@ def tool_output(output: Any) -> Any:
     """Promote only an explicit image-bearing Core content list, never JSON text."""
     if not has_tool_images(output):
         return output if isinstance(output, str) else json.dumps(output)
+    # Promotion is all-or-nothing, with an unambiguous Core content schema.
+    # Known native media in a mixed/malformed list must not become JSON pixels.
+    if not all(
+        isinstance(item, dict) and (
+            item.get("type") == "text" and set(item) == {"type", "text"}
+            and isinstance(item["text"], str)
+            or item.get("type") == "image" and set(item) == {"type", "source"}
+        ) for item in output
+    ):
+        unsupported_image("native tool images require a complete Core text/image block list.")
     parts = []
     for item in output:
         if not isinstance(item, dict):

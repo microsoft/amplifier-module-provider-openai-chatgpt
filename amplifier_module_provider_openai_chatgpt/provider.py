@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import difflib
+import inspect
 import json
 import logging
 import math
@@ -1222,6 +1223,18 @@ class ChatGPTProvider:
             elif message.role == "tool":
                 # Tool result messages → standalone function_call_output items
                 if isinstance(message.content, list):
+                    if all(isinstance(b, TextBlock) for b in message.content):
+                        if not message.tool_call_id:
+                            raise kernel_errors.InvalidRequestError(
+                                "Typed tool text content requires the actual tool_call_id.",
+                                provider=self.name, retryable=False,
+                            )
+                        input_items.append({
+                            "type": "function_call_output", "call_id": message.tool_call_id,
+                            "output": "\n".join(b.text for b in message.content),
+                        })
+                        self._consume_tool_results(message, outstanding_calls)
+                        continue
                     if any(isinstance(b, ImageBlock) for b in message.content):
                         if any(isinstance(b, ToolResultBlock) for b in message.content):
                             unsupported_image(
@@ -1345,6 +1358,95 @@ class ChatGPTProvider:
     # ------------------------------------------------------------------
     # Auth helpers
     # ------------------------------------------------------------------
+
+    def _media_send_guard(self, request: ChatRequest, kwargs: dict[str, Any]):
+        """Bind the host's existing private witness; never prepare or hydrate here."""
+        namespace = "experimental.media.v1"
+
+        def capability():
+            getter = getattr(self._coordinator, "get_capability", None)
+            value = getter(namespace) if callable(getter) else None
+            return value if getattr(value, "version", None) == 1 else None
+
+        def refused():
+            raise kernel_errors.InvalidRequestError(
+                "Prepared media request, options or selected connection changed; "
+                "prepare and fit a fresh request before sending. No request sent.",
+                provider=self.name, retryable=False,
+            ) from None
+
+        cap = capability()
+        refs = any(
+            isinstance(message.metadata, dict) and namespace in message.metadata
+            for message in request.messages
+        )
+        images = any(
+            isinstance(message.content, list) and any(
+                isinstance(block, ImageBlock)
+                or isinstance(block, ToolResultBlock) and has_tool_images(block.output)
+                for block in message.content
+            ) for message in request.messages
+        )
+        if not refs and not (cap is not None and images):
+            return None
+        if cap is None or not callable(getattr(cap, "validate", None)):
+            refused()
+        if any(key in self.extra_request_params for key in (
+            "input", "model", "extra_body", "stream", "store",
+        )):
+            refused()
+
+        def options():
+            value = kwargs.get("request_options")
+            if value is not None and not isinstance(value, Mapping):
+                refused()
+            return {**(value or {}), **{k: v for k, v in kwargs.items() if k != "request_options"}}
+
+        original_options = copy.deepcopy(options())
+        selected = original_options.get("model") or request.model or self.default_model
+        if (not isinstance(selected, str) or selected == LATEST_MODEL_SENTINEL
+                or request.model and request.model != selected):
+            refused()
+        if original_options.get("reasoning_effort") not in (
+            None, request.reasoning_effort or self.reasoning_effort,
+        ):
+            refused()
+
+        def binding():
+            # Account identity only, not token bytes or token-rotation policy.
+            tokens = self._tokens or {}
+            account = tuple(tokens.get(k) for k in ("account_id", "subject", "client_id"))
+            return (
+                id(self._coordinator), self.auth_mode, self._token_file_path,
+                self.default_model, self.reasoning_effort,
+                copy.deepcopy(self.extra_request_params), account,
+            )
+
+        original_binding = binding()
+
+        def guard():
+            if (capability() is not cap or options() != original_options
+                    or binding() != original_binding):
+                refused()
+            try:
+                result = cap.validate(
+                    request, purpose="provider-send",
+                    request_options=copy.deepcopy(original_options),
+                )
+                if inspect.isawaitable(result):
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    refused()
+                if not isinstance(result, dict) or result.get("valid") is not True:
+                    refused()
+            except Exception:
+                refused()
+            if (capability() is not cap or options() != original_options
+                    or binding() != original_binding):
+                refused()
+
+        guard()
+        return guard
 
     def _build_headers(self) -> dict[str, str]:
         """Return the HTTP headers required for the ChatGPT Codex API.
@@ -1678,6 +1780,7 @@ class ChatGPTProvider:
         Cancellation propagates without retry. Preparation keeps its existing
         behavior, before request telemetry and the transient retry campaign.
         """
+        media_guard = self._media_send_guard(request, kwargs)
         # 1. Ensure valid OAuth tokens.
         await self._ensure_valid_tokens()
 
@@ -1687,9 +1790,18 @@ class ChatGPTProvider:
         # instance's lifetime. No-op (returns immediately) when an explicit
         # non-sentinel default_model is configured.
         effective_default_model = await self._resolve_default_model()
+        if media_guard:
+            media_guard()
+            options = {
+                **(kwargs.get("request_options") or {}),
+                **{k: v for k, v in kwargs.items() if k != "request_options"},
+            }
+            effective_default_model = options.get("model") or effective_default_model
 
         # 2. Build request payload.
         payload = copy.deepcopy(self._build_payload(request, default_model=effective_default_model))
+        if media_guard:
+            media_guard()
 
         # Resolve effective model name (mirrors _build_payload logic) for events.
         model: str = request.model or effective_default_model
@@ -1709,7 +1821,7 @@ class ChatGPTProvider:
             await self._coordinator.hooks.emit("llm:request", req_event)
 
         start_time = time.monotonic()
-        state = {"exposed": False, "auth_refreshed": False}
+        state = {"exposed": False, "auth_refreshed": False, "media_guard": media_guard}
         request_id = str(uuid.uuid4())
         retry_config = self._retry_config
 
@@ -1769,7 +1881,7 @@ class ChatGPTProvider:
 
     async def _complete_attempt(
         self, request: ChatRequest, payload: dict[str, Any], model: str,
-        request_id: str, state: dict[str, bool],
+        request_id: str, state: dict[str, Any],
     ) -> tuple[ChatResponse, ParsedResponse]:
         """One transport attempt; no terminal error hooks before retry exhaustion."""
         headers = self._build_headers()
@@ -1825,6 +1937,10 @@ class ChatGPTProvider:
                     async with httpx.AsyncClient(
                         timeout=httpx.Timeout(self.timeout, connect=5.0, pool=5.0)
                     ) as client:
+                        # No await between the host's private witness check and
+                        # this physical send, including 401/backoff continuations.
+                        if state.get("media_guard"):
+                            state["media_guard"]()
                         async with client.stream(
                             "POST",
                             plan_auth.RESOURCE + "/responses"

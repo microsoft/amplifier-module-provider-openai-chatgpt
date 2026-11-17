@@ -249,9 +249,11 @@ image positions raise a nonretryable `InvalidRequestError` with
 `error_code="unsupported_image_input"` and `error_param="messages.content.image"`.
 Convert an unsupported format explicitly before attachment. Nothing is silently
 dropped, fetched, uploaded, resized, re-encoded or removed from saved history.
-Validation checks strict base64 plus PNG/JPEG signature and terminal framing;
+Validation checks strict base64 plus the PNG/JPEG signature only;
 it is **not** a full image decoder or raster-integrity/visual-safety certificate.
 The host owns upload/decode resource policy and admission before saving.
+Valid decoder-accepted trailers are preserved; this adapter does not pretend a
+terminal-byte check establishes raster completeness.
 
 `get_media_request_support_for_request(*, request, model, request_options=None)`
 returns synchronous, read-only v2 indexed facts with exact `v`, `positions`
@@ -264,6 +266,17 @@ account, generation and lifetime binding. Plan **conversion** supports native
 images, but plan automatic-hydration positions remain empty until account/model
 modality evidence is available for that separate route. The Codex catalogue is
 not borrowed to invent plan capability or entitlement.
+
+Participating requests reuse the actual `experimental.media.v1` capability's
+synchronous `validate(request, purpose="provider-send", request_options=...)`
+on the same private Core request immediately before **each** physical POST,
+including after auth/model awaits, 401 refresh and retry backoff. Missing,
+replaced, invalidated or changed witnesses/options/connection selections refuse
+before sending. No preparation, hydration, account fallback, or tool rerun is
+performed after fit. This optional structural boundary imports no Foundation
+runtime code; legacy inline requests without media capability/references remain
+compatible. The host owns actual candidate identity and lifetime, and must
+qualify its installed composition separately.
 
 Plan image requests check the public API's documented 1,500-image and 512 MB
 total serialized-payload limits (MB is conservatively decimal here). These are
