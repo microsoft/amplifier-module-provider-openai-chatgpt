@@ -62,7 +62,7 @@ selection and additional tuning can be supplied by the host or configuration.
 | `retry_jitter` | bool | `true` | Apply Core's jitter to backoff. |
 | `models_cache_ttl` | float | `3600` | Inference-only catalog cache lifetime; canonical `list_models()` always fetches fresh |
 | `models_client_version` | str | `"99.99.99"` | Settings-only override for the model-catalog version-gating constant (see `models.py`'s `MODELS_CLIENT_VERSION` -- FRAGILE, relies on the ChatGPT backend treating any unknown high version as "give me everything") |
-| `model_filters` | mapping | `{"include": ["gpt-6*"]}` | Immutable recommendation defaults for `list_models()`. Supports `include`, `exclude`, and `hide_dated`; does not restrict explicit inference. |
+| `model_filters` | mapping | `{"include": ["gpt-6*"]}` | Immutable selectors for `list_models()`. Unconfigured recommendations also apply account-backed known supersession below. Explicit configuration replaces that policy; it never restricts explicit inference. |
 | `use_streaming` | bool | `true` | Set `false` to force non-streaming completions |
 | `reasoning_effort` | str | *(unset)* | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Lands as `reasoning.effort`; an explicit request value wins. `none` or unset means "don't inject -- let the model decide". Invalid values fail at mount. |
 | `priority` | int | `100` | Read by the orchestrator's provider-selection logic |
@@ -83,7 +83,7 @@ partial responses raise typed errors. The candidate-only `discover_models()`
 method has been removed in favor of this canonical method.
 
 ```python
-await provider.list_models()                         # configured defaults: gpt-6*
+await provider.list_models()                         # built-in gpt-6* recommendations, or configured selectors
 await provider.list_models(filters=None)             # same defaults
 await provider.list_models(filters={})               # all account-listed API models
 await provider.list_models(filters={"include": ["gpt-5*"]})  # replace defaults
@@ -94,9 +94,17 @@ await provider.list_models(filters={"include": []})  # no recommendations
 patterns; exclusion wins. An explicit mapping **replaces**, not merges with,
 the configured defaults. `{}` also disables configured dated suppression.
 `hide_dated: true` hides a `YYYY-MM-DD` snapshot only when its matching undated
-alias is selected. It defaults to false for this provider: all actual `gpt-6*`
-tiers, previews and snapshots remain recommended, in endpoint order. This is
-not an intelligence ranking. IDs preserve their exact endpoint bytes.
+alias is selected. It defaults to false for this provider. Built-in `gpt-6*`
+recommendations omit `gpt-6-astra` only when the eligible account catalog also
+returns `gpt-6.2-astra`, and omit `gpt-6-sol` / `gpt-6.1-sol` only when it returns
+`gpt-6.2-sol`. The corresponding established `-fast` IDs follow their old base;
+a successor `-fast` ID alone does not supersede anything. No synthetic model is
+added. Without the successor base, the older recommendation remains.
+Terra 6.1, Luna 6, previews, dated snapshots and other families are unchanged.
+An explicit `model_filters` configuration or `filters` mapping replaces this
+built-in policy entirely, including when it specifies the same glob.
+Remaining models keep endpoint order; this is not an intelligence ranking.
+IDs preserve their exact endpoint bytes.
 Endpoint visibility/API eligibility still applies; overrides do not invent
 access to hidden or unsupported entries.
 
@@ -110,7 +118,7 @@ Configuration and returned metadata are independent snapshots; invalid filter
 types or keys fail before authentication.
 
 Listing does not alter an explicit inference model, request parameters, or
-the existing inference-only `latest` resolution/cache. Older models remain
+the inference-only cache. Older models remain
 usable by exact supported ID. The legacy Codex `-fast` inference shorthand is
 unchanged, but is not advertised as a separate account model. Plan inference
 continues to pass exact IDs without that remapping.
@@ -156,13 +164,31 @@ generations ship. Resolution precedence:
    (verified directly against the live payload), but the catalog IS ordered
    flagship-first (confirmed by the payload's own per-entry numeric
    `priority` field). "latest" resolves to the first catalog entry whose id
-   is not a speed/size variant (i.e. does not end in `-fast` or `-mini`) --
-   the concrete result depends on the live account catalog.
+   is not a speed/size variant (i.e. does not end in `-fast` or `-mini`),
+   skipping the known superseded bases described above only when their
+   successor base is available. Plan mode preserves literal account ordering,
+   with the same known supersession. The concrete result depends on the live
+   account catalog, not a public model list or numerical version parser.
 3. **Static fallback** -- `FALLBACK_MODELS[0]` (`gpt-6.1-sol` in this refresh),
    used when unauthenticated or when the live catalog can't be reached. No
    authentication error is raised for this fallback -- auth errors surface
    from actual requests (`complete()`/`list_models()`), never from resolving
    what model name to use.
+
+The legacy Codex fallback remains at Sol 6.1: it is an inference compatibility
+path, not evidence of subscription entitlement. No 6.2 fallback rows, public API
+context/output limits, prices or effort enums are substituted for account data.
+Plan mode still requires its own account catalog, with no static fallback.
+
+For exact GPT-6.2 Astra/Sol requests (including their `-fast` forms), a literal
+wire `reasoning.effort: none` is rejected. The existing mount-config
+`reasoning_effort: none` still means *omit the effort*, not an API value.
+`temperature`, `top_p`, `top_logprobs`, `logprobs` and the
+`message.output_text.logprobs` include are not supported for these models.
+Normal Codex request sampling fields remain omitted as before; unsupported
+extra wire fields fail locally after merging extras. Plan mode retains its
+stricter explicit-parameter rejection. Other effort values are not newly
+advertised or inferred from public API documentation.
 
 Resolution happens **lazily**, at the first moment a concrete model name is
 actually needed (the first `complete()` call), and is **cached** for the

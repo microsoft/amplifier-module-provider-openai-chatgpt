@@ -682,6 +682,202 @@ async def test_default_gpt6_exact_account_ids_and_unknown_limits(provider, monke
     assert "gpt-6-literal-fast-fast" not in _ids(rows)
 
 
+@pytest.mark.asyncio
+async def test_account_backed_62_supersession_is_default_only(provider, monkeypatch):
+    returned = [
+        "gpt-6-astra", "gpt-6-astra-fast", "gpt-6-sol", "gpt-6-sol-fast",
+        "gpt-6.1-sol", "gpt-6.1-sol-fast", "gpt-6.1-terra", "gpt-6-luna",
+        "gpt-6-preview", "gpt-6-astra-2026-10-01", "gpt-6.2-astra",
+        "gpt-6.2-sol", "gpt-6.2-sol-fast", "gpt-6.2-sol-preview",
+        "gpt-6-astra-fast-preview", "gpt-5.4",
+    ]
+    entries = [_entry(slug, additional_speed_tiers=["fast"]) for slug in returned]
+    entries[10].update(context_window=123_456, max_output_tokens=7_654)
+    entries[11].pop("context_window")
+    entries[11].pop("max_output_tokens")
+    original = copy.deepcopy(entries)
+    _install_transport(monkeypatch, lambda _: httpx.Response(
+        200, json={"models": entries}
+    ))
+    rows = await provider.list_models()
+    assert _ids(rows) == returned[6:-1]
+    assert _ids(await provider.list_models(filters=None)) == returned[6:-1]
+    assert _ids(await provider.list_models(filters={})) == returned
+    assert _ids(await provider.list_models(filters={"include": ["gpt-6*"]})) == returned[:-1]
+    assert _ids(await provider.list_models(filters={"include": ["gpt-6-astra"]})) == [returned[0]]
+    assert _ids(await provider.list_models(filters={"include": []})) == []
+    by_id = {row.id: row for row in rows}
+    assert by_id["gpt-6.2-astra"].context_window == 123_456
+    assert by_id["gpt-6.2-astra"].max_output_tokens == 7_654
+    assert by_id["gpt-6.2-sol"].context_window == 0
+    assert by_id["gpt-6.2-sol"].max_output_tokens == 0
+    assert by_id["gpt-6.2-sol"].defaults == {}
+    assert by_id["gpt-6.2-sol"].capabilities == []
+    assert entries == original
+    assert provider.get_model_list_info()["source"] == "provider-api"
+    # Even identical explicit configuration replaces the built-in policy.
+    for selector, expected in [({}, returned), ({"include": ["gpt-6*"]}, returned[:-1])]:
+        configured = ChatGPTProvider(
+            {"auth_mode": provider.auth_mode, "model_filters": selector},
+            tokens=provider._tokens,
+        )
+        configured._ensure_valid_tokens = AsyncMock()
+        assert _ids(await configured.list_models()) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("successor", ["gpt-6.2-astra", "gpt-6.2-sol"])
+async def test_only_eligible_successor_base_supersedes_on_each_fresh_call(
+    provider, monkeypatch, successor,
+):
+    old = "gpt-6-astra" if successor.endswith("astra") else "gpt-6.1-sol"
+    old_entries = [_entry(old), _entry(old + "-fast")]
+    payloads = [
+        {"models": [*old_entries, _entry(successor, additional_speed_tiers=["fast"])]},
+        {"models": [*old_entries, _entry(successor + "-fast")]},
+        {"models": [*old_entries, _entry(successor, visibility="hide")]},
+        {"models": old_entries},
+        {"models": []},
+    ]
+    _install_transport(monkeypatch, lambda _: httpx.Response(
+        200, json=payloads.pop(0)
+    ) if payloads else httpx.Response(503, text="unavailable"))
+    assert _ids(await provider.list_models()) == [successor]
+    assert _ids(await provider.list_models()) == [old, old + "-fast", successor + "-fast"]
+    assert _ids(await provider.list_models()) == [old, old + "-fast"]
+    assert _ids(await provider.list_models()) == [old, old + "-fast"]
+    assert await provider.list_models() == []
+    with pytest.raises(llm_errors.ProviderUnavailableError):
+        await provider.list_models()
+
+
+@pytest.mark.asyncio
+async def test_codex_non_api_successor_does_not_supersede(monkeypatch):
+    provider = _make_provider(CODEX_MODE)
+    _install_transport(monkeypatch, lambda _: httpx.Response(200, json={"models": [
+        _entry("gpt-6-sol"), _entry("gpt-6.2-sol", supported_in_api=False),
+    ]}))
+    assert _ids(await provider.list_models()) == ["gpt-6-sol"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("successor", [None, "gpt-6.2-sol-fast", "gpt-6.2-sol"])
+async def test_latest_skips_known_old_bases_only_when_successor_base_available(
+    provider, monkeypatch, successor,
+):
+    provider.default_model = "latest"
+    provider._models_cache = provider._resolved_default_model = None
+    entries = [_entry("gpt-6-sol"), _entry("gpt-6.1-sol")]
+    if successor:
+        entries.append(_entry(successor, additional_speed_tiers=["fast"]))
+    _install_transport(monkeypatch, lambda _: httpx.Response(200, json={"models": entries}))
+    expected = "gpt-6.2-sol" if successor == "gpt-6.2-sol" else "gpt-6-sol"
+    assert await provider._resolve_default_model() == expected
+    assert provider.default_model == "latest"
+    # The cached inventory itself is not rewritten by recommendation policy.
+    assert provider._models_cache[1][0].id == "gpt-6-sol"
+    if successor == "gpt-6.2-sol":
+        ids = _ids(provider._models_cache[1])
+        assert ("gpt-6.2-sol-fast" in ids) == (provider.auth_mode == CODEX_MODE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-6.2-astra", "gpt-6.2-sol-fast"])
+@pytest.mark.parametrize("terminal_error", [False, True])
+async def test_62_final_completion_keeps_transport_identity_and_terminal_errors(
+    provider, monkeypatch, model, terminal_error,
+):
+    provider.default_model = model
+    provider.reasoning_effort = "low"
+    provider._retry_config = provider_module.RetryConfig(max_retries=0)
+    calls = []
+    wire_id = model.removesuffix("-fast") if provider.auth_mode == CODEX_MODE else model
+
+    def handle(request):
+        calls.append(request)
+        assert request.method == "POST"
+        expected_url = (
+            provider_module.CHATGPT_CODEX_ENDPOINT
+            if provider.auth_mode == CODEX_MODE else plan_auth.RESOURCE + "/responses"
+        )
+        assert str(request.url) == expected_url
+        assert request.headers["authorization"] == "Bearer fixture-access-token"
+        if provider.auth_mode == CODEX_MODE:
+            assert request.headers["chatgpt-account-id"] == "fixture-account"
+        else:
+            assert "chatgpt-account-id" not in request.headers
+        body = json.loads(request.content)
+        assert body["model"] == wire_id
+        assert body["reasoning"]["effort"] == "low"
+        assert body["stream"] is True and body["store"] is False
+        assert body.get("service_tier") == (
+            "priority" if model.endswith("-fast") and provider.auth_mode == CODEX_MODE else None
+        )
+        events = [
+            {"type": "response.output_text.delta", "delta": "partial"},
+            {"type": "response.output_item.done", "item": {
+                "type": "message", "content": [{"type": "output_text", "text": "partial"}],
+            }},
+            {"type": "response.failed", "response": {"error": {
+                "code": "server_error", "message": "late failure",
+            }}} if terminal_error else {
+                "type": "response.completed", "response": {
+                    "id": "fixture-response", "model": wire_id, "output": [],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            },
+        ]
+        return httpx.Response(
+            200, text="".join("data: " + json.dumps(event) + "\n\n" for event in events),
+        )
+
+    _install_transport(monkeypatch, handle)
+    request = ChatRequest(messages=[Message(role="user", content="test")])
+    if terminal_error:
+        with pytest.raises(llm_errors.LLMError):
+            await provider.complete(request)
+    else:
+        assert (await provider.complete(request)).content[0].text == "partial"
+    assert len(calls) == 1  # No endpoint/model fallback or automatic second attempt.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pin", [
+    "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-sol-fast",
+])
+async def test_superseded_explicit_pin_still_reaches_same_wire_id(
+    provider, monkeypatch, pin,
+):
+    provider.default_model = pin
+    calls = []
+    wire_id = pin.removesuffix("-fast") if provider.auth_mode == CODEX_MODE else pin
+
+    def handle(request):
+        calls.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json={"models": [
+                _entry(pin), _entry("gpt-6.2-astra"), _entry("gpt-6.2-sol"),
+            ]})
+        body = json.loads(request.content)
+        assert body["model"] == wire_id
+        assert body["reasoning"]["effort"] == "high"
+        assert body["store"] is False and body["stream"] is True
+        assert body.get("service_tier") == (
+            "priority" if pin.endswith("-fast") and provider.auth_mode == CODEX_MODE else None
+        )
+        return httpx.Response(200, text="data: " + json.dumps({
+            "type": "response.completed",
+            "response": {"id": "fixture", "model": wire_id, "output": [],
+                         "usage": {"input_tokens": 1, "output_tokens": 0}},
+        }) + "\n\n")
+
+    _install_transport(monkeypatch, handle)
+    assert pin not in _ids(await provider.list_models())
+    await provider.complete(ChatRequest(messages=[Message(role="user", content="test")]))
+    assert provider.default_model == pin
+    assert [request.method for request in calls] == ["GET", "POST"]
+
+
 # Common conformance vectors from OpenAI PR141, commit 38b7b26.
 @pytest.mark.asyncio
 @pytest.mark.parametrize("selector,expected", [
