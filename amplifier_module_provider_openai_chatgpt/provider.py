@@ -47,6 +47,7 @@ from ._images import (
     image_values,
     safe_image_text,
     safe_error_body,
+    reject_override_images,
     tool_output,
     unsupported_image,
     validate_image_budget,
@@ -972,6 +973,61 @@ class ChatGPTProvider:
     # Payload construction
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _message_tool_calls(message: Any) -> list[ToolCall]:
+        """Normalize typed and cold-history dictionary calls without mutation."""
+        def invalid() -> None:
+            error = kernel_errors.InvalidRequestError(
+                "Assistant tool_calls must contain calls with nonempty id/name and object arguments.",
+                provider="openai-chatgpt", retryable=False,
+            )
+            error.error_code = "invalid_tool_call"
+            error.error_param = "messages.tool_calls"
+            raise error
+
+        blocks = message.content if isinstance(message.content, list) else []
+        calls = [
+            ToolCall(id=b.id, name=b.name, arguments=b.input)
+            for b in blocks if isinstance(b, ToolCallBlock)
+        ]
+        extra = getattr(message, "tool_calls", None)
+        if extra is not None:
+            if not isinstance(extra, list):
+                invalid()
+            for value in extra:
+                if not isinstance(value, (dict, ToolCall)):
+                    invalid()
+                try:
+                    call = ToolCall.model_validate(value, strict=True)
+                except (ValueError, TypeError):
+                    invalid()
+                calls.append(call)
+        unique: dict[str, ToolCall] = {}
+        for call in calls:
+            if (not isinstance(call.id, str) or not call.id
+                    or not isinstance(call.name, str) or not call.name
+                    or not isinstance(call.arguments, dict)):
+                invalid()
+            if call.id in unique and call != unique[call.id]:
+                invalid()
+            unique[call.id] = call
+        return list(unique.values())
+
+    @staticmethod
+    def _consume_tool_results(message: Any, outstanding: set[str]) -> bool:
+        """Consume all result carriers; return whether this raw tool row is paired."""
+        blocks = message.content if isinstance(message.content, list) else []
+        results = [b for b in blocks if isinstance(b, ToolResultBlock)]
+        raw_paired = not results and bool(
+            message.tool_call_id and message.tool_call_id in outstanding
+        )
+        if results:
+            for block in results:
+                outstanding.discard(block.tool_call_id)
+        else:
+            outstanding.discard(message.tool_call_id)
+        return raw_paired
+
     def get_media_request_support_for_request(
         self, *, request: ChatRequest, model: str,
         request_options: Mapping[str, Any] | None = None,
@@ -996,20 +1052,18 @@ class ChatGPTProvider:
         for index, message in enumerate(request.messages):
             blocks = message.content if isinstance(message.content, list) else []
             if message.role == "assistant":
-                calls.update(b.id for b in blocks if isinstance(b, ToolCallBlock))
-                calls.update(c.id for c in getattr(message, "tool_calls", None) or [])
+                calls.update(c.id for c in self._message_tool_calls(message))
             elif message.role == "user":
                 if isinstance(message.content, str) or all(
                     isinstance(b, (TextBlock, ThinkingBlock, ImageBlock)) for b in blocks
                 ):
                     facts["positions"].append({"message_index": index, "role": "user"})
-            elif (message.role == "tool" and message.tool_call_id
-                  and message.tool_call_id in calls
-                  and (isinstance(message.content, str) or all(
-                      isinstance(b, (TextBlock, ImageBlock)) for b in blocks
-                  ))):
-                facts["positions"].append({"message_index": index, "role": "tool"})
-                calls.remove(message.tool_call_id)
+            elif message.role == "tool":
+                paired = self._consume_tool_results(message, calls)
+                if paired and (isinstance(message.content, str) or all(
+                    isinstance(b, (TextBlock, ImageBlock)) for b in blocks
+                )):
+                    facts["positions"].append({"message_index": index, "role": "tool"})
         return facts
 
     def _convert_content(
@@ -1089,6 +1143,7 @@ class ChatGPTProvider:
         # Build input array and extract instructions from system/developer message
         instructions: str | None = None
         input_items: list[dict[str, Any]] = []
+        outstanding_calls: set[str] = set()
 
         for message in request.messages:
             if isinstance(message.content, list):
@@ -1117,6 +1172,8 @@ class ChatGPTProvider:
                 continue  # Do not add to input array
 
             if message.role == "assistant":
+                normalized_calls = self._message_tool_calls(message)
+                outstanding_calls.update(c.id for c in normalized_calls)
                 if isinstance(message.content, list):
                     # Split mixed content: text blocks go in role message,
                     # tool call blocks become standalone function_call items
@@ -1155,7 +1212,7 @@ class ChatGPTProvider:
                 embedded = {
                     b.id for b in message.content if isinstance(b, ToolCallBlock)
                 } if isinstance(message.content, list) else set()
-                for call in getattr(message, "tool_calls", None) or []:
+                for call in normalized_calls:
                     if call.id not in embedded:
                         input_items.append({
                             "type": "function_call", "call_id": call.id,
@@ -1171,12 +1228,9 @@ class ChatGPTProvider:
                                 "do not mix direct tool image content and ToolResultBlock carriers."
                             )
                         call_id = message.tool_call_id
-                        if not call_id or not any(
-                            item.get("type") == "function_call" and item.get("call_id") == call_id
-                            for item in input_items
-                        ):
+                        if not call_id or call_id not in outstanding_calls:
                             unsupported_image(
-                                "tool images require an actual tool_call_id and preceding assistant call."
+                                "tool images require an actual tool_call_id and outstanding assistant call."
                             )
                         parts = []
                         for block in message.content:
@@ -1191,15 +1245,13 @@ class ChatGPTProvider:
                         input_items.append({
                             "type": "function_call_output", "call_id": call_id, "output": parts,
                         })
+                        self._consume_tool_results(message, outstanding_calls)
                         continue
                     for block in message.content:
                         if isinstance(block, ToolResultBlock):
-                            if has_tool_images(block.output) and not any(
-                                item.get("type") == "function_call" and item.get("call_id") == block.tool_call_id
-                                for item in input_items
-                            ):
+                            if has_tool_images(block.output) and block.tool_call_id not in outstanding_calls:
                                 unsupported_image(
-                                    "tool image results require a preceding assistant call with the same ID."
+                                    "tool image results require an outstanding assistant call with the same ID."
                                 )
                             output = tool_output(block.output)
                             input_items.append(
@@ -1209,6 +1261,7 @@ class ChatGPTProvider:
                                     "output": output,
                                 }
                             )
+                            outstanding_calls.discard(block.tool_call_id)
                 else:
                     input_items.append(
                         {
@@ -1217,6 +1270,7 @@ class ChatGPTProvider:
                             "output": str(message.content),
                         }
                     )
+                self._consume_tool_results(message, outstanding_calls)
 
             else:
                 # user, developer (additional after first), function
@@ -1269,6 +1323,7 @@ class ChatGPTProvider:
         # known-rejected-params warning: this backend enforces a strict
         # payload schema.
         if self.extra_request_params:
+            reject_override_images(self.extra_request_params.get("input"))
             if "input" in self.extra_request_params and image_values(payload):
                 unsupported_image(
                     "extra_request_params.input would replace image-bearing message history; "
@@ -1753,6 +1808,11 @@ class ChatGPTProvider:
                 })
                 seq[idx] = seq.get(idx, 0) + 1
 
+        async def flush_display():
+            if emit_stream_events:
+                for echo_idx, echo_type in list(image_echoes):
+                    await display_delta(echo_idx, echo_type, "", final=True)
+
         try:
             # 4. Two-attempt loop: first attempt + one optional retry on 401.
             lines: list[str] = []
@@ -1922,6 +1982,7 @@ class ChatGPTProvider:
                                     "response.failed",
                                     "response.incomplete",
                                 ):
+                                    await flush_display()
                                     # Emit stream_aborted now if we already sent deltas.
                                     # parse_sse_events will raise SSEError after the loop.
                                     if any_emitted and not stream_aborted_emitted:
@@ -1971,9 +2032,7 @@ class ChatGPTProvider:
                     raise
 
             # 6. Parse SSE events.
-            if emit_stream_events:
-                for echo_idx, echo_type in list(image_echoes):
-                    await display_delta(echo_idx, echo_type, "", final=True)
+            await flush_display()
             parsed = parse_sse_events(
                 lines,
                 collect_raw=self.raw,
@@ -1983,10 +2042,12 @@ class ChatGPTProvider:
             return self._to_chat_response(parsed, model), parsed
 
         except kernel_errors.LLMError:
+            await flush_display()
             # The logical request owns its one terminal response diagnostic.
             raise
 
         except SSEError as exc:
+            await flush_display()
             # Map SSE-layer errors to kernel types before escaping complete().
             # If a partial stream was emitted before the SSE error, signal abort.
             if any_emitted and _has_hooks and not stream_aborted_emitted:
@@ -2043,6 +2104,7 @@ class ChatGPTProvider:
             raise mapped_exc from (None if known_images else exc)
 
         except httpx.TimeoutException as exc:
+            await flush_display()
             # Timeout → LLMTimeoutError (retryable).
             # If a partial stream was emitted before the timeout, signal abort.
             if any_emitted and _has_hooks and not stream_aborted_emitted:
@@ -2064,6 +2126,7 @@ class ChatGPTProvider:
             raise mapped_timeout from (None if known_images else exc)
 
         except httpx.TransportError as exc:
+            await flush_display()
             # Transport / connection errors → ProviderUnavailableError (retryable).
             # Covers ConnectError, RemoteProtocolError, and other transport
             # failures. Note: TimeoutException is a separate hierarchy caught above.
@@ -2087,6 +2150,7 @@ class ChatGPTProvider:
             raise mapped_unavail from (None if known_images else exc)
 
         except Exception as exc:
+            await flush_display()
             # Catch-all: wrap in LLMError so callers always receive a typed error.
             # If a partial stream was emitted, signal abort before translating error.
             if any_emitted and _has_hooks and not stream_aborted_emitted:

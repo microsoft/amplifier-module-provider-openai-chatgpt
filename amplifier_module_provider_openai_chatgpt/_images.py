@@ -105,6 +105,32 @@ def tool_output(output: Any) -> Any:
     return parts
 
 
+def reject_override_images(items: Any) -> None:
+    """Reject image carriers in the raw input escape hatch, not arbitrary JSON.
+
+    Typed request conversion owns validation/position policy. Inspect only
+    message content and tool-result output; never parse argument/text strings
+    or walk metadata, function arguments, or other application dictionaries.
+    """
+    for item in items if isinstance(items, list) else [items]:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind is not None and not isinstance(kind, str):
+            unsupported_image("extra_request_params.input item types must be strings.")
+        if kind in {"image", "input_image", "image_url", "computer_screenshot"}:
+            unsupported_image(
+                "images in extra_request_params.input are unsupported; use typed message images."
+            )
+        if kind in {"function_call_output", "tool_result"}:
+            reject_override_images(item.get("output"))
+        elif kind == "message" or (
+            isinstance(item.get("role"), str) and item["role"] in {
+            "user", "tool", "assistant", "system", "developer", "function",
+        }):
+            reject_override_images(item.get("content"))
+
+
 def image_values(value: Any) -> tuple[str, ...]:
     """Collect only native image values for private, invocation-local redaction."""
     found: set[str] = set()

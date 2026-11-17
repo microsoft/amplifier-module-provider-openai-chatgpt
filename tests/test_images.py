@@ -544,3 +544,182 @@ def test_untranslated_image_detail_is_explicit(provider):
     request.messages[0].content[0].detail = "original"
     with pytest.raises(llm_errors.InvalidRequestError, match="extra fields"):
         provider._build_payload(request)
+
+
+def serialized_call_request(content):
+    return ChatRequest(messages=[
+        Message.model_validate({
+            "role": "assistant", "content": "", "tool_calls": [
+                {"id": "cold-call", "name": "read_file", "arguments": {"path": "fixture"}}
+            ],
+        }),
+        Message(role="tool", tool_call_id="cold-call", content=content),
+    ])
+
+
+def test_cold_history_dictionary_tool_calls(provider):
+    request = serialized_call_request([TextBlock(text="read"), ImageBlock(source=source())])
+    before = request.model_dump()
+    facts = provider.get_media_request_support_for_request(request=request, model="gpt-6.1-sol")
+    assert facts["positions"] == (
+        [{"message_index": 1, "role": "tool"}] if provider.auth_mode == "chatgpt_codex" else []
+    )
+    payload = provider._build_payload(request)
+    assert payload["input"][-2] == {
+        "type": "function_call", "call_id": "cold-call", "name": "read_file",
+        "arguments": '{"path": "fixture"}',
+    }
+    assert payload["input"][-1]["call_id"] == "cold-call"
+    assert payload["input"][-1]["output"][1]["type"] == "input_image"
+    assert request.model_dump() == before
+
+
+@pytest.mark.parametrize("bad", [
+    {"id": "SECRET", "name": "read", "arguments": "SECRET"},
+    {"name": "SECRET", "arguments": {}},
+    {"id": [], "name": "SECRET", "arguments": {}},
+    "SECRET", None,
+])
+def test_invalid_dictionary_calls_raise_safe_typed_errors(provider, bad):
+    request = ChatRequest(messages=[Message.model_validate({
+        "role": "assistant", "content": "", "tool_calls": [bad],
+    })])
+    with pytest.raises(llm_errors.InvalidRequestError) as error:
+        provider._build_payload(request)
+    assert error.value.retryable is False and "SECRET" not in str(error.value)
+    if provider.auth_mode == "chatgpt_codex":
+        with pytest.raises(llm_errors.InvalidRequestError):
+            provider.get_media_request_support_for_request(request=request, model="gpt-6.1-sol")
+
+
+@pytest.mark.parametrize("first_result", ["string", "blocks", "nested-text", "raw-image", "nested-image"])
+@pytest.mark.parametrize("second_result", ["raw", "nested"])
+@pytest.mark.parametrize("call_shape", ["dict", "object"])
+def test_completed_call_never_qualifies_a_second_image_result(
+    provider, first_result, second_result, call_shape,
+):
+    src = source()
+    results = {
+        "string": Message(role="tool", tool_call_id="cold-call", content="done"),
+        "blocks": Message(role="tool", tool_call_id="cold-call", content=[TextBlock(text="done")]),
+        "nested-text": Message(role="tool", content=[
+            ToolResultBlock(tool_call_id="cold-call", output="done"),
+        ]),
+        "raw-image": Message(role="tool", tool_call_id="cold-call", content=[ImageBlock(source=src)]),
+        "nested-image": Message(role="tool", content=[ToolResultBlock(
+            tool_call_id="cold-call", output=[{"type": "image", "source": src}],
+        )]),
+    }
+    second = (
+        Message(role="tool", tool_call_id="cold-call", content=[ImageBlock(source=src)])
+        if second_result == "raw" else Message(role="tool", content=[ToolResultBlock(
+            tool_call_id="cold-call", output=[{"type": "image", "source": src}],
+        )])
+    )
+    request = serialized_call_request("unused")
+    if call_shape == "object":
+        request.messages[0].tool_calls = [ToolCall(id="cold-call", name="read_file", arguments={})]
+    request.messages[1:] = [results[first_result], second]
+    facts = provider.get_media_request_support_for_request(request=request, model="gpt-6.1-sol")
+    assert {"message_index": 2, "role": "tool"} not in facts["positions"]
+    with pytest.raises(llm_errors.InvalidRequestError, match="outstanding"):
+        provider._build_payload(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True, "remote"])
+@pytest.mark.parametrize("array_input", [True, False])
+async def test_extra_input_images_rejected_before_any_hook_or_http(
+    provider, monkeypatch, native, array_input,
+):
+    src = source()
+    image = (
+        {"type": "input_image", "image_url": "https://private.invalid/SECRET"}
+        if native == "remote" else
+        {"type": "input_image", "image_url": f"data:image/png;base64,{src['data']}"}
+        if native else {"type": "image", "source": src}
+    )
+    row = {"role": "user", "content": [image]}
+    provider.extra_request_params["input"] = [row] if array_input else row
+    provider.raw = True
+    provider._coordinator = MagicMock()
+    provider._coordinator.hooks.emit = AsyncMock()
+    install_transport(monkeypatch, lambda _: pytest.fail("override image reached HTTP"))
+    with pytest.raises(llm_errors.InvalidRequestError) as error:
+        await provider.complete(ChatRequest(messages=[Message(role="user", content="text only")]))
+    assert src["data"] not in str(error.value) and "SECRET" not in str(error.value)
+    provider._coordinator.hooks.emit.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delta_type", ["response.output_text.delta", "response.reasoning_text.delta"])
+@pytest.mark.parametrize("suffix", ["i", "iVBORw0KGgoAAA"])
+async def test_partial_nonimage_suffix_flushed_before_transport_abort(
+    provider, monkeypatch, delta_type, suffix,
+):
+    events = []
+    provider._coordinator = MagicMock()
+    provider._coordinator.hooks.emit = AsyncMock(
+        side_effect=lambda name, data: events.append((name, data))
+    )
+    wire = [
+        {"type": "response.output_item.added", "output_index": 0, "item": {
+            "type": "message" if "output_text" in delta_type else "reasoning",
+        }},
+        {"type": delta_type, "output_index": 0, "delta": "kiw" + suffix},
+    ]
+
+    class Interrupted(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for event in wire:
+                yield ("data: " + json.dumps(event) + "\n\n").encode()
+            raise httpx.ReadError("offline interrupted")
+
+    install_transport(monkeypatch, lambda _: httpx.Response(200, stream=Interrupted()))
+    with pytest.raises(llm_errors.LLMError):
+        await provider.complete(request_for(source()))
+    visible = "".join(data.get("text", "") for name, data in events if name == "llm:stream_block_delta")
+    assert visible == "kiw" + suffix
+    assert [name for name, _ in events].index("llm:stream_aborted") > max(
+        i for i, (name, _) in enumerate(events) if name == "llm:stream_block_delta"
+    )
+
+
+@pytest.mark.parametrize("container", ["function_call_output", "tool_result", "message"])
+def test_override_scanner_rejects_nested_known_carriers_but_leaves_opaque_json(provider, container):
+    image = {"type": "image", "source": source()}
+    item = ({"type": container, "role": "tool", "content": [image]} if container == "message"
+            else {"type": container, "call_id": "c", "output": [image]})
+    provider.extra_request_params["input"] = [item]
+    with pytest.raises(llm_errors.InvalidRequestError, match="typed message"):
+        provider._build_payload(ChatRequest(messages=[]))
+    opaque = {
+        "type": "function_call", "call_id": "c", "name": "opaque",
+        "arguments": json.dumps({"type": "image", "source": source()}),
+        "metadata": {"type": "image", "source": source()},
+    }
+    provider.extra_request_params["input"] = [opaque]
+    assert provider._build_payload(ChatRequest(messages=[]))["input"] == [opaque]
+
+
+@pytest.mark.asyncio
+async def test_cold_history_dict_calls_reach_actual_native_http_wire(provider, monkeypatch):
+    src = source()
+    request = serialized_call_request([TextBlock(text="original"), ImageBlock(source=src)])
+    before = request.model_dump()
+    sent = []
+
+    def handle(wire):
+        body = json.loads(wire.content)
+        sent.append(body)
+        assert body["input"][-1] == {
+            "type": "function_call_output", "call_id": "cold-call", "output": [
+                {"type": "input_text", "text": "original"},
+                {"type": "input_image", "image_url": f"data:image/png;base64,{src['data']}"},
+            ],
+        }
+        return httpx.Response(200, text=completed())
+
+    install_transport(monkeypatch, handle)
+    await provider.complete(request)
+    assert len(sent) == 1 and request.model_dump() == before
