@@ -1428,7 +1428,11 @@ class ChatGPTProvider:
             # pinning None and rejecting the normal same-account bootstrap.
             tokens = self._tokens
             if tokens is None and not self._tokens_injected:
-                tokens = load_tokens(path=self._token_file_path)
+                # Match the selected mode's auth loader, including Plan's ~
+                # expansion; Codex retains its existing path interpretation.
+                path = (str(plan_auth._path(self._token_file_path))
+                        if self.auth_mode == plan_auth.MODE else self._token_file_path)
+                tokens = load_tokens(path=path)
             tokens = tokens if isinstance(tokens, dict) else {}
             account = tuple(tokens.get(k) for k in ("account_id", "subject", "client_id"))
             return (

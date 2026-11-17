@@ -135,18 +135,27 @@ async def test_actual_private_witness_at_each_physical_send(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["chatgpt_codex", "chatgpt_plan"])
+@pytest.mark.parametrize(("mode", "path_style"), [
+    ("chatgpt_codex", "absolute"), ("chatgpt_codex", "relative"),
+    ("chatgpt_plan", "absolute"), ("chatgpt_plan", "relative"), ("chatgpt_plan", "tilde"),
+])
 @pytest.mark.parametrize("boundary", [
     "same-selected", "initial-account-change", "initial-host-selection-change",
     "401-account-change", "backoff-account-change",
 ])
 async def test_cold_file_auth_and_same_session_resume_preserve_selected_account(
-    tmp_path, monkeypatch, mode, boundary,
+    tmp_path, monkeypatch, mode, path_style, boundary,
 ):
     """Actual unprimed provider auth reads synthetic file; no login or auth HTTP."""
     from amplifier_module_provider_openai_chatgpt import plan_auth
 
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     auth_path = tmp_path / "synthetic-auth.json"
+    configured_path = (
+        "~/synthetic-auth.json" if path_style == "tilde"
+        else "synthetic-auth.json" if path_style == "relative" else str(auth_path)
+    )
     selected = {
         "auth_mode": mode, "access_token": "offline-synthetic-only",
         **(
@@ -193,7 +202,7 @@ async def test_cold_file_auth_and_same_session_resume_preserve_selected_account(
                     "generation": generation}
         p = ChatGPTProvider(
             {"auth_mode": mode, "default_model": "gpt-6.1-sol",
-             "token_file_path": str(auth_path)},
+             "token_file_path": configured_path},
             SimpleNamespace(get_capability=lambda _: cap),
         )
         assert p._tokens is None  # No public plaintext warm-up before projection.

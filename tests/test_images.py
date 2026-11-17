@@ -1068,8 +1068,9 @@ def test_explicit_name_wins_over_loop_tool_alias_without_extra_equality_conflict
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["same", "different", "missing-selected-file", "known-memory-account"])
+@pytest.mark.parametrize("path_style", ["absolute", "mode-specific"])
 async def test_cold_media_guard_pins_selected_file_not_unknown_wildcard(
-    provider, monkeypatch, tmp_path, change,
+    provider, monkeypatch, tmp_path, change, path_style,
 ):
     from datetime import datetime, timedelta, timezone
     import time
@@ -1086,10 +1087,16 @@ async def test_cold_media_guard_pins_selected_file_not_unknown_wildcard(
         ),
     }
     account_key = "subject" if provider.auth_mode == "chatgpt_plan" else "account_id"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     auth_path = tmp_path / "synthetic-cold.json"
     if change != "missing-selected-file":
         auth_path.write_text(json.dumps(selected))
-    provider._token_file_path = str(auth_path)
+    provider._token_file_path = (
+        str(auth_path) if path_style == "absolute"
+        else "~/synthetic-cold.json" if provider.auth_mode == "chatgpt_plan"
+        else "synthetic-cold.json"
+    )
     provider._tokens = selected.copy() if change == "known-memory-account" else None
     provider._tokens_injected = False
     request, witness = witness_request(provider)
