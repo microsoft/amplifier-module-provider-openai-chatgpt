@@ -173,11 +173,14 @@ in top-level `tools`, subject to model and account policy. This adapter does not
 currently translate custom or namespaced tool-call histories; those definitions
 fail clearly instead of being dropped.
 
-The typed plan adapter currently accepts text/thinking and function-call/result
-history. Other typed content blocks, including images, are rejected explicitly
-instead of silently disappearing. This adapter limit is narrower than the
-service's model-dependent image/file support; adding that conversion is separate
-work.
+The typed plan adapter accepts text/thinking, function-call/result history, and
+native base64 PNG/JPEG images in user content or a strict image-bearing
+`ToolResultBlock.output` list. See the [image contract and evidence matrix](../README.md#image-input-and-transport-evidence).
+The service documents model-dependent image/file support; the adapter does not
+infer vision from a model name. Unsupported image formats, sources and positions
+are rejected explicitly, without resizing, relocating or changing saved history.
+Other typed content blocks remain unsupported. File inputs, URL images and
+model-aware detail controls are separate work; no Files upload workflow is added.
 
 The plan preview rejects stored/background conversations and several ordinary
 Responses parameters. Explicit unsupported parameters, including `temperature`,

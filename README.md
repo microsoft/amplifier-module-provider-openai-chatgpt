@@ -210,6 +210,8 @@ Works in SSH/headless sessions -- the device code flow only requires a browser o
 
 ## Features
 
+- Native ordered base64 PNG/JPEG user images and structured tool-result images
+  in both connection modes; see [image input and transport evidence](#image-input-and-transport-evidence)
 - OAuth device code authentication with PKCE (no API key needed)
 - Raw httpx + manual SSE streaming (not the OpenAI SDK)
 - Automatic token refresh with 4-step fallback chain
@@ -222,6 +224,93 @@ Works in SSH/headless sessions -- the device code flow only requires a browser o
 - `-fast` model suffix support (e.g. `gpt-5.5-fast` -> `gpt-5.5` with `service_tier: "priority"`)
 - Production routing matrix for all 13 Amplifier agent roles
 - `llm:request`/`llm:response` hook events with optional raw payload inclusion
+
+### Image input and transport evidence
+
+Both adapters convert Core `ImageBlock(source={"type": "base64",
+"media_type": "image/png", "data": ...})` into Responses
+`{"type": "input_image", "image_url": "data:image/png;base64,..."}`.
+JPEG uses `image/jpeg`. Mixed text/image order, multiple images, original image
+bytes and user history are preserved. No model-name pattern is taken as proof
+of vision support: the selected account/model must accept images.
+
+Call-bound images use the host's `Message(role="tool", tool_call_id=...,
+content=[TextBlock(...), ImageBlock(...)])`, paired with a preceding assistant
+tool call. They also accept `ToolResultBlock.output` containing a nonempty list of
+explicit Core block dictionaries, for example `[{type: "text", text: "..."},
+{type: "image", source: {type: "base64", media_type: "image/png", data: ...}}]`.
+Only image-bearing lists of this strict shape become a native
+`function_call_output.output` array of `input_text`/`input_image` parts. Call ID
+and result position stay unchanged. Other JSON outputs stay JSON strings;
+strings are never parsed or promoted, and no synthetic user message is added.
+
+URL/file/path sources, GIF/WebP/other formats, and assistant/system/developer
+image positions raise a nonretryable `InvalidRequestError` with
+`error_code="unsupported_image_input"` and `error_param="messages.content.image"`.
+Convert an unsupported format explicitly before attachment. Nothing is silently
+dropped, fetched, uploaded, resized, re-encoded or removed from saved history.
+Validation checks strict base64 plus PNG/JPEG signature and terminal framing;
+it is **not** a full image decoder or raster-integrity/visual-safety certificate.
+The host owns upload/decode resource policy and admission before saving.
+
+`get_media_request_support_for_request(*, request, model, request_options=None)`
+returns synchronous, read-only v2 indexed facts with exact `v`, `positions`
+(`message_index`/`role`) and `mime_types` fields. It qualifies user positions and
+actual paired raw-tool-message positions for the twelve exact image-input models
+in the [immutable first-party Codex catalogue](https://github.com/openai/codex/blob/65a5410f72dac1f4b40862c34ef0a8b71b12834a/codex-rs/models-manager/models.json).
+Unknown/unresolved models and input/model overrides have no qualified positions.
+These facts are not authority to hydrate references; the host owns request,
+account, generation and lifetime binding. Plan **conversion** supports native
+images, but plan automatic-hydration positions remain empty until account/model
+modality evidence is available for that separate route. The Codex catalogue is
+not borrowed to invent plan capability or entitlement.
+
+Plan image requests check the public API's documented 1,500-image and 512 MB
+total serialized-payload limits (MB is conservatively decimal here). These are
+outer limits, not admission guarantees: account/model/context/patch limits can
+be lower. No undocumented Codex byte/pixel ceiling is invented. Unsupported
+history remains an explicit error until the host/user repairs that attachment;
+the provider neither mutates history nor poisons subsequent independent text
+requests. Host admission and original-chat recovery are separate integration work.
+
+Native image URL/data values are omitted from diagnostic **copies before hooks**,
+including raw request/response events and known exact echoes in HTTP/SSE errors.
+Known echoes split across streaming text/thinking deltas are filtered locally;
+redundant raw delta values are omitted on image-bearing requests. Actual wire
+payloads, completed model output, reasoning and tool arguments are not rewritten.
+The marker `[IMAGE REDACTED]` is not a retrievable media reference. Exact-value
+redaction does not certify truncated, re-encoded or arbitrary
+third-party traceback/local-variable capture.
+
+Evidence reviewed 2026-11-17; offline MockTransport tests qualify adapter wire
+serialization only, **not authenticated endpoint acceptance or visual inference**:
+
+| Surface | `chatgpt_codex` | `chatgpt_plan` | Evidence / implementation |
+|---|---|---|---|
+| Inference + auth | Device OAuth, `chatgpt.com/backend-api/codex/responses` | Browser OAuth plan permission, `api.openai.com/v1/responses` | [Official Codex client route][codex-route]; [documented plan route][plan-inference]. These are distinct from Platform API-key billing; no fallback. |
+| Text, local function tools, reasoning, SSE | Implemented | Implemented; functions through `additional_tools`, `store:false`, `stream:true` | Existing source/offline tests; [plan limitations][plan-limits] |
+| Base64 user images | Implemented PNG/JPEG | Implemented PNG/JPEG | [Documented image shape][vision-doc]; [official-client image wire][codex-image]; offline tests, not live qualification |
+| Native tool-result images | Implemented strict typed list | Implemented strict typed list | [Official-client Responses output schema][codex-tool-image]; public plan documents image/function inputs, exact combination still requires service qualification |
+| Other image formats / URL sources / detail controls | Not translated | Not translated | General API documents WebP/nonanimated GIF, URLs, model-dependent detail; not proof of Codex backend parity |
+| Files / custom or namespaced functions / WebSockets | Not translated | Legitimate separate backlog | Plan documents files (not uploads), custom/namespaced tools, same-connection WebSocket continuation. No feature enabled by this change. |
+| Image generation, native computer use, hosted MCP, file search, Code Interpreter, audio/video, Files upload | Not established by this adapter | Explicitly unavailable in plan preview | [Plan restrictions][plan-limits]; do not infer support from generic Responses schema |
+| Arbitrary-request input count / enforced output cap / persistent server conversation | Not added | Not added | Existing source limits; plan rejects unsupported parameters. No counter/auth crossover. |
+
+Immediate reusable improvements are the native image conversion and
+privacy-safe diagnostic copies. Model-aware detail, other image forms, inline
+file conversion, custom tools and new transports remain separate research/
+qualification tasks. This work does not adopt the larger private-media
+preparation/auth-binding experiment in [draft PR #28](https://github.com/microsoft/amplifier-module-provider-openai-chatgpt/pull/28)
+(`b0fae0992b92f9f86ce2abe7f65b1dd38468b1d2`), whose original-position tool image
+and diagnostic-copy design was reviewed as prior work. Its held source and proof
+remain separate; no draft branch or compaction experiment is imported.
+
+[plan-inference]: https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference.md
+[plan-limits]: https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations.md
+[vision-doc]: https://developers.openai.com/api/docs/guides/images-vision.md
+[codex-route]: https://github.com/openai/codex/blob/9a56c2b1aa994f696b144ba863200f4b73a74c0a/codex-rs/model-provider-info/src/lib.rs#L472-L490
+[codex-image]: https://github.com/openai/codex/blob/9a56c2b1aa994f696b144ba863200f4b73a74c0a/codex-rs/protocol/src/models.rs#L940-L995
+[codex-tool-image]: https://github.com/openai/codex/blob/9a56c2b1aa994f696b144ba863200f4b73a74c0a/codex-rs/protocol/src/models.rs#L2235-L2355
 
 ## Local Development
 

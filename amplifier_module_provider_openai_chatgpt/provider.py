@@ -26,6 +26,7 @@ from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
+    ImageBlock,
     TextBlock,
     ThinkingBlock,
     ToolCall,
@@ -37,6 +38,19 @@ from amplifier_core.utils import redact_secrets
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 
 from . import plan_auth
+from ._images import (
+    CODEX_IMAGE_MODELS,
+    ImageEchoStream,
+    diagnostic_copy,
+    has_tool_images,
+    image_part,
+    image_values,
+    safe_image_text,
+    safe_error_body,
+    tool_output,
+    unsupported_image,
+    validate_image_budget,
+)
 from ._model_listing import ModelFilters, selector_schema
 from ._plan_request import prepare_plan_payload
 from ._sse import ParsedResponse, SSEError, parse_sse_events
@@ -958,6 +972,46 @@ class ChatGPTProvider:
     # Payload construction
     # ------------------------------------------------------------------
 
+    def get_media_request_support_for_request(
+        self, *, request: ChatRequest, model: str,
+        request_options: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Read-only indexed adapter facts, not authentication or media authority.
+
+        The exact first-party Codex modality catalogue is positive evidence for
+        Codex only. Plan conversion works, but this provider has no account/model
+        modality fact for automatic hydration on that different transport yet.
+        """
+        facts: dict[str, Any] = {
+            "v": 2, "positions": [], "mime_types": ["image/png", "image/jpeg"],
+        }
+        selected = request.model or model
+        options = request_options or {}
+        if (self.auth_mode != CODEX_MODE or not isinstance(selected, str)
+                or selected.removesuffix("-fast") not in CODEX_IMAGE_MODELS
+                or options.get("model", selected) != selected
+                or any(key in self.extra_request_params for key in ("input", "model", "extra_body"))):
+            return facts
+        calls: set[str] = set()
+        for index, message in enumerate(request.messages):
+            blocks = message.content if isinstance(message.content, list) else []
+            if message.role == "assistant":
+                calls.update(b.id for b in blocks if isinstance(b, ToolCallBlock))
+                calls.update(c.id for c in getattr(message, "tool_calls", None) or [])
+            elif message.role == "user":
+                if isinstance(message.content, str) or all(
+                    isinstance(b, (TextBlock, ThinkingBlock, ImageBlock)) for b in blocks
+                ):
+                    facts["positions"].append({"message_index": index, "role": "user"})
+            elif (message.role == "tool" and message.tool_call_id
+                  and message.tool_call_id in calls
+                  and (isinstance(message.content, str) or all(
+                      isinstance(b, (TextBlock, ImageBlock)) for b in blocks
+                  ))):
+                facts["positions"].append({"message_index": index, "role": "tool"})
+                calls.remove(message.tool_call_id)
+        return facts
+
     def _convert_content(
         self, content: str | list[Any], role: str = "user"
     ) -> list[dict[str, Any]]:
@@ -966,6 +1020,7 @@ class ChatGPTProvider:
         - str → [{type: input_text|output_text, text}]
         - TextBlock → {type: input_text|output_text, text}
         - ThinkingBlock → {type: input_text|output_text, text: block.thinking}
+        - ImageBlock → native input_image (validated base64 PNG/JPEG only)
         - Other block types (ToolCallBlock, ToolResultBlock) are skipped here
           and handled directly in _build_payload.
 
@@ -982,6 +1037,12 @@ class ChatGPTProvider:
                 result.append({"type": text_type, "text": block.text})
             elif isinstance(block, ThinkingBlock):
                 result.append({"type": text_type, "text": block.thinking})
+            elif isinstance(block, ImageBlock):
+                if block.model_extra:
+                    unsupported_image(
+                        "image detail/extra fields are not translated by this adapter."
+                    )
+                result.append(image_part(block.source, role))
             # ToolCallBlock and ToolResultBlock are handled in _build_payload
         return result
 
@@ -1030,6 +1091,18 @@ class ChatGPTProvider:
         input_items: list[dict[str, Any]] = []
 
         for message in request.messages:
+            if isinstance(message.content, list):
+                for block in message.content:
+                    if isinstance(block, ImageBlock) and message.role not in {"user", "tool"}:
+                        unsupported_image(
+                            "put images in user content or structured ToolResultBlock.output; "
+                            "assistant/system/developer images are not supported."
+                        )
+                    if (isinstance(block, ToolResultBlock) and message.role != "tool"
+                            and has_tool_images(block.output)):
+                        unsupported_image(
+                            "image-bearing ToolResultBlock requires the tool message role."
+                        )
             # First system/developer message becomes top-level instructions
             if message.role in ("system", "developer") and instructions is None:
                 if isinstance(message.content, str):
@@ -1077,15 +1150,58 @@ class ChatGPTProvider:
                             ),
                         }
                     )
+                # Core also permits tool calls on Message.tool_calls. Preserve
+                # that actual host shape without duplicating ToolCallBlocks.
+                embedded = {
+                    b.id for b in message.content if isinstance(b, ToolCallBlock)
+                } if isinstance(message.content, list) else set()
+                for call in getattr(message, "tool_calls", None) or []:
+                    if call.id not in embedded:
+                        input_items.append({
+                            "type": "function_call", "call_id": call.id,
+                            "name": call.name, "arguments": json.dumps(call.arguments),
+                        })
 
             elif message.role == "tool":
                 # Tool result messages → standalone function_call_output items
                 if isinstance(message.content, list):
+                    if any(isinstance(b, ImageBlock) for b in message.content):
+                        if any(isinstance(b, ToolResultBlock) for b in message.content):
+                            unsupported_image(
+                                "do not mix direct tool image content and ToolResultBlock carriers."
+                            )
+                        call_id = message.tool_call_id
+                        if not call_id or not any(
+                            item.get("type") == "function_call" and item.get("call_id") == call_id
+                            for item in input_items
+                        ):
+                            unsupported_image(
+                                "tool images require an actual tool_call_id and preceding assistant call."
+                            )
+                        parts = []
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                parts.append({"type": "input_text", "text": block.text})
+                            elif isinstance(block, ImageBlock):
+                                if block.model_extra:
+                                    unsupported_image("tool image detail/extra fields are not translated.")
+                                parts.append(image_part(block.source, role="tool"))
+                            else:
+                                unsupported_image("direct tool image content accepts only text/image blocks.")
+                        input_items.append({
+                            "type": "function_call_output", "call_id": call_id, "output": parts,
+                        })
+                        continue
                     for block in message.content:
                         if isinstance(block, ToolResultBlock):
-                            output = block.output
-                            if not isinstance(output, str):
-                                output = json.dumps(output)
+                            if has_tool_images(block.output) and not any(
+                                item.get("type") == "function_call" and item.get("call_id") == block.tool_call_id
+                                for item in input_items
+                            ):
+                                unsupported_image(
+                                    "tool image results require a preceding assistant call with the same ID."
+                                )
+                            output = tool_output(block.output)
                             input_items.append(
                                 {
                                     "type": "function_call_output",
@@ -1153,6 +1269,11 @@ class ChatGPTProvider:
         # known-rejected-params warning: this backend enforces a strict
         # payload schema.
         if self.extra_request_params:
+            if "input" in self.extra_request_params and image_values(payload):
+                unsupported_image(
+                    "extra_request_params.input would replace image-bearing message history; "
+                    "remove the override rather than silently losing attachments."
+                )
             if self.auth_mode == plan_auth.MODE and request.tools and "tools" in self.extra_request_params:
                 raise kernel_errors.InvalidRequestError(
                     "ChatGPT plan tools were supplied twice. Use request.tools or extra_request_params.tools; neither list will be silently replaced.",
@@ -1162,7 +1283,8 @@ class ChatGPTProvider:
             payload.update(self.extra_request_params)
 
         if self.auth_mode == plan_auth.MODE:
-            return prepare_plan_payload(payload, request)
+            payload = prepare_plan_payload(payload, request)
+        validate_image_budget(payload, plan=self.auth_mode == plan_auth.MODE)
         return payload
 
     # ------------------------------------------------------------------
@@ -1528,7 +1650,7 @@ class ChatGPTProvider:
                 "message_count": len(request.messages),
             }
             if self.raw:
-                req_event["raw"] = redact_secrets(payload)
+                req_event["raw"] = redact_secrets(diagnostic_copy(payload, image_values(payload)))
             await self._coordinator.hooks.emit("llm:request", req_event)
 
         start_time = time.monotonic()
@@ -1584,7 +1706,9 @@ class ChatGPTProvider:
             if parsed.cache_read_tokens is not None:
                 resp_event["usage"]["cache_read_tokens"] = parsed.cache_read_tokens
             if self.raw:
-                resp_event["raw"] = redact_secrets({"events": parsed.raw_events})
+                resp_event["raw"] = redact_secrets(diagnostic_copy(
+                    {"events": parsed.raw_events}, image_values(payload)
+                ))
             await self._coordinator.hooks.emit("llm:response", resp_event)
         return result
 
@@ -1594,6 +1718,7 @@ class ChatGPTProvider:
     ) -> tuple[ChatResponse, ParsedResponse]:
         """One transport attempt; no terminal error hooks before retry exhaustion."""
         headers = self._build_headers()
+        known_images = image_values(payload)
         _has_hooks = self._coordinator and hasattr(self._coordinator, "hooks")
 
         # Per-request streaming override (does NOT mutate config-level setting).
@@ -1615,6 +1740,18 @@ class ChatGPTProvider:
 
         # Local guard variable — concurrency-safe (no instance-level mutation).
         service_request_id: str | None = None
+        image_echoes: dict[tuple[int, str], ImageEchoStream] = {}
+
+        async def display_delta(idx: int, block_type: str, text: str, *, final: bool = False):
+            redactor = image_echoes.setdefault((idx, block_type), ImageEchoStream(known_images))
+            text = redactor.feed(text, final=final)
+            if text:
+                state["exposed"] = True
+                await self._coordinator.hooks.emit("llm:stream_block_delta", {
+                    "request_id": request_id, "block_index": idx,
+                    "block_type": block_type, "sequence": seq.get(idx, 0), "text": text,
+                })
+                seq[idx] = seq.get(idx, 0) + 1
 
         try:
             # 4. Two-attempt loop: first attempt + one optional retry on 401.
@@ -1640,6 +1777,7 @@ class ChatGPTProvider:
                             # 5. Check HTTP status — map to kernel error types.
                             if resp.status_code != 200:
                                 error_body = await resp.aread()
+                                error_body = safe_error_body(error_body, known_images)
                                 status = resp.status_code
 
                                 if self.auth_mode == plan_auth.MODE:
@@ -1712,7 +1850,6 @@ class ChatGPTProvider:
 
                                 if not isinstance(event, dict):
                                     continue
-
                                 raw_event_type = event.get("type", "")
                                 et = (
                                     raw_event_type
@@ -1750,17 +1887,7 @@ class ChatGPTProvider:
                                     if delta_text:
                                         idx = event.get("output_index", 0)
                                         state["exposed"] = any_emitted = True
-                                        await self._coordinator.hooks.emit(
-                                            "llm:stream_block_delta",
-                                            {
-                                                "request_id": request_id,
-                                                "block_index": idx,
-                                                "block_type": "text",
-                                                "sequence": seq.get(idx, 0),
-                                                "text": delta_text,
-                                            },
-                                        )
-                                        seq[idx] = seq.get(idx, 0) + 1
+                                        await display_delta(idx, "text", delta_text)
                                         any_emitted = True
 
                                 elif et in (
@@ -1771,21 +1898,14 @@ class ChatGPTProvider:
                                     if delta_text:
                                         idx = event.get("output_index", 0)
                                         state["exposed"] = any_emitted = True
-                                        await self._coordinator.hooks.emit(
-                                            "llm:stream_block_delta",
-                                            {
-                                                "request_id": request_id,
-                                                "block_index": idx,
-                                                "block_type": "thinking",
-                                                "sequence": seq.get(idx, 0),
-                                                "text": delta_text,
-                                            },
-                                        )
-                                        seq[idx] = seq.get(idx, 0) + 1
+                                        await display_delta(idx, "thinking", delta_text)
                                         any_emitted = True
 
                                 elif et == "response.output_item.done":
                                     idx = event.get("output_index", 0)
+                                    for echo_idx, echo_type in list(image_echoes):
+                                        if echo_idx == idx:
+                                            await display_delta(idx, echo_type, "", final=True)
                                     if idx in block_types:
                                         state["exposed"] = any_emitted = True
                                         await self._coordinator.hooks.emit(
@@ -1831,7 +1951,7 @@ class ChatGPTProvider:
                                                 "request_id": request_id,
                                                 "error": {
                                                     "type": "error",
-                                                    "msg": err_msg,
+                                                    "msg": safe_image_text(err_msg, known_images),
                                                 },
                                             },
                                         )
@@ -1851,6 +1971,9 @@ class ChatGPTProvider:
                     raise
 
             # 6. Parse SSE events.
+            if emit_stream_events:
+                for echo_idx, echo_type in list(image_echoes):
+                    await display_delta(echo_idx, echo_type, "", final=True)
             parsed = parse_sse_events(
                 lines,
                 collect_raw=self.raw,
@@ -1873,40 +1996,43 @@ class ChatGPTProvider:
                         "request_id": request_id,
                         "error": {
                             "type": type(exc).__name__,
-                            "msg": str(exc),
+                            "msg": safe_image_text(str(exc), known_images),
                         },
                     },
                 )
             code = exc.code or ""
-            msg = str(exc).lower()
+            message = safe_image_text(str(exc), known_images)
+            msg = message.lower()
 
             if self.auth_mode == plan_auth.MODE and (
                 code.startswith(("subscription_sharing_", "chatpass_v2_"))
             ):
-                mapped_exc = _plan_error(code, str(exc), provider=self.name)
-            elif (coded := _coded_error(code, str(exc), self.name)) is not None:
+                mapped_exc = _plan_error(code, message, provider=self.name)
+            elif (coded := _coded_error(code, message, self.name)) is not None:
                 mapped_exc = coded
             elif code == "context_length_exceeded" or (
                 not code
                 and any(kw in msg for kw in ("context length", "too many tokens"))
             ):
                 mapped_exc = kernel_errors.ContextLengthError(
-                    str(exc), provider=self.name, retryable=False
+                    message, provider=self.name, retryable=False
                 )
             elif any(kw in msg for kw in ("content filter", "safety", "blocked")):
                 mapped_exc = kernel_errors.ContentFilterError(
-                    str(exc), provider=self.name, retryable=False
+                    message, provider=self.name, retryable=False
                 )
             else:
                 mapped_exc = kernel_errors.LLMError(
-                    str(exc), provider=self.name, retryable=False
+                    message, provider=self.name, retryable=False
                 )
 
             if self.auth_mode == plan_auth.MODE:
                 mapped_exc.error_code = exc.code
                 mapped_exc.error_param = getattr(exc, "param", None)
                 mapped_exc.request_id = service_request_id
-                mapped_exc.response_body = redact_secrets(getattr(exc, "details", {}))
+                mapped_exc.response_body = redact_secrets(diagnostic_copy(
+                    getattr(exc, "details", {}), known_images
+                ))
             details = getattr(exc, "details", {})
             response = details.get("response", {}) if isinstance(details, dict) else {}
             error_data = details.get("error", details if exc.event_type == "error" else None) if isinstance(details, dict) else None
@@ -1914,7 +2040,7 @@ class ChatGPTProvider:
                 error_data = response.get("error")
             if isinstance(error_data, dict):
                 mapped_exc.retry_after = _retry_after(error_data.get("retry_after"))
-            raise mapped_exc from exc
+            raise mapped_exc from (None if known_images else exc)
 
         except httpx.TimeoutException as exc:
             # Timeout → LLMTimeoutError (retryable).
@@ -1926,16 +2052,16 @@ class ChatGPTProvider:
                         "request_id": request_id,
                         "error": {
                             "type": type(exc).__name__,
-                            "msg": str(exc),
+                            "msg": safe_image_text(str(exc), known_images),
                         },
                     },
                 )
             mapped_timeout = kernel_errors.LLMTimeoutError(
-                f"ChatGPT API request timed out: {exc}",
+                f"ChatGPT API request timed out: {safe_image_text(str(exc), known_images)}",
                 provider=self.name,
                 retryable=True,
             )
-            raise mapped_timeout from exc
+            raise mapped_timeout from (None if known_images else exc)
 
         except httpx.TransportError as exc:
             # Transport / connection errors → ProviderUnavailableError (retryable).
@@ -1949,16 +2075,16 @@ class ChatGPTProvider:
                         "request_id": request_id,
                         "error": {
                             "type": type(exc).__name__,
-                            "msg": str(exc),
+                            "msg": safe_image_text(str(exc), known_images),
                         },
                     },
                 )
             mapped_unavail = kernel_errors.ProviderUnavailableError(
-                f"ChatGPT API connection error: {exc}",
+                f"ChatGPT API connection error: {safe_image_text(str(exc), known_images)}",
                 provider=self.name,
                 retryable=True,
             )
-            raise mapped_unavail from exc
+            raise mapped_unavail from (None if known_images else exc)
 
         except Exception as exc:
             # Catch-all: wrap in LLMError so callers always receive a typed error.
@@ -1970,13 +2096,13 @@ class ChatGPTProvider:
                         "request_id": request_id,
                         "error": {
                             "type": type(exc).__name__,
-                            "msg": str(exc),
+                            "msg": safe_image_text(str(exc), known_images),
                         },
                     },
                 )
             raise kernel_errors.LLMError(
-                str(exc), provider=self.name, retryable=False
-            ) from exc
+                safe_image_text(str(exc), known_images), provider=self.name, retryable=False
+            ) from (None if known_images else exc)
 
     def _to_chat_response(self, parsed: ParsedResponse, model: str) -> ChatResponse:
         """Convert a ``ParsedResponse`` into an Amplifier ``ChatResponse``.

@@ -76,10 +76,10 @@ def prepare_plan_payload(
     for message in request.messages:
         if isinstance(message.content, list):
             for block in message.content:
-                if block.type not in {"text", "thinking", "tool_call", "tool_result"}:
+                if block.type not in {"text", "thinking", "image", "tool_call", "tool_result"}:
                     _unsupported(
                         f"messages.content.{block.type}",
-                        "This provider's plan adapter currently supports text and function-call history; this content cannot be silently omitted.",
+                        "This provider's plan adapter supports text, validated base64 images and function-call history; this content cannot be silently omitted.",
                     )
     for param in sorted(UNSUPPORTED_FIELDS):
         # ChatRequest.metadata is local provider/event control (for example,
