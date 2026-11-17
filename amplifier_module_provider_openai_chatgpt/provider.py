@@ -1423,7 +1423,13 @@ class ChatGPTProvider:
 
         def binding():
             # Account identity only, not token bytes or token-rotation policy.
-            tokens = self._tokens or {}
+            # A cold file-backed instance has not loaded its selected record
+            # yet. Pin that record's account before the auth await instead of
+            # pinning None and rejecting the normal same-account bootstrap.
+            tokens = self._tokens
+            if tokens is None and not self._tokens_injected:
+                tokens = load_tokens(path=self._token_file_path)
+            tokens = tokens if isinstance(tokens, dict) else {}
             account = tuple(tokens.get(k) for k in ("account_id", "subject", "client_id"))
             return (
                 id(self._coordinator), self.auth_mode, self._token_file_path,

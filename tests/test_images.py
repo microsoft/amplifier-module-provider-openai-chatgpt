@@ -1064,3 +1064,60 @@ def test_explicit_name_wins_over_loop_tool_alias_without_extra_equality_conflict
     assert [item for item in payload["input"] if item.get("type") == "function_call"] == [{
         "type": "function_call", "call_id": "c", "name": "explicit", "arguments": "{}",
     }]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["same", "different", "missing-selected-file", "known-memory-account"])
+async def test_cold_media_guard_pins_selected_file_not_unknown_wildcard(
+    provider, monkeypatch, tmp_path, change,
+):
+    from datetime import datetime, timedelta, timezone
+    import time
+    from amplifier_module_provider_openai_chatgpt import plan_auth
+
+    selected = {
+        "auth_mode": provider.auth_mode, "access_token": "offline-cold-unit",
+        **(
+            {"subject": "selected", "client_id": "selected-client",
+             "scopes": [plan_auth.PLAN_SCOPE], "expires_at": time.time() + 3600}
+            if provider.auth_mode == "chatgpt_plan" else
+            {"account_id": "selected",
+             "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()}
+        ),
+    }
+    account_key = "subject" if provider.auth_mode == "chatgpt_plan" else "account_id"
+    auth_path = tmp_path / "synthetic-cold.json"
+    if change != "missing-selected-file":
+        auth_path.write_text(json.dumps(selected))
+    provider._token_file_path = str(auth_path)
+    provider._tokens = selected.copy() if change == "known-memory-account" else None
+    provider._tokens_injected = False
+    request, witness = witness_request(provider)
+    sends = []
+    real_ensure = ChatGPTProvider._ensure_valid_tokens.__get__(provider)
+
+    async def ensure():
+        if change in {"different", "known-memory-account"}:
+            changed = {**selected, account_key: "different"}
+            # Simulate normal loading/refresh resolving another identity; the
+            # guard must reject it, not accept any account after a cold None.
+            provider._tokens = changed
+        elif change == "missing-selected-file":
+            provider._tokens = selected.copy()
+        else:
+            await real_ensure()
+
+    provider._ensure_valid_tokens = ensure
+
+    def handle(wire):
+        sends.append(wire.content)
+        return httpx.Response(200, text=completed())
+
+    install_transport(monkeypatch, handle)
+    if change == "same":
+        await provider.complete(request)
+        assert len(sends) == 1 and witness.calls
+    else:
+        with pytest.raises(llm_errors.InvalidRequestError):
+            await provider.complete(request)
+        assert sends == []

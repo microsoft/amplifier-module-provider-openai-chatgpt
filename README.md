@@ -277,6 +277,11 @@ performed after fit. This optional structural boundary imports no Foundation
 runtime code; legacy inline requests without media capability/references remain
 compatible. The host owns actual candidate identity and lifetime, and must
 qualify its installed composition separately.
+Cold file-backed providers pin the configured record's account identity before
+authentication, so loading that same record is not mistaken for an account
+switch. This does not treat an unknown account as a wildcard: a changed loaded
+account, missing selection, or changed host private binding still refuses.
+No public text warm-up, rehydration or refit is needed for that bootstrap.
 
 Plan image requests check the public API's documented 1,500-image and 512 MB
 total serialized-payload limits (MB is conservatively decimal here). These are
