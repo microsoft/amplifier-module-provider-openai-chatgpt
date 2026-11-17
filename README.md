@@ -190,6 +190,16 @@ extra wire fields fail locally after merging extras. Plan mode retains its
 stricter explicit-parameter rejection. Other effort values are not newly
 advertised or inferred from public API documentation.
 
+**Subscription effort pass-through is channel-specific.** The public OpenAI
+API model/effort registry is **not** an allowlist for ChatGPT Codex or ChatGPT
+plan subscriptions. Non-`none` values already accepted by this provider,
+including `high`, `minimal`, `xhigh` and `max`, pass through unchanged for exact
+6.2 Astra/Sol IDs and their established `-fast` forms, whether supplied by a
+request, mount configuration or extra wire parameters. Account-reported
+metadata and the selected subscription backend determine support; pass-through
+does not claim that every account accepts each value. This does not change
+literal request `none` rejection or mount-config `none` omission above.
+
 Resolution happens **lazily**, at the first moment a concrete model name is
 actually needed (the first `complete()` call), and is **cached** for the
 provider instance's lifetime -- it does not re-fetch on every request. A

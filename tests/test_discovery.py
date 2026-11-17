@@ -842,6 +842,67 @@ async def test_62_final_completion_keeps_transport_identity_and_terminal_errors(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", [
+    "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-fast", "gpt-6.2-sol-fast",
+])
+@pytest.mark.parametrize("effort", ["high", "minimal", "xhigh", "max"])
+@pytest.mark.parametrize("source", ["request", "config", "extra"])
+async def test_62_subscription_effort_passes_through_complete_to_wire(
+    provider, monkeypatch, model, effort, source,
+):
+    """Public API effort registries are not a subscription-channel allowlist."""
+    config = {
+        "auth_mode": provider.auth_mode,
+        "default_model": model,
+        "max_retries": 0,
+        "reasoning_effort": effort if source == "config" else "medium",
+    }
+    if source == "extra":
+        config["extra_request_params"] = {"reasoning": {"effort": effort}}
+    p = ChatGPTProvider(config, tokens=provider._tokens)
+    p._ensure_valid_tokens = AsyncMock()
+    original = copy.deepcopy(config)
+    calls = []
+    wire_id = model.removesuffix("-fast") if p.auth_mode == CODEX_MODE else model
+
+    def handle(request):
+        calls.append(request)
+        assert request.method == "POST"
+        assert str(request.url) == (
+            provider_module.CHATGPT_CODEX_ENDPOINT
+            if p.auth_mode == CODEX_MODE else plan_auth.RESOURCE + "/responses"
+        )
+        assert request.headers["authorization"] == "Bearer fixture-access-token"
+        if p.auth_mode == CODEX_MODE:
+            assert request.headers["chatgpt-account-id"] == "fixture-account"
+        else:
+            assert "chatgpt-account-id" not in request.headers
+        body = json.loads(request.content)
+        assert body["model"] == wire_id
+        assert body["reasoning"]["effort"] == effort
+        assert body["stream"] is True and body["store"] is False
+        assert body.get("service_tier") == (
+            "priority" if model.endswith("-fast") and p.auth_mode == CODEX_MODE else None
+        )
+        return httpx.Response(200, text="data: " + json.dumps({
+            "type": "response.completed",
+            "response": {"id": "effort-fixture", "model": wire_id, "output": [],
+                         "usage": {"input_tokens": 1, "output_tokens": 0}},
+        }) + "\n\n")
+
+    _install_transport(monkeypatch, handle)
+    response = await p.complete(ChatRequest(
+        messages=[Message(role="user", content="test")],
+        reasoning_effort=effort if source == "request" else None,
+    ))
+    assert response.usage.input_tokens == 1
+    assert len(calls) == 1  # No alternate endpoint, model, or inference attempt.
+    assert config == original
+    assert p.default_model == model
+    p._ensure_valid_tokens.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("pin", [
     "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-sol-fast",
 ])
