@@ -97,11 +97,7 @@ async def test_actual_private_witness_at_each_physical_send(
         output = body["input"][-1]
         if role == "tool":
             assert output["type"] == "function_call_output" and output["call_id"] == "actual"
-        if mode == "chatgpt_codex":
-            assert encoded in wire.content.decode()
-        else:
-            assert encoded not in wire.content.decode()
-            assert "Image unavailable" in wire.content.decode()
+        assert encoded in wire.content.decode()
         if len(calls) == 1:
             return httpx.Response(
                 401 if boundary == "401" else 503,
@@ -234,10 +230,7 @@ async def test_cold_file_auth_and_same_session_resume_preserve_selected_account(
             assert wire.headers["authorization"] == "Bearer offline-synthetic-only"
             if mode == "chatgpt_codex":
                 assert wire.headers["chatgpt-account-id"] == "selected-account"
-                assert encoded in wire.content.decode()
-            else:
-                assert encoded not in wire.content.decode()
-                assert "Image unavailable" in wire.content.decode()
+            assert encoded in wire.content.decode()
             if boundary in {"401-account-change", "backoff-account-change"}:
                 return httpx.Response(
                     401 if boundary == "401-account-change" else 503,

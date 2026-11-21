@@ -22,7 +22,7 @@ from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
 @pytest.fixture(params=["chatgpt_codex", "chatgpt_plan"])
 def provider(request):
     p = ChatGPTProvider(
-        {"auth_mode": request.param, "default_model": "exact-model", "max_retries": 0},
+        {"auth_mode": request.param, "default_model": "gpt-6.2-sol", "max_retries": 0},
         tokens={"auth_mode": request.param, "access_token": "offline-token", "account_id": "offline-account"},
     )
     p._ensure_valid_tokens = AsyncMock()
@@ -379,7 +379,7 @@ def test_indexed_facts_exact_models_positions_and_nonmutation(provider, model):
     assert facts == {
         "v": 2, "mime_types": ["image/png", "image/jpeg"],
         "positions": [{"message_index": 1, "role": "user"}, {"message_index": 3, "role": "tool"}]
-        if provider.auth_mode == "chatgpt_codex" else [],
+        if provider.auth_mode == "chatgpt_codex" or model in _images.PLAN_IMAGE_MODELS else [],
     }
     assert request.model_dump() == before and options == {"model": model}
     facts["positions"].clear()
@@ -387,7 +387,7 @@ def test_indexed_facts_exact_models_positions_and_nonmutation(provider, model):
         request=request, model=model, request_options=options,
     )["positions"] == (
         [{"message_index": 1, "role": "user"}, {"message_index": 3, "role": "tool"}]
-        if provider.auth_mode == "chatgpt_codex" else []
+        if provider.auth_mode == "chatgpt_codex" or model in _images.PLAN_IMAGE_MODELS else []
     )
 
 
@@ -566,7 +566,7 @@ def test_cold_history_dictionary_tool_calls(provider):
     before = request.model_dump()
     facts = provider.get_media_request_support_for_request(request=request, model="gpt-6.1-sol")
     assert facts["positions"] == (
-        [{"message_index": 1, "role": "tool"}] if provider.auth_mode == "chatgpt_codex" else []
+        [{"message_index": 1, "role": "tool"}]
     )
     payload = provider._build_payload(request)
     assert payload["input"][-2] == {
@@ -1023,10 +1023,7 @@ async def test_real_loop_tool_key_two_http_continuation(
     ])
     original = copy.deepcopy(request.model_dump())
     facts = provider.get_media_request_support_for_request(request=request, model="gpt-6.1-sol")
-    if provider.auth_mode == "chatgpt_codex":
-        assert {"message_index": 2, "role": "tool"} in facts["positions"]
-    else:
-        assert facts["positions"] == []
+    assert {"message_index": 2, "role": "tool"} in facts["positions"]
     second = await provider.complete(request)
     assert second.content[0].text == "continued"
     assert len(sent) == 2 and request.model_dump() == original
@@ -1128,3 +1125,97 @@ async def test_cold_media_guard_pins_selected_file_not_unknown_wildcard(
         with pytest.raises(llm_errors.InvalidRequestError):
             await provider.complete(request)
         assert sends == []
+
+@pytest.mark.asyncio
+async def test_selected_account_modality_drives_discovery_and_delivery(provider, monkeypatch):
+    encoded = source()
+    content = request_for(encoded)
+    calls = []
+    listing = [
+        {"slug": slug, "input_modalities": modalities, "display_name": slug,
+         "visibility": "list", "supported_in_api": True}
+        for slug, modalities in (
+            ("gpt-6.2-sol", ["text"]), ("test-account-vision", ["text", "image"]),
+        )
+    ]
+
+    def handle(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"models": listing})
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, text=completed())
+
+    install_transport(monkeypatch, handle)
+    listed = {row.id: row.capabilities for row in await provider.list_models(filters={})}
+    assert listed == {"gpt-6.2-sol": [], "test-account-vision": ["vision"]}
+    for model, positions in [
+        ("test-account-vision", [{"message_index": 0, "role": "user"}]),
+        ("gpt-6.2-sol", []),
+    ]:
+        content.model = model
+        assert provider.get_media_request_support_for_request(
+            request=content, model=model,
+        )["positions"] == positions
+        if positions:
+            await provider.complete(content)
+        else:
+            with pytest.raises(llm_errors.InvalidRequestError, match="verified image"):
+                await provider.complete(content)
+    await provider.complete(ChatRequest(model="gpt-6.2-sol", messages=[Message(role="user", content="hi")]))
+    assert [call["model"] for call in calls] == ["test-account-vision", "gpt-6.2-sol"]
+    assert calls[0]["input"][0]["content"][0] == {
+        "type": "input_image", "image_url": f"data:image/png;base64,{encoded['data']}",
+    }
+    provider._tokens["account_id"] = "another-test-account"
+    assert not provider.get_media_request_support_for_request(
+        request=request_for(encoded), model="test-account-vision",
+    )["positions"]
+
+
+@pytest.mark.asyncio
+async def test_inline_and_persisted_tool_images_work_with_an_unrelated_media_capability(
+    provider, monkeypatch,
+):
+    class OtherCapability:
+        version = 1
+
+        def validate(self, *args, **kwargs):
+            pytest.fail("inline inputs do not belong to a saved reference")
+
+    provider._coordinator = SimpleNamespace(get_capability=lambda _: OtherCapability())
+    blob = source()
+    parts = [TextBlock(text="look").model_dump(), ImageBlock(source=blob).model_dump()]
+    request = ChatRequest(messages=[
+        Message(role="user", content=[ImageBlock(source=blob)]),
+        Message(role="assistant", content=[ToolCallBlock(id="f", name="read", input={})]),
+        Message(role="tool", content=[ToolResultBlock(tool_call_id="f", output=parts)]),
+    ])
+    expected_image = {"type": "input_image", "image_url": f"data:image/png;base64,{blob['data']}"}
+
+    def handle(wire):
+        items = json.loads(wire.content)["input"]
+        assert items[0]["content"] == [expected_image]
+        assert items[-1] == {"type": "function_call_output", "call_id": "f", "output": [
+            {"type": "input_text", "text": "look"}, expected_image,
+        ]}
+        return httpx.Response(200, text=completed())
+
+    install_transport(monkeypatch, handle)
+    await provider.complete(request)
+
+@pytest.mark.parametrize("fmt", ["core", "mcp"])
+def test_tool_result_envelope_keeps_call_pixels_and_status(provider, fmt):
+    src = source()
+    block = ({"type": "image", "source": src} if fmt == "core"
+             else {"type": "image", "mimeType": src["media_type"], "data": src["data"]})
+    result = {"isError": False, "content": [block]}
+    request = ChatRequest(messages=[
+        Message(role="assistant", content=[ToolCallBlock(id="result", name="read", input={})]),
+        Message(role="tool", content=[ToolResultBlock(tool_call_id="result", output=result)]),
+    ])
+    assert provider._build_payload(request)["input"][-1] == {
+        "type": "function_call_output", "call_id": "result", "output": [
+            {"type": "input_text", "text": '{"isError": false}'},
+            {"type": "input_image", "image_url": "data:image/png;base64," + src["data"]},
+        ],
+    }

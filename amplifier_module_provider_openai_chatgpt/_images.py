@@ -15,13 +15,16 @@ PLAN_MAX_PAYLOAD_BYTES = 512_000_000
 PLAN_MAX_IMAGES = 1500
 _FORMATS = {"image/png", "image/jpeg"}
 _DATA_URL = re.compile(r"data:image/[^;,\s]+;base64,[A-Za-z0-9+/=]+")
-# Exact first-party input_modalities facts, not entitlement or plan discovery.
-IMAGE_MODEL_EVIDENCE = "https://github.com/openai/codex/blob/65a5410f72dac1f4b40862c34ef0a8b71b12834a/codex-rs/models-manager/models.json"
-CODEX_IMAGE_MODELS = frozenset({
-    "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna",
-    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
-    "gpt-daybreak-blue-latest", "gpt-daybreak-red-latest", "codex-auto-review",
+# The Codex client publishes explicit input modalities. Plan supports image input
+# for public models that accept it, subject to the signed-in account's catalog.
+IMAGE_MODEL_EVIDENCE = "https://github.com/openai/codex/blob/7edf91b13c54f20aab22fece0abfa4a5c28379b3/codex-rs/models-manager/models.json"
+PLAN_IMAGE_MODELS = frozenset({
+    "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra",
+    "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
 })
+CODEX_IMAGE_MODELS = PLAN_IMAGE_MODELS | {
+    "gpt-daybreak-blue-latest", "gpt-daybreak-red-latest", "codex-auto-review",
+}
 
 
 def unsupported_image(explanation: str) -> None:
@@ -71,14 +74,16 @@ def image_part(source: Any, role: str = "user") -> dict[str, str]:
 
 
 def has_tool_images(output: Any) -> bool:
-    # Recognize actual Core carriers, not business records with type="image".
+    # A tool may return the block list directly or inside its content field.
+    if isinstance(output, dict):
+        output = output.get("content")
     return isinstance(output, list) and any(
         isinstance(item, dict) and item.get("type") == "image"
         and (
-            set(item) == {"type", "source"} and isinstance(item["source"], dict)
+            isinstance(item.get("source"), dict)
             and isinstance(item["source"].get("type"), str)
             and item["source"]["type"] in {"base64", "url", "file", "path"}
-            or set(item) == {"type", "data", "mimeType"}  # Native MCP, not Core.
+            or "data" in item and "mimeType" in item  # Native MCP content.
         )
         for item in output
     )
@@ -88,32 +93,32 @@ def tool_output(output: Any) -> Any:
     """Promote only an explicit image-bearing Core content list, never JSON text."""
     if not has_tool_images(output):
         return output if isinstance(output, str) else json.dumps(output)
-    # Promotion is all-or-nothing, with an unambiguous Core content schema.
-    # Known native media in a mixed/malformed list must not become JSON pixels.
-    if not all(
-        isinstance(item, dict) and (
-            item.get("type") == "text" and set(item) == {"type", "text"}
-            and isinstance(item["text"], str)
-            or item.get("type") == "image" and set(item) == {"type", "source"}
-        ) for item in output
-    ):
-        unsupported_image("native tool images require a complete Core text/image block list.")
     parts = []
+    if isinstance(output, dict):
+        fields = {k: v for k, v in output.items() if k != "content"}
+        # Other fields may themselves carry opaque tool data. Qualify known
+        # status fields only, and refuse mixed envelopes without serializing.
+        if any(k not in {"isError", "is_error", "success"} or not isinstance(v, bool)
+               for k, v in fields.items()):
+            unsupported_image("unsupported fields alongside tool image content.")
+        if fields:
+            parts.append({"type": "input_text", "text": json.dumps(fields)})
+        output = output["content"]
     for item in output:
         if not isinstance(item, dict):
-            unsupported_image(
-                "tool image content must be a list of text/image block objects."
-            )
-        if item.get("type") == "text" and isinstance(item.get("text"), str):
-            if set(item) - {"type", "text"}:
-                unsupported_image("tool text blocks accept only type and text.")
+            unsupported_image("native tool images require a complete Core text/image block list.")
+        kind = item.get("type")
+        keys = item.keys() - {"visibility"}
+        if kind == "text" and keys == {"type", "text"} and isinstance(item["text"], str):
             parts.append({"type": "input_text", "text": item["text"]})
-        elif item.get("type") == "image" and set(item) <= {"type", "source"}:
-            parts.append(image_part(item.get("source"), role="tool"))
+        elif kind == "image" and keys == {"type", "source"}:
+            parts.append(image_part(item["source"], role="tool"))
+        elif kind == "image" and keys == {"type", "data", "mimeType"}:
+            parts.append(image_part({
+                "type": "base64", "media_type": item["mimeType"], "data": item["data"],
+            }, role="tool"))
         else:
-            unsupported_image(
-                "tool image content supports only explicit text/image blocks."
-            )
+            unsupported_image("native tool images require a complete Core text/image block list.")
     return parts
 
 

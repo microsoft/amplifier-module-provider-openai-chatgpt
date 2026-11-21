@@ -41,6 +41,7 @@ from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from . import plan_auth
 from ._images import (
     CODEX_IMAGE_MODELS,
+    PLAN_IMAGE_MODELS,
     ImageEchoStream,
     diagnostic_copy,
     has_tool_images,
@@ -517,6 +518,7 @@ class ChatGPTProvider:
             key="models_cache_ttl",
             default=DEFAULT_CACHE_TTL_SECONDS,
         )
+        self._media_catalog: tuple[float, tuple, dict[str, bool]] | None = None
         self._models_cache: tuple[float, list[ModelInfo]] | None = None
         self._models_lock = asyncio.Lock()
 
@@ -728,7 +730,10 @@ class ChatGPTProvider:
                     client_version=self.models_client_version,
                     strict=True,
                 )
-            models = to_model_infos(entries, include_speed_variants=False, strict=True)
+            models = to_model_infos(
+                entries, include_speed_variants=False, strict=True, image_models=self._image_models,
+            )
+            self._remember_media_catalog(models)
         except kernel_errors.LLMError:
             raise
         except httpx.TimeoutException:
@@ -802,7 +807,8 @@ class ChatGPTProvider:
                     )
                 if not entries:
                     raise ValueError("Live model catalog returned 0 usable entries")
-                models = to_model_infos(entries)
+                models = to_model_infos(entries, image_models=self._image_models)
+                self._remember_media_catalog(models)
                 self._models_cache = (time.monotonic(), models)
                 return models
             except kernel_errors.AuthenticationError:
@@ -1085,23 +1091,40 @@ class ChatGPTProvider:
             outstanding.discard(message.tool_call_id)
         return raw_paired
 
+    @property
+    def _image_models(self) -> frozenset[str]:
+        return PLAN_IMAGE_MODELS if self.auth_mode == plan_auth.MODE else CODEX_IMAGE_MODELS
+
+    def _media_account(self) -> tuple:
+        tokens = self._tokens or {}
+        return (self.auth_mode, *(tokens.get(k) for k in ("account_id", "subject", "client_id")))
+
+    def _remember_media_catalog(self, models: list[ModelInfo]) -> None:
+        self._media_catalog = (time.monotonic(), self._media_account(), {
+            row.id: "vision" in row.capabilities for row in models
+        })
+
+    def _accepts_images(self, model: str) -> bool:
+        if self.auth_mode == CODEX_MODE:
+            model = model.removesuffix("-fast")
+        if self._media_catalog is not None:
+            at, account, models = self._media_catalog
+            if account == self._media_account() and time.monotonic() - at < self._models_cache_ttl:
+                if model in models:
+                    return models[model]
+        return model in self._image_models
+
     def get_media_request_support_for_request(
         self, *, request: ChatRequest, model: str,
         request_options: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Read-only indexed adapter facts, not authentication or media authority.
-
-        The exact first-party Codex modality catalogue is positive evidence for
-        Codex only. Plan conversion works, but this provider has no account/model
-        modality fact for automatic hydration on that different transport yet.
-        """
+        """Return eligible request positions without discovery or an LLM call."""
         facts: dict[str, Any] = {
             "v": 2, "positions": [], "mime_types": ["image/png", "image/jpeg"],
         }
         selected = request.model or model
         options = request_options or {}
-        if (self.auth_mode != CODEX_MODE or not isinstance(selected, str)
-                or selected.removesuffix("-fast") not in CODEX_IMAGE_MODELS
+        if (not isinstance(selected, str) or not self._accepts_images(selected)
                 or options.get("model", selected) != selected
                 or any(key in self.extra_request_params for key in ("input", "model", "extra_body"))):
             return facts
@@ -1437,14 +1460,9 @@ class ChatGPTProvider:
             isinstance(message.metadata, dict) and namespace in message.metadata
             for message in request.messages
         )
-        images = any(
-            isinstance(message.content, list) and any(
-                isinstance(block, ImageBlock)
-                or isinstance(block, ToolResultBlock) and has_tool_images(block.output)
-                for block in message.content
-            ) for message in request.messages
-        )
-        if not refs and not (cap is not None and images):
+        # Ordinary inline user and tool images have no stored-media reference.
+        # A host may mount the capability alongside those calls for other turns.
+        if not refs:
             return None
         if cap is None or not callable(getattr(cap, "validate", None)):
             refused()
@@ -1875,6 +1893,10 @@ class ChatGPTProvider:
         if self.auth_mode != plan_auth.MODE and model.endswith("-fast"):
             model = model.removesuffix("-fast")
 
+        known_images = image_values(payload)
+        if known_images and not self._accepts_images(payload["model"]):
+            unsupported_image("the selected model has no verified image input support.")
+
         # 3. Emit llm:request event (NOT re-emitted on retry).
         _has_hooks = self._coordinator and hasattr(self._coordinator, "hooks")
         if _has_hooks:
@@ -1884,11 +1906,12 @@ class ChatGPTProvider:
                 "message_count": len(request.messages),
             }
             if self.raw:
-                req_event["raw"] = redact_secrets(diagnostic_copy(payload, image_values(payload)))
+                req_event["raw"] = redact_secrets(diagnostic_copy(payload, known_images))
             await self._coordinator.hooks.emit("llm:request", req_event)
 
         start_time = time.monotonic()
-        state = {"exposed": False, "auth_refreshed": False, "media_guard": media_guard}
+        state = {"exposed": False, "auth_refreshed": False, "media_guard": media_guard,
+                 "known_images": known_images}
         request_id = str(uuid.uuid4())
         retry_config = self._retry_config
 
@@ -1941,7 +1964,7 @@ class ChatGPTProvider:
                 resp_event["usage"]["cache_read_tokens"] = parsed.cache_read_tokens
             if self.raw:
                 resp_event["raw"] = redact_secrets(diagnostic_copy(
-                    {"events": parsed.raw_events}, image_values(payload)
+                    {"events": parsed.raw_events}, known_images
                 ))
             await self._coordinator.hooks.emit("llm:response", resp_event)
         return result
@@ -1952,7 +1975,7 @@ class ChatGPTProvider:
     ) -> tuple[ChatResponse, ParsedResponse]:
         """One transport attempt; no terminal error hooks before retry exhaustion."""
         headers = self._build_headers()
-        known_images = image_values(payload)
+        known_images = state["known_images"]
         _has_hooks = self._coordinator and hasattr(self._coordinator, "hooks")
 
         # Per-request streaming override (does NOT mutate config-level setting).

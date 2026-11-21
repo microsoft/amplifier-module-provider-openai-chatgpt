@@ -275,7 +275,8 @@ content=[TextBlock(...), ImageBlock(...)])`, paired with a preceding assistant
 tool call. They also accept `ToolResultBlock.output` containing a nonempty list of
 explicit Core block dictionaries, for example `[{type: "text", text: "..."},
 {type: "image", source: {type: "base64", media_type: "image/png", data: ...}}]`.
-Only image-bearing lists of this strict shape become a native
+Equivalent MCP image blocks and tool result envelopes with a content list and
+boolean result status are also supported. Image-bearing lists become a native
 `function_call_output.output` array of `input_text`/`input_image` parts. Call ID
 and result position stay unchanged. Other JSON outputs stay JSON strings;
 strings are never parsed or promoted, and no synthetic user message is added.
@@ -294,14 +295,14 @@ terminal-byte check establishes raster completeness.
 `get_media_request_support_for_request(*, request, model, request_options=None)`
 returns synchronous, read-only v2 indexed facts with exact `v`, `positions`
 (`message_index`/`role`) and `mime_types` fields. It qualifies user positions and
-actual paired raw-tool-message positions for the twelve exact image-input models
-in the [immutable first-party Codex catalogue](https://github.com/openai/codex/blob/65a5410f72dac1f4b40862c34ef0a8b71b12834a/codex-rs/models-manager/models.json).
-Unknown/unresolved models and input/model overrides have no qualified positions.
-These facts are not authority to hydrate references; the host owns request,
-account, generation and lifetime binding. Plan **conversion** supports native
-images, but plan automatic-hydration positions remain empty until account/model
-modality evidence is available for that separate route. The Codex catalogue is
-not borrowed to invent plan capability or entitlement.
+paired tool-result positions for image-capable models. Both authentication modes
+use explicit `input_modalities` from the account catalog when available.
+For models without this field, exact documented model IDs qualify, including
+GPT-6.2 Astra and Sol. Codex-only models qualify in Codex mode. Model support
+does not grant account access. Unknown models and input/model overrides have no
+qualified positions. The host owns request, account, generation and lifetime
+binding. [Codex model catalog](https://github.com/openai/codex/blob/7edf91b13c54f20aab22fece0abfa4a5c28379b3/codex-rs/models-manager/models.json)
+and [ChatGPT plan input support][plan-limits].
 
 Participating requests reuse the actual `experimental.media.v1` capability's
 synchronous `validate(request, purpose="provider-send", request_options=...)`
@@ -310,8 +311,8 @@ including after auth/model awaits, 401 refresh and retry backoff. Missing,
 replaced, invalidated or changed witnesses/options/connection selections refuse
 before sending. No preparation, hydration, account fallback, or tool rerun is
 performed after fit. This optional structural boundary imports no Foundation
-runtime code; legacy inline requests without media capability/references remain
-compatible. The host owns actual candidate identity and lifetime, and must
+runtime code; ordinary inline inputs use their existing path even when the host also
+supports stored media references. The host owns actual candidate identity and lifetime, and must
 qualify its installed composition separately.
 Cold file-backed providers pin the configured record's account identity before
 authentication, so loading that same record is not mistaken for an account
@@ -500,7 +501,7 @@ differ; check `list_models()` for what your subscription actually exposes.)
 The current fallback starts with Sol 6.1 and includes Luna 6. Its 272K GPT-6
 input limits are conservative fallback values, not an entitlement claim. Older
 entries remain for explicit legacy pins; they are not the default selection.
-Catalog metadata does not invent vision capability tags. Plan mode continues
+Model rows expose the `vision` capability when image input is supported. Plan mode continues
 to require its account-specific live catalog and never borrows this Codex list.
 
 Models with a "fast" speed tier support a `-fast` suffix (e.g. `gpt-5.5-fast`) which maps to `service_tier: "priority"` in the request. This consumes priority quota faster.
