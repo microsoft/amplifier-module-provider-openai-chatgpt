@@ -28,7 +28,7 @@ def test_fallback_keeps_legacy_explicit_models_and_current_conservative_limits()
     assert {"gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-terra"} <= infos.keys()
     assert infos["gpt-6.1-sol"].context_window == 272_000
     assert infos["gpt-6.1-sol"].max_output_tokens == 128_000
-    assert "vision" not in infos["gpt-6.1-sol"].capabilities
+    assert "vision" in infos["gpt-6.1-sol"].capabilities
 
 
 def test_compatibility_matrix_has_only_current_clean_models():

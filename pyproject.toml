@@ -42,6 +42,7 @@ asyncio_mode = "strict"
 [dependency-groups]
 dev = [
     "amplifier-core>=1.3.3",
+    "Pillow>=11.3.0",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
     "ruff>=0.14.10",

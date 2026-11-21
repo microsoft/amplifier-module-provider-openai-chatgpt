@@ -10,6 +10,7 @@ import httpx
 
 from amplifier_core import ModelInfo
 
+from ._images import CODEX_IMAGE_MODELS
 from .oauth import CHATGPT_CODEX_BASE_URL
 
 # ---------------------------------------------------------------------------
@@ -262,7 +263,8 @@ def _validated_catalog_entries(
 
 def to_model_infos(
     entries: list[dict[str, Any]], *,
-    include_speed_variants: bool = True, strict: bool = False
+    include_speed_variants: bool = True, strict: bool = False,
+    image_models: frozenset[str] = CODEX_IMAGE_MODELS,
 ) -> list[ModelInfo]:
     """Convert raw model catalog entries to :class:`~amplifier_core.ModelInfo` objects.
 
@@ -311,10 +313,16 @@ def to_model_infos(
             context_window = limit("context_window")
             max_output_tokens = limit("max_output_tokens")
 
+        modalities = entry.get("input_modalities")
+        if "input_modalities" in entry:
+            vision = isinstance(modalities, list) and "image" in modalities
+        else:
+            vision = slug in image_models
         result.append(
             ModelInfo(
                 id=slug,
                 display_name=display_name,
+                capabilities=["vision"] if vision else [],
                 context_window=context_window,
                 max_output_tokens=max_output_tokens,
             )
@@ -327,6 +335,7 @@ def to_model_infos(
                 ModelInfo(
                     id=f"{slug}-fast",
                     display_name=f"{display_name} (fast)",
+                    capabilities=["vision"] if vision else [],
                     context_window=context_window,
                     max_output_tokens=max_output_tokens,
                 )

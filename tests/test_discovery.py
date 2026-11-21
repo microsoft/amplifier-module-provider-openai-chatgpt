@@ -712,7 +712,7 @@ async def test_account_backed_62_supersession_is_default_only(provider, monkeypa
     assert by_id["gpt-6.2-sol"].context_window == 0
     assert by_id["gpt-6.2-sol"].max_output_tokens == 0
     assert by_id["gpt-6.2-sol"].defaults == {}
-    assert by_id["gpt-6.2-sol"].capabilities == []
+    assert by_id["gpt-6.2-sol"].capabilities == ["vision"]
     assert entries == original
     assert provider.get_model_list_info()["source"] == "provider-api"
     # Even identical explicit configuration replaces the built-in policy.
