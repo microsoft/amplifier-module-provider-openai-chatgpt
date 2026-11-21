@@ -6,6 +6,33 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 
 
+# Recommendation policy, not aliases or entitlement: only a literal eligible
+# successor base in this account's catalog supersedes these known older IDs.
+# Keep this explicit; previews, dated pins and other families are independent.
+_KNOWN_SUCCESSORS = {
+    "gpt-6-astra": "gpt-6.2-astra",
+    "gpt-6-sol": "gpt-6.2-sol",
+    "gpt-6.1-sol": "gpt-6.2-sol",
+}
+
+
+def superseded_recommendations(ids: list[str]) -> set[str]:
+    """IDs to omit from built-in recommendations/latest, never explicit pins.
+
+    The established Codex -fast shorthand follows its base's supersession.
+    A successor -fast ID alone is not evidence that its base is available.
+    No new IDs, suffix normalization, version ranking or metadata are created.
+    """
+    available = set(ids)
+    return {
+        variant
+        for old, successor in _KNOWN_SUCCESSORS.items()
+        if successor in available
+        for variant in (old, f"{old}-fast")
+        if variant in available
+    }
+
+
 @dataclass(frozen=True)
 class ModelFilters:
     """An immutable snapshot, never a reference to caller-owned lists."""

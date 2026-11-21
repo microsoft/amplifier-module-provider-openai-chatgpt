@@ -53,7 +53,7 @@ from ._images import (
     unsupported_image,
     validate_image_budget,
 )
-from ._model_listing import ModelFilters, selector_schema
+from ._model_listing import ModelFilters, selector_schema, superseded_recommendations
 from ._plan_request import prepare_plan_payload
 from ._sse import ParsedResponse, SSEError, parse_sse_events
 from .models import (
@@ -345,6 +345,47 @@ def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# GPT-6.2 final request restrictions
+# ---------------------------------------------------------------------------
+
+
+def _validate_gpt_6_2_payload(payload: dict[str, Any]) -> None:
+    """Check known 6.2 restrictions after the extra-parameter escape hatch.
+
+    This is not an effort allowlist: account metadata/backend remain the source
+    for supported levels. Config's legacy "none" omission sentinel is already
+    resolved; a literal wire effort of "none" must fail, not be coerced.
+    """
+    if payload.get("model") not in {
+        "gpt-6.2-astra", "gpt-6.2-sol",
+        "gpt-6.2-astra-fast", "gpt-6.2-sol-fast",
+    }:
+        return
+
+    def unsupported(param: str) -> None:
+        error = kernel_errors.InvalidRequestError(
+            f"{payload['model']} does not support {param}. Remove this parameter; "
+            "the provider will not coerce it or change models.",
+            provider="openai-chatgpt",
+            retryable=False,
+        )
+        error.error_code = "unsupported_model_parameter"
+        error.error_param = param
+        raise error
+
+    reasoning = payload.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
+    if effort == "none":
+        unsupported("reasoning.effort=none")
+    for param in ("temperature", "top_p", "top_logprobs", "logprobs"):
+        if param in payload:
+            unsupported(param)
+    include = payload.get("include", [])
+    if isinstance(include, (list, tuple, str)) and "message.output_text.logprobs" in include:
+        unsupported("include.message.output_text.logprobs")
+
+
+# ---------------------------------------------------------------------------
 # Provider class
 # ---------------------------------------------------------------------------
 
@@ -389,6 +430,7 @@ class ChatGPTProvider:
                 "ChatGPT credentials do not match the selected authentication mode"
             )
         _warn_unknown_config_keys(self._config)
+        self._use_default_recommendations = "model_filters" not in self._config
         self._model_filters = ModelFilters.parse(
             self._config.get("model_filters", {"include": ["gpt-6*"]})
         )
@@ -659,7 +701,8 @@ class ChatGPTProvider:
     ) -> list[ModelInfo]:
         """Fetch current account models without fallback, synthetic IDs, or caching.
 
-        None uses the immutable configured defaults (gpt-6* when unconfigured).
+        None uses the immutable configured defaults (gpt-6* when unconfigured,
+        with known older recommendations superseded only by available bases).
         An explicit mapping replaces those defaults; {} disables all selectors.
         Both authentication modes have real catalogs. Empty successful catalogs
         stay empty; failures raise the existing kernel error types. Selection
@@ -707,6 +750,8 @@ class ChatGPTProvider:
                 retryable=False,
             ) from None
         selected = set(policy.select([model.id for model in models]))
+        if filters is None and self._use_default_recommendations:
+            selected -= superseded_recommendations([model.id for model in models])
         # Keep endpoint order (used by existing callers), byte-exact IDs and
         # metadata. Selectors never change inference configuration or caches.
         return [model for model in models if model.id in selected]
@@ -826,6 +871,8 @@ class ChatGPTProvider:
 
             try:
                 models = await self._get_catalog()
+                superseded = superseded_recommendations([m.id for m in models])
+                models = [m for m in models if m.id not in superseded]
                 resolved = (
                     models[0].id
                     if self.auth_mode == plan_auth.MODE and models
@@ -1359,6 +1406,7 @@ class ChatGPTProvider:
                 )
             payload.update(self.extra_request_params)
 
+        _validate_gpt_6_2_payload(payload)
         if self.auth_mode == plan_auth.MODE:
             payload = prepare_plan_payload(payload, request)
         validate_image_budget(payload, plan=self.auth_mode == plan_auth.MODE)
