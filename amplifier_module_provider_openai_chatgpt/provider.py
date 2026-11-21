@@ -386,6 +386,11 @@ def _validate_gpt_6_2_payload(payload: dict[str, Any]) -> None:
         unsupported("include.message.output_text.logprobs")
 
 
+def _tool_strict(tool: Any) -> bool:
+    """The tool's own explicit strict choice; anything else is non-strict."""
+    return getattr(tool, "strict", False) is True
+
+
 # ---------------------------------------------------------------------------
 # Provider class
 # ---------------------------------------------------------------------------
@@ -1196,7 +1201,8 @@ class ChatGPTProvider:
         - `default_model` param overrides self.default_model when given
           (used by complete() to pass the already-resolved "latest" model
           instead of the literal sentinel string)
-        - Tools → {type, name, description, parameters} + tool_choice: 'auto'
+        - Tools → {type, name, description, parameters} + tool_choice: 'auto';
+          Codex mode adds an explicit strict (false unless the tool sets true)
         - ToolResultBlock → {type: function_call_output, call_id, output}
         - ToolCallBlock → {type: function_call, call_id, name, arguments}
         - Reasoning effort → {reasoning: {effort, summary: 'detailed'}}
@@ -1389,12 +1395,25 @@ class ChatGPTProvider:
 
         # Tools → Responses API format
         if request.tools:
+            # Responses reads an omitted `strict` as strict mode. GPT-6.2 then
+            # compiles every function schema and refuses a keyword it has not
+            # implemented. Measured 2026-11-21 on the Codex route: 400
+            # invalid_json_schema, 'Unimplemented keys: ["uniqueItems"]', for
+            # gpt-6.2-sol and gpt-6.2-astra; gpt-6-astra, gpt-6-sol and
+            # gpt-6.1-sol accept the same request. The same request with an
+            # explicit false passes on all five. So state the mode instead of
+            # changing the caller's schema, as provider-openai does. ToolSpec
+            # permits extras: a tool that sets strict=True keeps strict mode.
+            # Plan mode keeps its exact shape: that route is not measured
+            # with this field.
+            codex = self.auth_mode != plan_auth.MODE
             payload["tools"] = [
                 {
                     "type": "function",
                     "name": tool.name,
                     "description": tool.description,
                     "parameters": tool.parameters,
+                    **({"strict": _tool_strict(tool)} if codex else {}),
                 }
                 for tool in request.tools
             ]

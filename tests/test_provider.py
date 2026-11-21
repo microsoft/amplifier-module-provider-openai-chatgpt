@@ -589,6 +589,56 @@ class TestBuildPayload:
         assert tools[0]["description"] == "Gets the weather"
         assert tools[0]["parameters"] == {"type": "object", "properties": {}}
 
+    def test_function_tools_state_non_strict_mode(self) -> None:
+        """An omitted strict is strict mode on Responses; GPT-6.2 then refuses
+        a schema keyword such as uniqueItems. The schema itself is not changed."""
+        from amplifier_core.message_models import Message, ToolSpec
+
+        parameters = {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "question_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 32,
+                    "uniqueItems": True,
+                },
+            },
+            "required": [],
+        }
+        provider = self._make_provider("gpt-6.2-sol")
+        request = self._make_request(
+            messages=[Message(role="user", content="hi")],
+            tools=[ToolSpec(name="bash", description="Run", parameters=parameters)],
+        )
+        payload = provider._build_payload(request)  # type: ignore[union-attr]
+        assert payload["tools"] == [
+            {
+                "type": "function",
+                "name": "bash",
+                "description": "Run",
+                "parameters": parameters,
+                "strict": False,
+            }
+        ]
+
+    @pytest.mark.parametrize(
+        ("given", "sent"),
+        [(True, True), (False, False), (None, False), ("true", False), (1, False)],
+    )
+    def test_function_tool_keeps_only_an_explicit_true_strict(self, given, sent) -> None:
+        """ToolSpec permits extras: only a tool's own strict=True opts in."""
+        from amplifier_core.message_models import Message, ToolSpec
+
+        provider = self._make_provider()
+        request = self._make_request(
+            messages=[Message(role="user", content="hi")],
+            tools=[ToolSpec(name="foo", parameters={"type": "object"}, strict=given)],
+        )
+        payload = provider._build_payload(request)  # type: ignore[union-attr]
+        assert payload["tools"][0]["strict"] is sent
+
     def test_tools_adds_tool_choice_auto(self) -> None:
         """When tools present, tool_choice should be 'auto'."""
         from amplifier_core.message_models import Message, ToolSpec
