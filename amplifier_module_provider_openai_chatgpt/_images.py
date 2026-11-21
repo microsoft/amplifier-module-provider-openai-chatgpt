@@ -167,6 +167,9 @@ def image_values(value: Any) -> tuple[str, ...]:
                 walk(child)
 
     walk(value)
+    # A JSON error can contain an already slash-escaped copy of the input
+    # embedded in a string. Prepare its spelling once for every diagnostic.
+    found.update(secret.replace("/", r"\/") for secret in tuple(found) if "/" in secret)
     return tuple(sorted(found, key=len, reverse=True))
 
 

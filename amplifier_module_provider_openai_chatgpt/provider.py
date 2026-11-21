@@ -1919,6 +1919,11 @@ class ChatGPTProvider:
             try:
                 return await self._complete_attempt(request, payload, model, request_id, state)
             except kernel_errors.LLMError as error:
+                if known_images:
+                    # HTTPX transport exceptions can retain the entire outgoing
+                    # request even when their message and formatted traceback are clean.
+                    error.__cause__ = error.__context__ = None
+                    error.__suppress_context__ = True
                 # Retryability here means safe replay of this invocation, not
                 # merely a transient service cause. Do not invite outer replay
                 # after output or an excessive server hint.

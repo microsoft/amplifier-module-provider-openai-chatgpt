@@ -1219,3 +1219,42 @@ def test_tool_result_envelope_keeps_call_pixels_and_status(provider, fmt):
             {"type": "input_image", "image_url": "data:image/png;base64," + src["data"]},
         ],
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("failure", ["transport", "escaped_json_error", "escaped_sse_error"])
+async def test_image_error_objects_hooks_and_logs_omit_http_request_and_escaped_pixels(
+    provider, monkeypatch, caplog, raw, failure,
+):
+    import traceback
+
+    out = io.BytesIO()
+    Image.frombytes("RGB", (16, 8), bytes(range(192)) * 2).save(out, format="PNG")
+    b64 = base64.b64encode(out.getvalue()).decode()
+    assert "/" in b64
+    escaped = b64.replace("/", r"\/")
+    provider.raw = raw
+    events = []
+    provider._coordinator = SimpleNamespace(
+        hooks=SimpleNamespace(emit=AsyncMock(side_effect=lambda *args: events.append(args))),
+    )
+
+    def fail(wire):
+        assert b64.encode() in wire.content
+        if failure == "transport":
+            raise httpx.ConnectError("Disconnected", request=wire)
+        problem = {"message": 'Bad image in field "' + escaped + '"', "code": "invalid_request"}
+        if failure == "escaped_sse_error":
+            event = {"type": "error", "error": problem}
+            return httpx.Response(200, text="data: " + json.dumps(event) + "\n\n")
+        return httpx.Response(400, json={"error": problem})
+
+    install_transport(monkeypatch, fail)
+    with pytest.raises(llm_errors.LLMError) as caught:
+        await provider.complete(request_for({"type": "base64", "media_type": "image/png", "data": b64}))
+    exc = caught.value
+    assert exc.__cause__ is None and exc.__context__ is None
+    assert exc.retryable is (failure == "transport")
+    diagnostic = str(exc) + json.dumps(events) + caplog.text + "".join(traceback.format_exception(exc))
+    assert all(secret not in diagnostic for secret in (b64, escaped, json.dumps(escaped)[1:-1]))
