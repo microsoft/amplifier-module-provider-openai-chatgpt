@@ -1,0 +1,139 @@
+import base64
+import hashlib
+import io
+import json
+from pathlib import Path
+
+import httpx
+import pytest
+from PIL import Image
+from amplifier_core.message_models import ChatRequest, Message, ToolCallBlock
+
+from amplifier_module_provider_openai_chatgpt.artwork import CodexArtwork
+from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+
+@pytest.fixture
+def artwork(tmp_path):
+    provider = ChatGPTProvider(
+        {"auth_mode": "chatgpt_codex", "default_model": "gpt-6.2-sol"},
+        tokens={
+            "account_id": "fixture",
+            "access_token": "fixture",
+            "expires_at": "2099-01-01T00:00:00+00:00",
+        },
+    )
+    return CodexArtwork(provider, tmp_path)
+
+
+def png(color):
+    out = io.BytesIO()
+    Image.new("RGB", (512, 256), color).save(out, "PNG")
+    return out.getvalue()
+
+
+def install_stream(monkeypatch, handler):
+    client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: client(transport=httpx.MockTransport(handler), **kw),
+    )
+
+
+def events(*items):
+    return httpx.Response(
+        200, text="".join("data: " + json.dumps(item) + "\n\n" for item in items)
+    )
+
+
+def generated(data):
+    return {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "image_generation_call",
+            "result": base64.b64encode(data).decode(),
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_generate_inspect_and_reference_edit(artwork, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    original, revised = png("teal"), png("orange")
+    sends = []
+
+    def send(req):
+        assert req.url.host == "chatgpt.com"
+        body = json.loads(req.content)
+        sends.append(body)
+        return events(
+            generated(original if len(sends) == 1 else revised),
+            {"type": "response.completed"},
+        )
+
+    install_stream(monkeypatch, send)
+    result = await artwork.execute({"prompt": "draw"})
+    receipt = result.output
+    assert receipt["artifact_id"] == hashlib.sha256(original).hexdigest()
+    assert Path(receipt["path"]).read_bytes() == original
+    request = ChatRequest(
+        messages=[
+            Message(
+                role="assistant",
+                content=[
+                    ToolCallBlock(id="one", name=artwork.name, input={"prompt": "draw"})
+                ],
+            ),
+            Message(
+                role="tool", tool_call_id="one", content=result.get_serialized_output()
+            ),
+        ]
+    )
+    restored = artwork.restore_recent_preview(request)
+    output = artwork.provider._build_payload(restored)["input"][-1]["output"]
+    preview = base64.b64decode(output[1]["image_url"].split(",")[1])
+    assert Image.open(io.BytesIO(preview)).size == (384, 192)
+    assert request.messages[-1].content == result.get_serialized_output()
+    if hasattr(result, "content"):
+        assert result.content[1].source["data"] == base64.b64encode(preview).decode()
+    artwork.provider._tokens["account_id"] = "different"
+    assert artwork.restore_recent_preview(request) is request
+    artwork.provider._tokens["account_id"] = "fixture"
+    result = await artwork.execute(
+        {"prompt": "revise", "reference": receipt["artifact_id"]}
+    )
+    assert Path(result.output["path"]).read_bytes() == revised
+    assert len(sends) == 2
+    assert sends[1]["input"][0]["content"][1]["image_url"].endswith(
+        base64.b64encode(original).decode()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["response.incomplete", "error", None])
+async def test_interrupted_operation_never_replays_or_publishes(
+    artwork, monkeypatch, terminal
+):
+    sends = []
+
+    def send(req):
+        sends.append(1)
+        return events(
+            generated(png("blue")), *([{"type": terminal}] if terminal else [])
+        )
+
+    install_stream(monkeypatch, send)
+    with pytest.raises(RuntimeError, match="completed image"):
+        await artwork.execute({"prompt": "draw"})
+    assert sends == [1] and not list(artwork.directory.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_rejects_untrusted_reference_before_submission(artwork):
+    with pytest.raises(ValueError, match="ID"):
+        await artwork.execute({"prompt": "edit", "reference": "../elsewhere.png"})
+    identity = "a" * 64
+    (artwork.directory / (identity + ".png")).write_bytes(png("red"))
+    with pytest.raises(ValueError, match="receipt"):
+        await artwork.execute({"prompt": "edit", "reference": identity})

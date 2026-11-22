@@ -37,5 +37,14 @@ async def mount(
     # Do not read the token file here either: an unavailable account file must
     # not turn package validation into an account-readiness check.
     provider = ChatGPTProvider(config, coordinator)
+    if config.get("artwork_directory"):
+        from .artwork import CodexArtwork
+        from .provider import CODEX_MODE
+
+        if provider.auth_mode != CODEX_MODE:
+            raise ValueError("Artwork requires chatgpt_codex")
+        artwork = CodexArtwork(provider, config["artwork_directory"])
+        await coordinator.mount("tools", artwork, name=artwork.name)
+        provider._artwork = artwork
     await coordinator.mount("providers", provider, name="openai-chatgpt")
     return provider.close
