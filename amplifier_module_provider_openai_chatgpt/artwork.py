@@ -143,7 +143,7 @@ class CodexArtwork:
         prompt = input.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("Supply an artwork prompt")
-        parts = [{"type": "input_text", "text": prompt}]
+        references = []
         if "reference" in input:
             reference = input["reference"]
             if not isinstance(reference, str) or not re.fullmatch(
@@ -164,6 +164,44 @@ class CodexArtwork:
                 data = stream.read(MAX_BYTES + 1)
             if len(data) > MAX_BYTES or hashlib.sha256(data).hexdigest() != reference:
                 raise ValueError("Artwork does not match its receipt")
+            references.append(data)
+        return await self.generate(prompt, references, _tool_input=input)
+
+    async def generate(
+        self,
+        prompt,
+        references=(),
+        *,
+        size=None,
+        quality=None,
+        background=None,
+        _tool_input=None,
+    ):
+        """Return the full artifact receipt and rich preview to a workspace-owning host."""
+        if (
+            self.provider.auth_mode != CODEX_MODE
+            or not isinstance(prompt, str)
+            or not prompt.strip()
+        ):
+            raise ValueError(
+                "Codex subscription sign-in and an artwork prompt are required"
+            )
+        if len(references) > 2:
+            raise ValueError("Use at most two reference PNGs")
+        options = {"type": "image_generation", "output_format": "png"}
+        for name, value, choices in (
+            ("size", size, ("auto", "1024x1024", "1536x1024", "1024x1536")),
+            ("quality", quality, ("auto", "low", "medium", "high")),
+            ("background", background, ("auto", "opaque", "transparent")),
+        ):
+            if value is not None:
+                if value not in choices:
+                    raise ValueError(f"Unsupported image {name}")
+                options[name] = value
+        parts = [{"type": "input_text", "text": prompt}]
+        for data in references:
+            if not isinstance(data, bytes) or len(data) > MAX_BYTES:
+                raise ValueError("Invalid reference PNG")
             with Image.open(io.BytesIO(data), formats=["PNG"]) as original:
                 if original.width * original.height > 16_777_216:
                     raise ValueError("Reference image dimensions exceed the limit")
@@ -186,7 +224,7 @@ class CodexArtwork:
             "stream": True,
             "instructions": "Create the requested artwork.",
             "input": [{"role": "user", "content": parts}],
-            "tools": [{"type": "image_generation", "output_format": "png"}],
+            "tools": [options],
             "tool_choice": "required",
         }
         if model.endswith("-fast"):
@@ -204,15 +242,17 @@ class CodexArtwork:
                         f"Codex artwork request failed (HTTP {response.status_code})"
                     )
                 receipt, content = await self._receive(response.aiter_lines())
+                if _tool_input is None:
+                    return receipt, content
                 if account:
                     key = json.dumps(receipt, sort_keys=True)
-                    self._previews[key] = (account, content, dict(input))
+                    self._previews[key] = (account, content, dict(_tool_input))
                     if len(self._previews) > 4:
                         self._previews.popitem(last=False)
                 self.generation += 1
                 self._issued[receipt["preview_sha256"]] = (
                     self.generation,
-                    dict(input),
+                    dict(_tool_input),
                     receipt["path"],
                 )
                 if len(self._issued) > 16:

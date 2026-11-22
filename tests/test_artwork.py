@@ -227,3 +227,37 @@ async def test_conflicting_terminal_image_does_not_publish(artwork, monkeypatch)
     with pytest.raises(ValueError, match="Inconsistent"):
         await artwork.execute({"prompt": "draw"})
     assert not list(artwork.directory.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_workspace_reference_bytes_and_output_options(artwork, monkeypatch):
+    references = [png("orange"), png("green")]
+    calls = []
+
+    def send(request):
+        calls.append(json.loads(request.content))
+        return events(generated(png("white")), {"type": "response.completed"})
+
+    install_stream(monkeypatch, send)
+    with pytest.raises(ValueError, match="quality"):
+        await artwork.generate("edit", references, quality="unknown")
+    receipt, parts = await artwork.generate(
+        "edit", references, size="1536x1024", quality="medium", background="transparent"
+    )
+    (body,) = calls
+    assert body["tools"][0] == {
+        "type": "image_generation",
+        "output_format": "png",
+        "size": "1536x1024",
+        "quality": "medium",
+        "background": "transparent",
+    }
+    images = body["input"][0]["content"][1:]
+    assert [
+        base64.b64decode(p["image_url"].split(",")[1]) for p in images
+    ] == references
+    assert receipt["artifact_id"] == hashlib.sha256(png("white")).hexdigest()
+    assert (
+        hashlib.sha256(base64.b64decode(parts[1]["source"]["data"])).hexdigest()
+        == receipt["preview_sha256"]
+    )
