@@ -80,18 +80,31 @@ class CodexArtwork:
 
         messages = list(request.messages)
         changed = False
-        index = len(messages)
-        while index and messages[index - 1].role == "tool":
-            index -= 1
-        if not index or messages[index - 1].role != "assistant":
+        if (request.metadata or {}).get("purpose") == "context-compaction":
             return request
-        calls = self.provider._message_tool_calls(messages[index - 1])
-        inputs = {call.id: call.arguments for call in calls if call.name == self.name}
-        for pos in range(index, len(messages)):
+        start = next(
+            (
+                i + 1
+                for i in range(len(messages) - 1, -1, -1)
+                if messages[i].role == "user"
+            ),
+            0,
+        )
+        inputs = {}
+        for pos in range(start, len(messages)):
             message = messages[pos]
-            if message.tool_call_id not in inputs or not isinstance(
-                message.content, str
-            ):
+            if message.role == "assistant":
+                inputs = {
+                    call.id: call.arguments
+                    for call in self.provider._message_tool_calls(message)
+                    if call.name == self.name
+                }
+                continue
+            if message.role != "tool":
+                inputs.clear()
+                continue
+            arguments = inputs.pop(message.tool_call_id, None)
+            if arguments is None or not isinstance(message.content, str):
                 continue
             if len(message.content) > 8192:
                 continue
@@ -111,7 +124,7 @@ class CodexArtwork:
             if (
                 cached
                 and cached[0] == (self.provider._tokens or {}).get("account_id")
-                and cached[2] == inputs[message.tool_call_id]
+                and cached[2] == arguments
             ):
                 messages[pos] = Message(
                     role="tool", tool_call_id=message.tool_call_id, content=cached[1]

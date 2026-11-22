@@ -617,7 +617,7 @@ for each trust boundary. Whoever has access to the directory controls retention.
 
 Rich Core results carry text and image blocks. For older text-only loops the
 mounted provider recognizes its four most recent exact receipts in the current
-batch of matching tool responses and can present the preview on the next
+user turn’s matching tool responses and can present the preview on the next
 completion. The cache is local to the mounted instance and account. A changed
 or elided receipt stays text. Restarting clears this cache. A disconnected
 generation has an uncertain outcome; the tool does not retry it automatically.

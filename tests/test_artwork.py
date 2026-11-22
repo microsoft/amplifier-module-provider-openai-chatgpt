@@ -131,6 +131,36 @@ async def test_generate_inspect_and_reference_edit(artwork, monkeypatch):
         {"prompt": "revise", "reference": receipt["artifact_id"]}
     )
     assert Path(result.output["path"]).read_bytes() == revised
+    request.messages.extend(
+        [
+            Message(
+                role="assistant",
+                content=[
+                    ToolCallBlock(
+                        id="two",
+                        name=artwork.name,
+                        input={"prompt": "revise", "reference": receipt["artifact_id"]},
+                    )
+                ],
+            ),
+            Message(
+                role="tool", tool_call_id="two", content=result.get_serialized_output()
+            ),
+        ]
+    )
+    comparison = artwork.provider._build_payload(
+        artwork.restore_recent_preview(request)
+    )
+    outputs = [
+        item["output"]
+        for item in comparison["input"]
+        if item.get("type") == "function_call_output"
+    ]
+    assert len(outputs) == 2 and all(
+        parts[1]["type"] == "input_image" for parts in outputs
+    )
+    request.messages.append(Message(role="user", content="A new turn"))
+    assert artwork.restore_recent_preview(request) is request
     assert len(sends) == 2
     assert sends[1]["input"][0]["content"][1]["image_url"].endswith(
         base64.b64encode(original).decode()
