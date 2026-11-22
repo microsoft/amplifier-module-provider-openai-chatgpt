@@ -151,6 +151,10 @@ class CodexArtwork:
                 data = stream.read(MAX_BYTES + 1)
             if len(data) > MAX_BYTES or hashlib.sha256(data).hexdigest() != reference:
                 raise ValueError("Artwork does not match its receipt")
+            with Image.open(io.BytesIO(data), formats=["PNG"]) as original:
+                if original.width * original.height > 16_777_216:
+                    raise ValueError("Reference image dimensions exceed the limit")
+                original.verify()
             parts.append(
                 {
                     "type": "input_image",
@@ -162,6 +166,7 @@ class CodexArtwork:
         model = await self.provider._resolve_default_model()
         await self.provider._ensure_valid_tokens(fresh_from_file=True)
         account = self.provider._tokens.get("account_id")
+        headers = self.provider._build_headers()
         body = {
             "model": model.removesuffix("-fast"),
             "store": False,
@@ -178,7 +183,7 @@ class CodexArtwork:
             async with client.stream(
                 "POST",
                 CHATGPT_CODEX_ENDPOINT,
-                headers=self.provider._build_headers(),
+                headers=headers,
                 json=body,
             ) as response:
                 if response.status_code != 200:
