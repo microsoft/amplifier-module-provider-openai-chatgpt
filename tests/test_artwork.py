@@ -97,6 +97,33 @@ async def test_generate_inspect_and_reference_edit(artwork, monkeypatch):
     assert request.messages[-1].content == result.get_serialized_output()
     if hasattr(result, "content"):
         assert result.content[1].source["data"] == base64.b64encode(preview).decode()
+    # CLI canonicalizes object ordering and puts the receipt in a successful Core envelope.
+    message = request.messages[-1]
+    message.content = json.dumps(
+        {"output": receipt, "success": True, "error": None}, sort_keys=True
+    )
+    assert artwork.restore_recent_preview(request) is not request
+    message.content = json.dumps(
+        {"output": receipt, "success": False, "error": "denied"}
+    )
+    assert artwork.restore_recent_preview(request) is request
+    message.content = json.dumps({**receipt, "width": 999})
+    assert artwork.restore_recent_preview(request) is request
+    message.content = result.get_serialized_output()
+    assert (
+        artwork.artifact_for_preview(receipt["preview_sha256"], {"prompt": "draw"}, 0)
+        == receipt["path"]
+    )
+    assert (
+        artwork.artifact_for_preview(receipt["preview_sha256"], {"prompt": "edit"}, 0)
+        is None
+    )
+    assert (
+        artwork.artifact_for_preview(
+            receipt["preview_sha256"], {"prompt": "draw"}, artwork.generation
+        )
+        is None
+    )
     artwork.provider._tokens["account_id"] = "different"
     assert artwork.restore_recent_preview(request) is request
     artwork.provider._tokens["account_id"] = "fixture"
@@ -137,3 +164,36 @@ async def test_rejects_untrusted_reference_before_submission(artwork):
     (artwork.directory / (identity + ".png")).write_bytes(png("red"))
     with pytest.raises(ValueError, match="receipt"):
         await artwork.execute({"prompt": "edit", "reference": identity})
+
+
+@pytest.mark.asyncio
+async def test_final_response_can_carry_the_image(artwork, monkeypatch):
+    data = png("indigo")
+    item = generated(data)["item"]
+    install_stream(
+        monkeypatch,
+        lambda req: events(
+            {
+                "type": "response.completed",
+                "response": {"status": "completed", "output": [item]},
+            }
+        ),
+    )
+    result = await artwork.execute({"prompt": "draw"})
+    assert Path(result.output["path"]).read_bytes() == data
+
+
+@pytest.mark.asyncio
+async def test_conflicting_terminal_image_does_not_publish(artwork, monkeypatch):
+    first = generated(png("red"))
+    second = generated(png("blue"))
+    install_stream(
+        monkeypatch,
+        lambda req: events(
+            first,
+            {"type": "response.completed", "response": {"output": [second["item"]]}},
+        ),
+    )
+    with pytest.raises(ValueError, match="Inconsistent"):
+        await artwork.execute({"prompt": "draw"})
+    assert not list(artwork.directory.iterdir())

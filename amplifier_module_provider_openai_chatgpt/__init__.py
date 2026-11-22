@@ -43,6 +43,8 @@ async def mount(
 
         if provider.auth_mode != CODEX_MODE:
             raise ValueError("Artwork requires chatgpt_codex")
+        if "codex_artwork" in (coordinator.get("tools") or {}):
+            raise ValueError("Only one mounted Codex account can own codex_artwork in this session")
         artwork = CodexArtwork(provider, config["artwork_directory"])
         await coordinator.mount("tools", artwork, name=artwork.name)
         provider._artwork = artwork

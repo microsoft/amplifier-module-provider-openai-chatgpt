@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
 import base64
 import hashlib
@@ -9,6 +10,7 @@ import io
 import json
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
 
@@ -40,7 +42,16 @@ class CodexArtwork:
     def __init__(self, provider, directory):
         self.provider = provider
         self._previews = OrderedDict()
+        self._issued = OrderedDict()
+        self.generation = 0
         self.directory = Path(directory).expanduser().resolve()
+
+    def artifact_for_preview(self, digest, arguments, after):
+        """Resolve a locally issued preview for a host witnessing this invocation."""
+        issued = self._issued.get(digest)
+        if issued and issued[0] > after and issued[1] == arguments:
+            return issued[2]
+        return None
 
     def as_agent_tool(self):
         """Register this instance through the amplifier-agent Python SDK."""
@@ -75,13 +86,33 @@ class CodexArtwork:
         if not index or messages[index - 1].role != "assistant":
             return request
         calls = self.provider._message_tool_calls(messages[index - 1])
-        ids = {call.id for call in calls if call.name == self.name}
+        inputs = {call.id: call.arguments for call in calls if call.name == self.name}
         for pos in range(index, len(messages)):
             message = messages[pos]
-            if message.tool_call_id not in ids or not isinstance(message.content, str):
+            if message.tool_call_id not in inputs or not isinstance(
+                message.content, str
+            ):
                 continue
-            cached = self._previews.get(message.content)
-            if cached and cached[0] == (self.provider._tokens or {}).get("account_id"):
+            if len(message.content) > 8192:
+                continue
+            try:
+                receipt = json.loads(message.content)
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(receipt, dict):
+                continue
+            if (
+                set(receipt) == {"success", "error", "output"}
+                and receipt["success"] is True
+                and receipt["error"] is None
+            ):
+                receipt = receipt["output"]
+            cached = self._previews.get(json.dumps(receipt, sort_keys=True))
+            if (
+                cached
+                and cached[0] == (self.provider._tokens or {}).get("account_id")
+                and cached[2] == inputs[message.tool_call_id]
+            ):
                 messages[pos] = Message(
                     role="tool", tool_call_id=message.tool_call_id, content=cached[1]
                 )
@@ -109,10 +140,14 @@ class CodexArtwork:
             with os.fdopen(
                 os.open(
                     self.directory / (reference + ".png"),
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_NONBLOCK", 0),
                 ),
                 "rb",
             ) as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ValueError("Artwork reference must be a regular file")
                 data = stream.read(MAX_BYTES + 1)
             if len(data) > MAX_BYTES or hashlib.sha256(data).hexdigest() != reference:
                 raise ValueError("Artwork does not match its receipt")
@@ -150,9 +185,23 @@ class CodexArtwork:
                     raise RuntimeError(
                         f"Codex artwork request failed (HTTP {response.status_code})"
                     )
-                return await self._receive(response.aiter_lines(), account)
+                receipt, content = await self._receive(response.aiter_lines())
+                if account:
+                    key = json.dumps(receipt, sort_keys=True)
+                    self._previews[key] = (account, content, dict(input))
+                    if len(self._previews) > 4:
+                        self._previews.popitem(last=False)
+                self.generation += 1
+                self._issued[receipt["preview_sha256"]] = (
+                    self.generation,
+                    dict(input),
+                    receipt["path"],
+                )
+                if len(self._issued) > 16:
+                    self._issued.popitem(last=False)
+                return receipt, content
 
-    async def _receive(self, lines, account):
+    async def _receive(self, lines):
         encoded = None
         async for line in lines:
             if not line.startswith("data: ") or line == "data: [DONE]":
@@ -167,13 +216,32 @@ class CodexArtwork:
                     if encoded is not None:
                         raise ValueError("Expected one artwork result")
                     encoded = item.get("result")
-            if kind == "response.completed" and isinstance(encoded, str):
+            if kind == "response.completed":
+                final = event.get("response", {})
+                if final.get("status", "completed") != "completed":
+                    break
+                images = [
+                    item
+                    for item in final.get("output", [])
+                    if item.get("type") == "image_generation_call"
+                ]
+                if len(images) > 1:
+                    raise ValueError("Expected one artwork result")
+                if images and images[0].get("result") is not None:
+                    final_image = images[0]["result"]
+                    if encoded is not None and encoded != final_image:
+                        raise ValueError("Inconsistent final artwork")
+                    encoded = final_image
+                if not isinstance(encoded, str):
+                    break
                 if len(encoded) > 4 * ((MAX_BYTES + 2) // 3):
                     raise ValueError("Generated artwork exceeds the size limit")
-                return self._save(base64.b64decode(encoded, validate=True), account)
+                return await asyncio.to_thread(
+                    self._save, base64.b64decode(encoded, validate=True)
+                )
         raise RuntimeError("Codex did not confirm a completed image")
 
-    def _save(self, data, account):
+    def _save(self, data):
         if len(data) > MAX_BYTES:
             raise ValueError("Generated artwork exceeds the size limit")
         with Image.open(io.BytesIO(data), formats=["PNG"]) as image:
@@ -194,14 +262,15 @@ class CodexArtwork:
         identity = hashlib.sha256(data).hexdigest()
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         path = self.directory / (identity + ".png")
-        with tempfile.NamedTemporaryFile(dir=self.directory, delete=False) as temp:
-            try:
+        temp = tempfile.NamedTemporaryFile(dir=self.directory, delete=False)
+        try:
+            with temp:
                 temp.write(data)
                 temp.flush()
                 os.fsync(temp.fileno())
-                os.replace(temp.name, path)
-            finally:
-                Path(temp.name).unlink(missing_ok=True)
+            os.replace(temp.name, path)
+        finally:
+            Path(temp.name).unlink(missing_ok=True)
         receipt = {
             "artifact_id": identity,
             "path": str(path),
@@ -209,6 +278,7 @@ class CodexArtwork:
             "width": width,
             "height": height,
             "bytes": len(data),
+            "preview_sha256": hashlib.sha256(preview.getvalue()).hexdigest(),
         }
         parts = [
             {"type": "text", "text": json.dumps(receipt)},
@@ -221,9 +291,4 @@ class CodexArtwork:
                 },
             },
         ]
-        result = ToolResult(output=receipt)
-        if account:
-            self._previews[result.get_serialized_output()] = (account, parts)
-            if len(self._previews) > 4:
-                self._previews.popitem(last=False)
         return receipt, parts

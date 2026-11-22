@@ -1890,7 +1890,9 @@ class ChatGPTProvider:
         # 1. Ensure valid OAuth tokens.
         await self._ensure_valid_tokens()
 
-        if self._artwork is not None and media_guard is None:
+        capability = getattr(self._coordinator, "get_capability", None)
+        if (self._artwork is not None and media_guard is None
+                and not (callable(capability) and capability("experimental.media.v1") is not None)):
             restored = self._artwork.restore_recent_preview(request)
             if restored is not request:
                 request = restored
