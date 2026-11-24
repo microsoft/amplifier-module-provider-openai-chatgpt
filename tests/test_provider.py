@@ -1146,6 +1146,30 @@ class TestComplete:
         assert result.content[0].text == "Hello, world!"
 
     @pytest.mark.asyncio
+    async def test_completion_evidence_belongs_to_each_response(self) -> None:
+        provider = self._make_provider()
+        lines = _make_sse_lines(text="Original answer")
+        # This helper finishes with an output item, a legacy response.done with
+        # usage, and [DONE]. Exercise an explicit completion and two EOF cases.
+        explicit = lines[:-2] + [
+            'data: {"type":"response.completed","response":{"status":"completed"}}',
+            lines[-1],
+        ]
+        contradictory = lines[:-2] + [
+            'data: {"type":"response.completed","response":{"status":"incomplete"}}',
+        ]
+        malformed = lines[:-2] + ['data: {"type":"response.completed","response":null}']
+        cases = [(explicit, True), (lines, False), (lines[:-2], False),
+                 (contradictory, False), (malformed, False)]
+        for stream, completed in cases:
+            with patch("amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient") as client:
+                client.return_value = _make_sse_response(stream)
+                reply = await provider.complete(self._make_request())
+            assert reply.content[0].text == "Original answer"
+            assert reply.finish_reason == "stop"
+            assert reply.metadata["provider_response_completed"] is completed
+
+    @pytest.mark.asyncio
     async def test_simple_text_completion_usage(self) -> None:
         """complete() returns correct usage counts."""
         provider = self._make_provider()

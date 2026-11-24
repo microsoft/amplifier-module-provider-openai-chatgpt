@@ -2445,6 +2445,7 @@ class ChatGPTProvider:
             tool_calls=tool_call_list if tool_call_list else None,
             usage=usage,
             finish_reason=finish_reason,
+            metadata={"provider_response_completed": parsed.completed},
         )
 
 
