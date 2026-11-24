@@ -551,7 +551,8 @@ See [docs/DTU_VALIDATION.md](docs/DTU_VALIDATION.md) for the full guide covering
 - **Automatic mid-session 401 recovery** -- if the access token expires mid-session, the provider performs one silent token refresh and retries the request automatically. A second consecutive 401 raises `AuthenticationError`.
 - **No `response.incomplete` continuation** -- if a reasoning model hits its output limit, the partial response is lost. Auto-continuation is planned.
 - **Streaming is mandatory** -- the ChatGPT backend requires `stream=True`. The provider always streams internally but returns a complete `ChatResponse` to the orchestrator.
-- The returned `ChatResponse.metadata["provider_response_completed"]` records whether
+- Both sign-in modes advertise `response:confirmed_terminal` in `get_info().capabilities`.
+  The returned `ChatResponse.metadata["provider_response_completed"]` records whether
   this request received the backend's `response.completed` event with explicit
   completed status, consistent response IDs and no error or incomplete details. Callers that
   commit durable state after confirmed completion can check this field. Codex

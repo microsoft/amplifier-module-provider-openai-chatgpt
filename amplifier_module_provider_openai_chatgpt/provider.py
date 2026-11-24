@@ -645,6 +645,7 @@ class ChatGPTProvider:
                 "streaming",
                 "tools",
                 "reasoning",
+                "response:confirmed_terminal",
                 "auth:oauth_pkce"
                 if self.auth_mode == plan_auth.MODE
                 else "auth:oauth_device_code",

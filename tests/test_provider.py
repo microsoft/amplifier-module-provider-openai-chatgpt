@@ -1148,6 +1148,7 @@ class TestComplete:
     @pytest.mark.asyncio
     async def test_completion_evidence_belongs_to_each_response(self) -> None:
         provider = self._make_provider()
+        assert "response:confirmed_terminal" in provider.get_info().capabilities
         lines = _make_sse_lines(text="Original answer")
         # This helper finishes with an output item, a legacy response.done with
         # usage, and [DONE]. Exercise an explicit completion and two EOF cases.
