@@ -110,9 +110,10 @@ def parse_sse_events(
             if event_type == "response.completed":
                 saw_completed_event = True
                 result.completed = (
-                    isinstance(resp, dict) and bool(resp)
-                    and resp.get("status", "completed") == "completed"
+                    isinstance(resp, dict) and resp.get("status") == "completed"
+                    and resp.get("incomplete_details") is None
                     and resp.get("error") is None
+                    and (not result.response_id or not resp.get("id") or resp["id"] == result.response_id)
                 )
             if not isinstance(resp, dict):
                 resp = {}

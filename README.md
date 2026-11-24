@@ -552,8 +552,8 @@ See [docs/DTU_VALIDATION.md](docs/DTU_VALIDATION.md) for the full guide covering
 - **No `response.incomplete` continuation** -- if a reasoning model hits its output limit, the partial response is lost. Auto-continuation is planned.
 - **Streaming is mandatory** -- the ChatGPT backend requires `stream=True`. The provider always streams internally but returns a complete `ChatResponse` to the orchestrator.
 - The returned `ChatResponse.metadata["provider_response_completed"]` records whether
-  this request received the backend's `response.completed` event with a
-  response object and a consistent status when supplied. Callers that
+  this request received the backend's `response.completed` event with explicit
+  completed status, consistent response IDs and no error or incomplete details. Callers that
   commit durable state after confirmed completion can check this field. Codex
   can still return available text or tool calls when the stream ends earlier.
 - **No dedicated `response.content_part.delta` handling** -- the delta event types the ChatGPT backend actually emits (`response.output_text.delta` for text, `response.reasoning_text.delta`/`response.reasoning_summary_text.delta` for reasoning) are forwarded live via the standard `llm:stream_block_delta` contract. `response.content_part.delta` is a distinct event type this provider does not special-case.
