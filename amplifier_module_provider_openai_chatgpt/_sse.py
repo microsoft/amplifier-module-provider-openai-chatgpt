@@ -44,6 +44,7 @@ class ParsedResponse:
     output_tokens: int = 0
     raw_events: list[dict] = field(default_factory=list)
     cache_read_tokens: int | None = None
+    completed: bool = False
 
 
 def parse_sse_events(
@@ -65,7 +66,7 @@ def parse_sse_events(
                   response.incomplete event.
     """
     result = ParsedResponse()
-    completed = False
+    saw_completed_event = False
 
     for line in lines:
         # Only process data lines.
@@ -104,10 +105,16 @@ def parse_sse_events(
         # ------------------------------------------------------------------
         # Metadata extraction.
         # ------------------------------------------------------------------
-        if event_type == "response.completed":
-            completed = True
         if event_type in ("response.created", "response.done", "response.completed"):
             resp = event.get("response")
+            if event_type == "response.completed":
+                saw_completed_event = True
+                result.completed = (
+                    isinstance(resp, dict) and resp.get("status") == "completed"
+                    and resp.get("incomplete_details") is None
+                    and resp.get("error") is None
+                    and (not result.response_id or not resp.get("id") or resp["id"] == result.response_id)
+                )
             if not isinstance(resp, dict):
                 resp = {}
             if not result.response_id:
@@ -154,7 +161,7 @@ def parse_sse_events(
                     }
                 )
 
-    if require_completed and not completed:
+    if require_completed and not saw_completed_event:
         raise SSEError(
             "ChatGPT stream ended before response.completed; completion is unconfirmed.",
             code="stream_incomplete",

@@ -1146,6 +1146,37 @@ class TestComplete:
         assert result.content[0].text == "Hello, world!"
 
     @pytest.mark.asyncio
+    async def test_completion_evidence_belongs_to_each_response(self) -> None:
+        provider = self._make_provider()
+        lines = _make_sse_lines(text="Original answer")
+        # This helper finishes with an output item, a legacy response.done with
+        # usage, and [DONE]. Exercise an explicit completion and two EOF cases.
+        def terminal(response):
+            event = json.dumps({"type": "response.completed", "response": response})
+            return [*lines[:-2], f"data: {event}", lines[-1]]
+
+        partial = {"reason": "max_output_tokens"}
+        cases = [
+            (terminal({"id": "resp_test", "status": "completed"}), True),
+            (lines, False),
+            (lines[:-2], False),
+            (terminal(None), False),
+            (terminal({"status": "incomplete"}), False),
+            (terminal({"id": "resp_test"}), False),
+            (terminal({"id": "resp_test", "incomplete_details": partial}), False),
+            (terminal({"status": "completed", "incomplete_details": partial}), False),
+            (terminal({"status": "completed", "error": {"code": "failed"}}), False),
+            (terminal({"status": "completed", "id": "different_response"}), False),
+        ]
+        for stream, completed in cases:
+            with patch("amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient") as client:
+                client.return_value = _make_sse_response(stream)
+                reply = await provider.complete(self._make_request())
+            assert reply.content[0].text == "Original answer"
+            assert reply.finish_reason == "stop"
+            assert reply.metadata["provider_response_completed"] is completed
+
+    @pytest.mark.asyncio
     async def test_simple_text_completion_usage(self) -> None:
         """complete() returns correct usage counts."""
         provider = self._make_provider()
