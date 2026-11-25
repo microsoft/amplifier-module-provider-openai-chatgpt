@@ -349,7 +349,8 @@ serialization only, **not authenticated endpoint acceptance or visual inference*
 | Native tool-result images | Implemented strict typed list | Implemented strict typed list | [Official-client Responses output schema][codex-tool-image]; public plan documents image/function inputs, exact combination still requires service qualification |
 | Other image formats / URL sources / detail controls | Not translated | Not translated | General API documents WebP/nonanimated GIF, URLs, model-dependent detail; not proof of Codex backend parity |
 | Files / custom or namespaced functions / WebSockets | Not translated | Legitimate separate backlog | Plan documents files (not uploads), custom/namespaced tools, same-connection WebSocket continuation. No feature enabled by this change. |
-| Image generation, native computer use, hosted MCP, file search, Code Interpreter, audio/video, Files upload | Not established by this adapter | Explicitly unavailable in plan preview | [Plan restrictions][plan-limits]; do not infer support from generic Responses schema |
+| Image generation | Opt-in Codex artwork tool; returns a PNG and a visual preview | Unavailable | See [Subscription artwork](#subscription-artwork). |
+| Native computer use, hosted MCP, file search, Code Interpreter, audio/video, Files upload | Not established by this adapter | Explicitly unavailable in plan preview | [Plan restrictions][plan-limits]; do not infer support from generic Responses schema |
 | Arbitrary-request input count / enforced output cap / persistent server conversation | Not added | Not added | Existing source limits; plan rejects unsupported parameters. No counter/auth crossover. |
 
 Immediate reusable improvements are the native image conversion and
@@ -595,3 +596,41 @@ completed response and `llm:response` event retain that count. A reported zero i
 a cache miss; omitted or invalid counts remain unknown. This reporting does not
 enable public OpenAI cache controls on the Codex or ChatGPT plan endpoints, and
 does not imply per-token subscription pricing.
+
+
+## Subscription artwork
+
+On a module-based host, configure the Codex provider with a private artifact directory
+owned by the current workspace. This enables the local `codex_artwork` tool.
+
+```yaml
+providers:
+  - module: provider-openai-chatgpt
+    config:
+      auth_mode: chatgpt_codex
+      default_model: YOUR_CODEX_MODEL
+      artwork_directory: /absolute/path/to/workspace/artwork
+```
+
+The selected model must support image input to inspect the result. Each tool
+invocation makes one hosted image request using the configured Codex subscription.
+The tool saves the original PNG under its SHA-256 ID and returns its path,
+dimensions and byte count, plus a reduced PNG for the model. To revise, pass
+the original ID as `reference` with the new prompt. The edit sends the original
+PNG. Both versions remain available on disk. Configure a separate directory
+for each trust boundary. Whoever has access to the directory controls retention.
+
+Rich Core results carry text and image blocks. For older text-only loops the
+mounted provider recognizes its four most recent exact receipts in the current
+user turn’s matching tool responses and can present the preview on the next
+completion. The cache is local to the mounted instance and account. A changed
+or elided receipt stays text. Restarting clears this cache. A disconnected
+generation has an uncertain outcome; the tool does not retry it automatically.
+
+Hosts using the **amplifier-agent Python SDK** register caller tools explicitly.
+Construct `CodexArtwork(provider, directory)` from the provider package's
+`artwork` module with the same configured Codex provider/credential as the
+agent, then pass `artwork.as_agent_tool()` in `AgentOptions.tools`. The
+binding returns native SDK text and image parts in a single tool response.
+This opt-in applies to Codex device OAuth. The public ChatGPT plan route and
+Platform API-key provider have their own capability contracts.

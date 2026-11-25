@@ -92,6 +92,7 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "default_model",
         "timeout",
         "priority",
+        "artwork_directory",
         "models_cache_ttl",
         "models_client_version",
         "model_filters",
@@ -407,6 +408,7 @@ class ChatGPTProvider:
         coordinator: Any = None,
         tokens: dict[str, Any] | None = None,
     ) -> None:
+        self._artwork = None
         self._config = config or {}
         # PUBLIC alias of the same dict, by ecosystem convention. Every other
         # provider module (anthropic, openai, gemini, github-copilot, ollama,
@@ -1886,6 +1888,17 @@ class ChatGPTProvider:
         media_guard = self._media_send_guard(request, kwargs)
         # 1. Ensure valid OAuth tokens.
         await self._ensure_valid_tokens()
+
+        capability = getattr(self._coordinator, "get_capability", None)
+        if (self._artwork is not None and media_guard is None
+                and not (callable(capability) and capability("experimental.media.v1") is not None)):
+            restored = self._artwork.restore_recent_preview(request)
+            if restored is not request:
+                request = restored
+                artwork_account = self._tokens.get("account_id")
+                def media_guard():
+                    if (self._tokens or {}).get("account_id") != artwork_account:
+                        unsupported_image("the artwork account changed before inspection.")
 
         # 1b. Resolve "latest" (if configured) to a concrete model id. This
         # is the "first need" moment for a completion request -- resolved
