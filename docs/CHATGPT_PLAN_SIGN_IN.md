@@ -196,6 +196,8 @@ Callers that depend on enforced output caps, including some internal naming,
 judging, and reduced-output recovery calls, cannot use this preview adapter with
 `max_output_tokens` set. The provider rejects the request rather than remove a
 spending constraint. Bundle/feature compatibility must be assessed separately.
+The plan route advertises `output_limit:service_default_only`. A caller that has no hard output limit can leave the field unset and use the service default. Callers that require an explicit limit still receive a refusal before transmission.
+
 The provider enforces `store: false` and `stream: true` and converts later system
 messages to developer messages. Supplying tool lists in both a typed request and
 `extra_request_params` is rejected rather than replacing a list silently.

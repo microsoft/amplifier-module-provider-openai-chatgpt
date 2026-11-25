@@ -636,19 +636,18 @@ class ChatGPTProvider:
             defaults["context_window"] = context_window
             defaults["max_output_tokens"] = max_output_tokens
 
+        capabilities = ["streaming", "tools", "reasoning"]
+        if self.auth_mode == plan_auth.MODE:
+            capabilities.extend(["auth:oauth_pkce", "output_limit:service_default_only"])
+        else:
+            capabilities.append("auth:oauth_device_code")
+
         return ProviderInfo(
             id="openai-chatgpt",
             display_name="ChatGPT plan"
             if self.auth_mode == plan_auth.MODE
             else "ChatGPT Codex",
-            capabilities=[
-                "streaming",
-                "tools",
-                "reasoning",
-                "auth:oauth_pkce"
-                if self.auth_mode == plan_auth.MODE
-                else "auth:oauth_device_code",
-            ],
+            capabilities=capabilities,
             credential_env_vars=[],
             defaults=defaults,
             config_fields=[
