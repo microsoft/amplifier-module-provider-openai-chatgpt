@@ -267,6 +267,7 @@ def test_mode_is_explicit_and_plan_metadata_has_no_codex_fallback():
         ChatGPTProvider({"auth_mode": "chatgpt_plan"}, tokens={"auth_mode": "oauth"})
     p = ChatGPTProvider({"auth_mode": "chatgpt_plan"})
     assert "auth:oauth_pkce" in p.get_info().capabilities
+    assert "output_limit:service_default_only" in p.get_info().capabilities
     assert "gpt-5.6" not in p.get_info().defaults["model"]
     assert "context_window" not in p.get_info().defaults
 
@@ -277,6 +278,7 @@ def test_codex_is_default_and_old_mode_is_compatibility_alias(mode):
     info = p.get_info()
     assert p.auth_mode == info.defaults["auth_mode"] == "chatgpt_codex"
     assert "auth:oauth_device_code" in info.capabilities
+    assert "output_limit:service_default_only" not in info.capabilities
     fields = {field.id: field.model_dump() for field in info.config_fields}
     assert fields["auth_mode"]["choices"] == ["chatgpt_codex", "chatgpt_plan"]
     assert fields["auth_mode"]["default"] == "chatgpt_codex"
