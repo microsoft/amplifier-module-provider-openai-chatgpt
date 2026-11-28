@@ -217,7 +217,12 @@ async def test_each_model_connection_has_keepalive_and_allows_quiet_peer(
         expected.append(10)
     if hasattr(socket, "TCP_KEEPCNT"):
         expected.append(3)
-    assert inspected == [expected, expected]
+    assert len(inspected) == 2
+    for values in inspected:
+        # getsockopt returns a nonzero flag, not necessarily 1: Darwin returns
+        # the SO_KEEPALIVE bit (8). Retain that raw value in the job log above.
+        assert isinstance(values[0], int) and values[0] != 0
+        assert values[1:] == expected[1:]
     assert sum(event.endswith("connect_tcp.complete") for event in prior_events) == 2
     assert any(
         event.endswith("receive_response_headers.started") for event in prior_events

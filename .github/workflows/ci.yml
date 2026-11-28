@@ -31,6 +31,7 @@ jobs:
         run: uv sync --all-extras --dev
 
       - name: Run test suite
+        if: runner.os != 'Windows'
         env:
           HTTPS_PROXY: http://127.0.0.1:9
           HTTP_PROXY: http://127.0.0.1:9
@@ -38,4 +39,16 @@ jobs:
           NO_PROXY: 127.0.0.1,localhost
         # Show socket read-back even for passing tests. Fail any non-local
         # network attempt, including one hidden by a test's exception handler.
-        run: uv run --no-sync python tests/local_only.py -q -rs --capture=tee-sys
+        run: uv run --no-sync python tests/local_only.py -q -ra --capture=tee-sys
+
+      # The first native full run found 21 existing Windows auth/file failures:
+      # POSIX permissions/fchmod, HOME expansion, and selectors on pipe handles.
+      # Keep this socket change scoped; the PR records every failing test.
+      - name: Run Windows socket and wait-policy tests
+        if: runner.os == 'Windows'
+        env:
+          HTTPS_PROXY: http://127.0.0.1:9
+          HTTP_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+          NO_PROXY: 127.0.0.1,localhost
+        run: uv run --no-sync python tests/local_only.py tests/test_transport_keepalive.py tests/test_wait_policy.py -q -ra --capture=tee-sys
