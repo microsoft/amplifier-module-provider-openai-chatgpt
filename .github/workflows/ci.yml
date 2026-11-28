@@ -7,8 +7,8 @@ on:
 
 jobs:
   test:
-    name: pytest (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     # A hang must fail LOUDLY and fast, not sit burning runner time until the
     # 6h default -- a job stuck at "in_progress" reads as "not done yet"
     # rather than "broken", which is how a false green gets merged.
@@ -16,6 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
         # requires-python = ">=3.11" -- cover the floor and a current minor.
         python-version: ["3.11", "3.12"]
     steps:
@@ -30,4 +31,24 @@ jobs:
         run: uv sync --all-extras --dev
 
       - name: Run test suite
-        run: uv run pytest -q
+        if: runner.os != 'Windows'
+        env:
+          HTTPS_PROXY: http://127.0.0.1:9
+          HTTP_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+          NO_PROXY: 127.0.0.1,localhost
+        # Show socket read-back even for passing tests. Fail any non-local
+        # network attempt, including one hidden by a test's exception handler.
+        run: uv run --no-sync python tests/local_only.py -q -ra --capture=tee-sys
+
+      # The first native full run found 21 existing Windows auth/file failures:
+      # POSIX permissions/fchmod, HOME expansion, and selectors on pipe handles.
+      # Keep this socket change scoped; the PR records every failing test.
+      - name: Run Windows socket and wait-policy tests
+        if: runner.os == 'Windows'
+        env:
+          HTTPS_PROXY: http://127.0.0.1:9
+          HTTP_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+          NO_PROXY: 127.0.0.1,localhost
+        run: uv run --no-sync python tests/local_only.py tests/test_transport_keepalive.py tests/test_wait_policy.py -q -ra --capture=tee-sys
