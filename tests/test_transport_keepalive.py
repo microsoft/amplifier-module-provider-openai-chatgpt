@@ -3,6 +3,7 @@
 import asyncio
 import json
 import socket
+import sys
 from contextlib import asynccontextmanager, suppress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -106,6 +107,7 @@ def local_endpoint(monkeypatch, port):
 @pytest.mark.parametrize("phase", ["headers", "body"])
 async def test_each_model_connection_has_keepalive_and_allows_quiet_peer(
     monkeypatch,
+    caplog,
     mode,
     via_proxy,
     phase,
@@ -122,21 +124,57 @@ async def test_each_model_connection_has_keepalive_and_allows_quiet_peer(
         trace = outgoing.extensions["trace"]
 
         async def inspect(event, info):
+            log_start = len(caplog.records)
             await trace(event, info)
             if event.endswith("connect_tcp.complete"):
                 sock = info["return_value"].get_extra_info("socket")
-                values = [sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)]
-                idle = getattr(
-                    socket, "TCP_KEEPIDLE", getattr(socket, "TCP_KEEPALIVE", None)
+                names = (
+                    "SO_KEEPALIVE",
+                    "TCP_KEEPIDLE",
+                    "TCP_KEEPALIVE",
+                    "TCP_KEEPINTVL",
+                    "TCP_KEEPCNT",
                 )
-                for option in (
-                    idle,
-                    getattr(socket, "TCP_KEEPINTVL", None),
-                    getattr(socket, "TCP_KEEPCNT", None),
-                ):
-                    if option is not None:
-                        values.append(sock.getsockopt(socket.IPPROTO_TCP, option))
-                inspected.append(values)
+                constants = {name: getattr(socket, name, None) for name in names}
+                idle_name = (
+                    "TCP_KEEPIDLE"
+                    if constants["TCP_KEEPIDLE"] is not None
+                    else "TCP_KEEPALIVE"
+                )
+                readback = {}
+                for name in ("SO_KEEPALIVE", idle_name, "TCP_KEEPINTVL", "TCP_KEEPCNT"):
+                    if constants[name] is not None:
+                        level = (
+                            socket.SOL_SOCKET
+                            if name == "SO_KEEPALIVE"
+                            else socket.IPPROTO_TCP
+                        )
+                        try:
+                            readback[name] = sock.getsockopt(level, constants[name])
+                        except OSError as error:
+                            readback[name] = str(error)
+                print(
+                    "W9_KEEPALIVE_SOCKET "
+                    + json.dumps(
+                        {
+                            "platform": sys.platform,
+                            "python": sys.version.split()[0],
+                            "mode": mode,
+                            "proxy": via_proxy,
+                            "quiet_phase": phase,
+                            "constants": constants,
+                            "readback": readback,
+                            "refused_options": [
+                                row.getMessage()
+                                for row in caplog.records[log_start:]
+                                if row.name == _transport.__name__
+                                and row.levelname == "WARNING"
+                            ],
+                        }
+                    ),
+                    flush=True,
+                )
+                inspected.append(list(readback.values()))
 
         outgoing.extensions["trace"] = inspect
 
@@ -183,6 +221,20 @@ async def test_each_model_connection_has_keepalive_and_allows_quiet_peer(
     assert sum(event.endswith("connect_tcp.complete") for event in prior_events) == 2
     assert any(
         event.endswith("receive_response_headers.started") for event in prior_events
+    )
+    print(
+        "W9_KEEPALIVE_COMPLETE "
+        + json.dumps(
+            {
+                "platform": sys.platform,
+                "python": sys.version.split()[0],
+                "mode": mode,
+                "proxy": via_proxy,
+                "quiet_phase": phase,
+                "completed_requests": 2,
+            }
+        ),
+        flush=True,
     )
 
 
