@@ -57,6 +57,7 @@ from ._images import (
 from ._model_listing import ModelFilters, selector_schema, superseded_recommendations
 from ._plan_request import prepare_plan_payload
 from ._sse import ParsedResponse, SSEError, parse_sse_events
+from ._transport import configure_request
 from .models import (
     DEFAULT_CACHE_TTL_SECONDS,
     FALLBACK_MODELS,
@@ -2048,7 +2049,8 @@ class ChatGPTProvider:
                 block_types = {}
                 try:
                     async with httpx.AsyncClient(
-                        timeout=httpx.Timeout(self.timeout, connect=5.0, pool=5.0)
+                        timeout=httpx.Timeout(self.timeout, connect=5.0, pool=5.0),
+                        event_hooks={"request": [configure_request]},
                     ) as client:
                         # No await between the host's private witness check and
                         # this physical send, including 401/backoff continuations.
